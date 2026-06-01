@@ -87,26 +87,6 @@ python -c "import deeplabcut; import umap; import hdbscan; import customtkinter;
 
 ---
 
-## Required Packages Summary
-
-| Package | Source | Purpose |
-|---------|--------|---------|
-| `deeplabcut[pytorch]` | pip | Pose estimation (Step 1) |
-| `torch`, `torchvision`, `torchaudio` | conda (pytorch channel) | GPU inference backend |
-| `numpy` | pip/conda | Numerical computing |
-| `pandas` | pip/conda | Data manipulation |
-| `matplotlib` | pip/conda | Plotting and figure export |
-| `scipy` | pip | Signal filtering (H5 post-processing) |
-| `scikit-learn` | pip | MLP classifier, validation metrics |
-| `umap-learn` | pip | Dimensionality reduction (Step 3) |
-| `hdbscan` | conda-forge | Density-based clustering (Step 3) |
-| `opencv-python-headless` | pip | Video reading and resizing |
-| `pillow` | pip | Image handling in GUI |
-| `customtkinter` | pip | Analyser GUI (Step 5) |
-| `ruamel.yaml` | pip | DLC config injection (Smart Adapt) |
-| `h5py` | pip | HDF5 pose file I/O |
-
----
 
 ## Running CUBE
 
@@ -133,7 +113,7 @@ Sessions are automatically saved after each step. To resume after a crash, click
 ## File Structure
 
 ```
-CUBE 3/
+CUBE /
 ├── cube.py                  # Main launcher and GUI
 ├── cube_core.py             # Core analysis engine (V2 features, UMAP, HDBSCAN, MLP)
 ├── cube_analyser.py         # Behaviour analysis and statistics (Step 5)
