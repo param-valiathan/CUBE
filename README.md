@@ -4,9 +4,6 @@
 
 <h1 align="center">CUBE — Comprehensive Unsupervised Behavioral Explorer</h1>
 
-<p align="center">
-  An automated, end-to-end pipeline for discovering and quantifying animal behavior from video — no manual labeling required.
-</p>
 
 ---
 
