@@ -2,7 +2,7 @@
   <img src="Cube_logo.PNG" alt="CUBE Logo" width="220"/>
 </p>
 
-<h1 align="center">CUBE — Comprehensive Unsupervised Behavioral Explorer</h1>
+<h1 align="center">Comprehensive Unsupervised Behavioral Explorer</h1>
 
 
 ---
