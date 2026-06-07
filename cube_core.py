@@ -17,7 +17,7 @@ Handles:
 """
 
 #   stdlib  
-import json, pickle, re, shutil, traceback, warnings
+import json, pickle, re, shutil, time, traceback, warnings
 from datetime import datetime
 from itertools import combinations
 from pathlib import Path
@@ -30,6 +30,7 @@ import matplotlib
 matplotlib.use("Agg")          # never open a display window
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.ticker
 
 warnings.filterwarnings("ignore")
 
@@ -46,8 +47,29 @@ PALETTE = [
     "#3F51B5","#009688","#FF4081","#CDDC39","#795548",
 ]
 
-_BG    = "#0d0d1a"
-_PANEL = "#1a1a2e"
+# Mutable theme globals — updated by _apply_plot_theme() at the start of each run
+_BG       = "#0d0d1a"
+_PANEL    = "#1a1a2e"
+_TEXT_COL = "white"       # primary text / axis title
+_TICK_COL = "#aaaacc"     # tick labels, axis labels, colourbar labels
+
+_THEME_COLORS = {
+    "dark":  dict(bg="#0d0d1a", panel="#1a1a2e",
+                  text="white",    tick="#aaaacc",  mpl_style="dark_background"),
+    "light": dict(bg="#f5f6fa",  panel="#ffffff",
+                  text="#1a1a2e", tick="#444466",   mpl_style="seaborn-v0_8-whitegrid"),
+}
+
+
+def _apply_plot_theme(theme: str = "dark") -> None:
+    """Update module-level colour globals and matplotlib style for every plot."""
+    global _BG, _PANEL, _TEXT_COL, _TICK_COL
+    c = _THEME_COLORS.get(theme, _THEME_COLORS["dark"])
+    _BG, _PANEL, _TEXT_COL, _TICK_COL = c["bg"], c["panel"], c["text"], c["tick"]
+    try:
+        plt.style.use(c["mpl_style"])
+    except Exception:
+        pass
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv"}
 DLC_EXTS   = {".csv", ".h5", ".hdf5"}
@@ -741,7 +763,688 @@ def predict_labels(xy_smooth: np.ndarray, _umap_model, mlp_model,
     return fl[:n_orig].astype(int)
 
 
-#  
+# ──────────────────────────────────────────────────────────────────────────────
+#  HMM SMOOTHING  (post-hoc Multinomial HMM wrapper for B-SOiD predictions)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def train_hmm(label_sequences: list, n_clusters: int,
+              n_states: int = None, n_iter: int = 100):
+    """Fit a Multinomial (Categorical) HMM to B-SOiD MLP label sequences.
+
+    Uses Baum-Welch EM.  n_states defaults to n_clusters (smoothing-only mode).
+
+    Emission initialisation strategy
+    ---------------------------------
+    When n_states == n_clusters (smoothing-only mode) the emission matrix is
+    seeded as a near-diagonal (identity-like) matrix with a small off-diagonal
+    probability eps=0.05.  This anchors Baum-Welch so that state i learns to
+    represent cluster i rather than converging to a degenerate permutation.
+    After fitting, states are realigned to clusters via the Hungarian algorithm
+    (scipy.optimize.linear_sum_assignment on the emission matrix) so the
+    returned state IDs exactly match the original B-SOiD cluster IDs — keeping
+    the analyser cluster→behaviour mapping valid.
+
+    When n_states < n_clusters (macro-state discovery) a uniform Dirichlet
+    initialisation is used; state IDs are arbitrary macro-state indices and
+    the original cluster mapping no longer applies directly.
+
+    Returns a fitted hmmlearn.hmm.CategoricalHMM.
+    """
+    try:
+        from hmmlearn.hmm import CategoricalHMM
+    except ImportError:
+        raise ImportError(
+            "hmmlearn is required for HMM smoothing.  "
+            "Install it with:  pip install hmmlearn>=0.3.2")
+    if n_states is None:
+        n_states = n_clusters
+
+    smoothing_mode = (n_states == n_clusters)
+
+    # Build emission matrix BEFORE model construction so we can pass it in.
+    # init_params excludes 'e' to prevent hmmlearn from overwriting our matrix.
+    if smoothing_mode:
+        # Near-diagonal: P(obs=j | state=i) ≈ 0.95 if i==j, 0.05/(k-1) else
+        eps = 0.05
+        emis = np.full((n_states, n_clusters), eps / max(1, n_clusters - 1))
+        np.fill_diagonal(emis, 1.0 - eps)
+        emis /= emis.sum(axis=1, keepdims=True)  # normalise (already sums to 1)
+        _ip = "st"   # randomly init start + transition; we supply emission
+    else:
+        # Macro-state mode: uniform Dirichlet, all states/clusters equally likely
+        rng  = np.random.default_rng(42)
+        emis = rng.dirichlet(np.ones(n_clusters), size=n_states)
+        _ip  = "st"
+
+    model = CategoricalHMM(
+        n_components=n_states,
+        n_iter=n_iter,
+        tol=1e-4,
+        init_params=_ip,   # 's' + 't' randomised; 'e' we set manually
+        params="ste",      # all params updated during EM
+    )
+    model.emissionprob_ = emis   # set BEFORE fit so hmmlearn validates shape
+
+    X       = np.concatenate([s.reshape(-1, 1).astype(int) for s in label_sequences])
+    lengths = [len(s) for s in label_sequences]
+    model.fit(X, lengths)
+
+    # ── State alignment (smoothing-only mode) ────────────────────────────────
+    # After Baum-Welch the emission matrix may have permuted rows.  Use the
+    # Hungarian algorithm to find the bijective assignment of states → clusters
+    # that maximises total emission probability on the diagonal, then permute
+    # all model parameters so state i ↔ cluster i.
+    if smoothing_mode:
+        try:
+            from scipy.optimize import linear_sum_assignment
+            # cost[i,j] = −P(obs=j | state=i); minimise → maximise probability
+            _, col_ind = linear_sum_assignment(-model.emissionprob_)
+            # col_ind[old_state_i] = cluster that best matches old_state_i
+            # perm[new_state_j]  = old_state whose best cluster is j
+            perm = np.argsort(col_ind)
+            model.startprob_   = model.startprob_[perm]
+            model.transmat_    = model.transmat_[np.ix_(perm, perm)]
+            model.emissionprob_ = model.emissionprob_[perm]
+        except ImportError:
+            pass  # scipy unavailable; states may not align perfectly with clusters
+
+    return model
+
+
+def decode_hmm(hmm_model, frame_labels: np.ndarray) -> np.ndarray:
+    """Viterbi decode: returns (n_frames,) int array of HMM state IDs."""
+    _, state_seq = hmm_model.decode(
+        frame_labels.reshape(-1, 1).astype(int), algorithm="viterbi")
+    return state_seq.astype(int)
+
+
+def plot_duration_comparison(raw_labels: np.ndarray, hmm_labels: np.ndarray,
+                              fps: float, out_path: Path):
+    """Log-scale bout duration histograms — raw B-SOiD vs HMM-smoothed."""
+    def _durations(labels):
+        bouts = labels_to_bouts(labels)
+        return bouts["Run lengths"].values / fps
+
+    raw_dur = _durations(raw_labels)
+    hmm_dur = _durations(hmm_labels)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), facecolor=_BG)
+    for ax in axes:
+        _dark_ax(ax)
+
+    all_dur = np.concatenate([raw_dur, hmm_dur])
+    lo   = max(1e-3, float(all_dur.min()))
+    hi   = float(all_dur.max()) + 0.1
+    bins = np.logspace(np.log10(lo), np.log10(hi), 40)
+
+    for ax, durs, title, col in zip(
+            axes,
+            [raw_dur, hmm_dur],
+            ["Raw B-SOiD  (MLP output)", "HMM-smoothed  (Viterbi)"],
+            ["#F28E2B", "#4E79A7"]):
+        ax.hist(durs, bins=bins, color=col, edgecolor=_BG, alpha=0.85)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("Bout duration (s)")
+        ax.set_ylabel("Count (log)")
+        ax.set_title(title)
+        one_frame = 1.0 / fps
+        ax.axvline(one_frame, color="#ff4081", linestyle="--",
+                   linewidth=1.2, label=f"1 frame ({one_frame:.3f} s)")
+        ax.legend(fontsize=7, facecolor=_PANEL, labelcolor=_TEXT_COL)
+
+    fig.suptitle("Behavioral bout duration  —  before vs. after HMM smoothing",
+                 color=_TEXT_COL, fontsize=12)
+    plt.tight_layout()
+    _savefig(fig, out_path)
+
+
+def plot_hmm_transition_matrix(hmm_model, out_path: Path,
+                                state_names: list = None):
+    """Heatmap of the HMM learned transition matrix (transmat_)."""
+    A = hmm_model.transmat_
+    n = A.shape[0]
+    names = state_names or [f"S{i}" for i in range(n)]
+
+    sz = max(6, n * 0.6 + 2)
+    fig, ax = plt.subplots(figsize=(sz, sz), facecolor=_BG)
+    _dark_ax(ax)
+    im = ax.imshow(A, cmap="Blues", aspect="auto", vmin=0, vmax=1)
+    cb = plt.colorbar(im, ax=ax)
+    cb.ax.tick_params(colors=_TICK_COL)
+    cb.set_label("Transition probability", color=_TICK_COL)
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(names, rotation=45, ha="right",
+                        color=_TICK_COL, fontsize=8)
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(names, color=_TICK_COL, fontsize=8)
+    ax.set_xlabel("State at t+1", color=_TICK_COL)
+    ax.set_ylabel("State at t", color=_TICK_COL)
+    ax.set_title("HMM learned transition matrix  A[i→j]  (diagonal = self-persistence)",
+                 color=_TEXT_COL)
+    cell_fs = max(5, 9 - n // 4)
+    for i in range(n):
+        for j in range(n):
+            # Use white text on dark cells (high probability), black on light cells
+            ax.text(j, i, f"{A[i, j]:.2f}", ha="center", va="center",
+                    fontsize=cell_fs,
+                    color="white" if A[i, j] > 0.4 else "black")
+    plt.tight_layout()
+    _savefig(fig, out_path)
+
+
+def plot_dual_ethogram(raw_labels: np.ndarray, hmm_labels: np.ndarray,
+                        fps: float, out_path: Path, tag: str):
+    """Two-row ethogram: row 1 = raw B-SOiD MLP, row 2 = HMM Viterbi."""
+    uniq_raw = np.unique(raw_labels)
+    uniq_hmm = np.unique(hmm_labels)
+    t = np.arange(len(raw_labels)) / fps
+
+    n_raw = len(uniq_raw)
+    n_hmm = len(uniq_hmm)
+
+    fig, (ax_raw, ax_hmm) = plt.subplots(
+        2, 1,
+        figsize=(14, max(4, (n_raw + n_hmm) * 0.35 + 2)),
+        facecolor=_BG, sharex=True)
+    _dark_ax(ax_raw)
+    _dark_ax(ax_hmm)
+
+    for idx_u, lbl in enumerate(uniq_raw):
+        sel = np.where(raw_labels == lbl)[0]
+        ax_raw.scatter(t[sel], np.full(len(sel), idx_u),
+                       c=_cmap(int(lbl)), s=8, marker="|", linewidths=3.5)
+    ax_raw.set_yticks(range(n_raw))
+    ax_raw.set_yticklabels([f"C{l}" for l in uniq_raw], color=_TEXT_COL, fontsize=7)
+    ax_raw.set_title(f"Raw B-SOiD  |  {tag}", color=_TEXT_COL, fontsize=9)
+    ax_raw.set_ylabel("Cluster", color=_TICK_COL, fontsize=8)
+
+    for idx_u, lbl in enumerate(uniq_hmm):
+        sel = np.where(hmm_labels == lbl)[0]
+        ax_hmm.scatter(t[sel], np.full(len(sel), idx_u),
+                       c=_cmap(int(lbl)), s=8, marker="|", linewidths=3.5)
+    ax_hmm.set_yticks(range(n_hmm))
+    ax_hmm.set_yticklabels([f"S{l}" for l in uniq_hmm], color=_TEXT_COL, fontsize=7)
+    ax_hmm.set_title("HMM Viterbi (state-aligned)", color=_TEXT_COL, fontsize=9)
+    ax_hmm.set_xlabel("Time (s)", color=_TICK_COL, fontsize=8)
+    ax_hmm.set_ylabel("State", color=_TICK_COL, fontsize=8)
+
+    plt.tight_layout()
+    _savefig(fig, out_path)
+
+
+def plot_syntax_network(hmm_model, out_path: Path,
+                         state_names: list = None, min_prob: float = 0.05):
+    """
+    Publication-quality directed behavioral syntax graph.
+    Left panel: spring-layout directed network with circular arc arrows.
+    Right panel: chord (circular) diagram showing directional transition flow.
+    Node size ∝ stationary probability · Edge/ribbon width ∝ transition probability.
+    """
+    try:
+        import networkx as nx
+    except ImportError:
+        return
+
+    A  = hmm_model.transmat_
+    n  = A.shape[0]
+    names = state_names or [f"S{i}" for i in range(n)]
+
+    # Stationary distribution via power iteration
+    pi = np.ones(n) / n
+    for _ in range(500):
+        pi = pi @ A
+    pi /= pi.sum()
+
+    # ── Build directed graph ──────────────────────────────────────────────────
+    G = nx.DiGraph()
+    for i in range(n):
+        G.add_node(names[i], weight=float(pi[i]))
+    for i in range(n):
+        for j in range(n):
+            if i != j and A[i, j] >= min_prob:
+                G.add_edge(names[i], names[j], weight=float(A[i, j]))
+
+    if G.number_of_edges() == 0:
+        return
+
+    node_colors = [_cmap(i) for i in range(n)]
+    node_sizes  = [max(600, float(pi[i]) * 12000) for i in range(n)]
+
+    # ── Figure: two panels ───────────────────────────────────────────────────
+    fw = max(16, n * 0.9)
+    fh = max(8,  n * 0.7)
+    fig, (ax_net, ax_chord) = plt.subplots(
+        1, 2, figsize=(fw, fh), facecolor=_BG)
+    _dark_ax(ax_net)
+    _dark_ax(ax_chord)
+    ax_net.set_facecolor(_PANEL)
+    ax_chord.set_facecolor(_PANEL)
+
+    # ── Left: directed network ────────────────────────────────────────────────
+    pos = nx.circular_layout(G)
+
+    # Draw edges with width & alpha ∝ probability; dark contrasting color
+    edges     = list(G.edges(data=True))
+    max_wt    = max((d["weight"] for _, _, d in edges), default=1.0)
+    edge_list = [(u, v) for u, v, _ in edges]
+    e_widths  = [max(1.2, d["weight"] / max_wt * 12) for _, _, d in edges]
+    e_alphas  = [0.55 + d["weight"] / max_wt * 0.45 for _, _, d in edges]
+    e_colors  = [_cmap(list(G.nodes).index(u)) for u, _, _ in edges]
+
+    # Draw each edge individually so alpha can vary
+    for (u, v), ew, ea, ec in zip(edge_list, e_widths, e_alphas, e_colors):
+        nx.draw_networkx_edges(
+            G, pos, ax=ax_net,
+            edgelist=[(u, v)],
+            width=ew,
+            edge_color=[ec],
+            alpha=ea,
+            arrows=True,
+            arrowstyle="-|>",
+            arrowsize=max(14, ew * 2),
+            connectionstyle="arc3,rad=0.18",
+            min_source_margin=22,
+            min_target_margin=22,
+        )
+
+    nx.draw_networkx_nodes(
+        G, pos, ax=ax_net,
+        node_size=node_sizes,
+        node_color=node_colors,
+        linewidths=1.8,
+        edgecolors=_BG,
+        alpha=0.95,
+    )
+    font_sz = max(6, 11 - n // 5)
+    nx.draw_networkx_labels(G, pos, ax=ax_net,
+                             font_color=_TEXT_COL,
+                             font_size=font_sz,
+                             font_weight="bold")
+    ax_net.set_title(
+        f"Behavioral Syntax Network  (p > {min_prob:.2f})\n"
+        "Node size ∝ stationary probability  ·  Arrow width ∝ transition probability",
+        color=_TEXT_COL, fontsize=10, fontweight="bold", pad=10)
+    ax_net.axis("off")
+
+    # ── Right: chord (circular) diagram ──────────────────────────────────────
+    theta  = np.linspace(0, 2 * np.pi, n, endpoint=False) - np.pi / 2
+    cx     = np.cos(theta)
+    cy     = np.sin(theta)
+    margin = 1.55
+
+    # Draw arcs as annotate arrows between node positions
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            p = float(A[i, j])
+            if p < min_prob:
+                continue
+            p_norm = p / max_wt
+            lw     = max(0.6, p_norm * 10)
+            alpha  = 0.45 + p_norm * 0.55
+            rad    = 0.20 if abs(i - j) > n // 3 else 0.12
+            ax_chord.annotate(
+                "", xy=(cx[j], cy[j]), xytext=(cx[i], cy[i]),
+                arrowprops=dict(
+                    arrowstyle="-|>",
+                    color=_cmap(i),
+                    alpha=alpha, lw=lw,
+                    connectionstyle=f"arc3,rad={rad}",
+                    mutation_scale=max(10, lw * 2.5),
+                ),
+                zorder=2 + int(p_norm * 5),
+            )
+
+    # Node dots on chord ring
+    nsize = 120 + 280 * (pi / pi.max())
+    ax_chord.scatter(cx, cy, s=nsize, c=node_colors,
+                     zorder=9, edgecolors=_BG, linewidths=1.4, alpha=0.96)
+    for i, nm in enumerate(names):
+        ox = cx[i] * margin
+        oy = cy[i] * margin
+        ha = "left" if cx[i] > 0.05 else ("right" if cx[i] < -0.05 else "center")
+        ax_chord.text(ox, oy, nm, ha=ha, va="center",
+                      fontsize=font_sz, color=_TEXT_COL,
+                      fontweight="bold")
+
+    ax_chord.set_xlim(-2.0, 2.0)
+    ax_chord.set_ylim(-2.0, 2.0)
+    ax_chord.set_aspect("equal")
+    ax_chord.axis("off")
+    ax_chord.set_title(
+        "Chord Diagram  (directional transitions)\n"
+        "Arc colour = source state  ·  Arc width ∝ transition probability",
+        color=_TEXT_COL, fontsize=10, fontweight="bold", pad=10)
+
+    plt.tight_layout(pad=2.0)
+    _savefig(fig, out_path)
+
+
+def plot_dwell_violin(epochs: "pd.DataFrame", out_path: Path, tag: str = ""):
+    """
+    Violin + strip plots of dwell-time distributions per behavioral state.
+    Shows the full distribution shape rather than just mean ± SD.
+    Each violin is colored by cluster ID.
+    """
+    if epochs is None or epochs.empty:
+        return
+    uniq = sorted(epochs["label"].unique())
+    n    = len(uniq)
+    if n == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(max(8, n * 0.9 + 2), 5), facecolor=_BG)
+    _dark_ax(ax)
+
+    data   = [epochs.loc[epochs["label"] == lbl, "duration_sec"].values
+              for lbl in uniq]
+    colors = [_cmap(int(lbl)) for lbl in uniq]
+
+    parts = ax.violinplot(data, positions=range(n),
+                          showmedians=True, showextrema=True)
+    parts["cmedians"].set_color("#ffd60a")
+    parts["cmins"].set_color(_TICK_COL)
+    parts["cmaxes"].set_color(_TICK_COL)
+    parts["cbars"].set_color(_TICK_COL)
+    for i, pc in enumerate(parts["bodies"]):
+        pc.set_facecolor(colors[i])
+        pc.set_edgecolor(_BG)
+        pc.set_alpha(0.72)
+
+    # Overlay raw data as a strip (jittered dots)
+    rng = np.random.default_rng(42)
+    for i, d in enumerate(data):
+        if len(d) == 0:
+            continue
+        jitter = rng.uniform(-0.12, 0.12, size=len(d))
+        ax.scatter(i + jitter, d,
+                   color=colors[i], alpha=0.35, s=6, linewidths=0,
+                   zorder=3)
+
+    ax.set_xticks(range(n))
+    ax.set_xticklabels([f"S{int(l)}" for l in uniq],
+                       color=_TEXT_COL, fontsize=max(6, 10 - n // 6))
+    ax.set_ylabel("Dwell time (s)", color=_TICK_COL, fontsize=10)
+    ax.set_yscale("log")
+    title = f"Dwell-time distributions per state  –  {tag}" if tag else \
+            "Dwell-time distributions per state"
+    ax.set_title(title, color=_TEXT_COL, fontsize=11, fontweight="bold")
+    ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+
+    plt.tight_layout()
+    _savefig(fig, out_path)
+
+
+def plot_sankey_sequences(all_frame_labels: list, out_path: Path,
+                           n_steps: int = 5):
+    """
+    Sankey (alluvial) diagram: state occupancy at consecutive sequence positions.
+    Each column shows the proportion of frames in each state at step k.
+    Bezier ribbons connect same-state or transitioning populations between steps,
+    illustrating how animals flow from state to state across a bout sequence.
+    """
+    import matplotlib.patches as mpatches_local
+    from matplotlib.path import Path as MPath
+
+    if not all_frame_labels:
+        return
+
+    # Build transition sequences: for each session extract label at every step
+    # We work at bout level: take the nth bout label for each session
+    all_bout_seqs = []
+    for fl in all_frame_labels:
+        if len(fl) == 0:
+            continue
+        bouts_obj = labels_to_bouts(np.asarray(fl))
+        seq = bouts_obj["B-SOiD labels"].values
+        if len(seq) >= 2:
+            all_bout_seqs.append(seq)
+
+    if not all_bout_seqs:
+        return
+
+    uniq_states = sorted({int(l) for seq in all_bout_seqs for l in seq})
+    ns = len(uniq_states)
+    si = {s: i for i, s in enumerate(uniq_states)}
+    n_steps_use = min(n_steps, min(len(s) for s in all_bout_seqs))
+    if n_steps_use < 2:
+        return
+
+    # Count state occupancy at each step position
+    counts = np.zeros((n_steps_use, ns), dtype=float)
+    for seq in all_bout_seqs:
+        for k in range(n_steps_use):
+            counts[k, si[int(seq[k])]] += 1
+    totals = counts.sum(axis=1, keepdims=True)
+    totals[totals == 0] = 1.0
+    props  = counts / totals    # (n_steps, ns)  — row-stochastic fractions
+
+    # Transition counts between adjacent steps
+    trans = np.zeros((n_steps_use - 1, ns, ns), dtype=float)
+    for seq in all_bout_seqs:
+        for k in range(n_steps_use - 1):
+            a, b = si[int(seq[k])], si[int(seq[k + 1])]
+            trans[k, a, b] += 1
+    for k in range(n_steps_use - 1):
+        row_s = trans[k].sum(axis=1, keepdims=True)
+        row_s[row_s == 0] = 1.0
+        trans[k] /= row_s
+
+    # ── Draw ─────────────────────────────────────────────────────────────────
+    col_x  = np.linspace(0, 1, n_steps_use)
+    col_w  = 0.05
+    bar_h  = 0.88   # total height used by state bars in each column
+    gap    = 0.006  # inter-state gap
+
+    fig, ax = plt.subplots(figsize=(max(10, n_steps_use * 2.5), 7), facecolor=_BG)
+    _dark_ax(ax)
+
+    # Compute y-positions for each (step, state) bar
+    y_bot = np.zeros((n_steps_use, ns), dtype=float)
+    y_top = np.zeros((n_steps_use, ns), dtype=float)
+    for k in range(n_steps_use):
+        cum = 0.06   # start slightly above bottom
+        for si_j in range(ns):
+            h = props[k, si_j] * bar_h
+            y_bot[k, si_j] = cum
+            y_top[k, si_j] = cum + h
+            cum += h + gap
+
+    colors = [_cmap(s) for s in uniq_states]
+
+    # Draw bezier ribbons first (behind bars)
+    for k in range(n_steps_use - 1):
+        x0 = col_x[k]  + col_w
+        x1 = col_x[k + 1]
+        cx0 = x0 + (x1 - x0) * 0.40
+        cx1 = x0 + (x1 - x0) * 0.60
+
+        # Offsets within source bar for each destination
+        src_offsets  = np.zeros(ns, dtype=float)
+        dst_offsets  = np.zeros(ns, dtype=float)
+
+        for a in range(ns):
+            src_h = y_top[k, a] - y_bot[k, a]
+            for b in range(ns):
+                p = float(trans[k, a, b])
+                if p < 0.005:
+                    continue
+                ribbon_h_src = src_h * p
+                ribbon_h_dst = (y_top[k + 1, b] - y_bot[k + 1, b]) * p
+
+                ys0 = y_bot[k, a]  + src_offsets[a]
+                ye0 = ys0 + ribbon_h_src
+                ys1 = y_bot[k + 1, b] + dst_offsets[b]
+                ye1 = ys1 + ribbon_h_dst
+
+                src_offsets[a] += ribbon_h_src
+                dst_offsets[b] += ribbon_h_dst
+
+                verts = [
+                    (x0, ys0), (cx0, ys0), (cx1, ys1), (x1, ys1),
+                    (x1, ye1), (cx1, ye1), (cx0, ye0), (x0, ye0),
+                    (x0, ys0),
+                ]
+                codes = (
+                    [MPath.MOVETO] +
+                    [MPath.CURVE4] * 3 +
+                    [MPath.LINETO] +
+                    [MPath.CURVE4] * 3 +
+                    [MPath.CLOSEPOLY]
+                )
+                path   = MPath(verts, codes)
+                patch  = mpatches_local.PathPatch(
+                    path, facecolor=colors[a],
+                    edgecolor="none", alpha=0.38, zorder=1)
+                ax.add_patch(patch)
+
+    # Draw state bars on top of ribbons
+    for k in range(n_steps_use):
+        for si_j in range(ns):
+            h = y_top[k, si_j] - y_bot[k, si_j]
+            if h < 1e-4:
+                continue
+            rect = mpatches_local.FancyBboxPatch(
+                (col_x[k], y_bot[k, si_j]), col_w, h,
+                boxstyle="square,pad=0",
+                facecolor=colors[si_j], edgecolor=_BG,
+                linewidth=0.5, zorder=3)
+            ax.add_patch(rect)
+            if h > 0.04:
+                ax.text(col_x[k] + col_w / 2,
+                        y_bot[k, si_j] + h / 2,
+                        f"S{uniq_states[si_j]}",
+                        ha="center", va="center",
+                        fontsize=max(5, 9 - ns // 6),
+                        color=_TEXT_COL, fontweight="bold", zorder=4)
+
+    # Column labels
+    for k, x in enumerate(col_x):
+        ax.text(x + col_w / 2, 0.02, f"Step {k + 1}",
+                ha="center", va="bottom", fontsize=9,
+                color=_TICK_COL, fontweight="bold")
+
+    # Legend patches
+    legend_handles = [
+        mpatches_local.Patch(color=colors[i], label=f"S{uniq_states[i]}")
+        for i in range(ns)
+    ]
+    ax.legend(handles=legend_handles, loc="upper right",
+              fontsize=8, facecolor=_PANEL,
+              labelcolor=_TEXT_COL, title="State",
+              title_fontsize=8, framealpha=0.7)
+
+    ax.set_xlim(-0.04, 1.06)
+    ax.set_ylim(0, 1.02)
+    ax.set_title(
+        f"Behavioral sequence Sankey diagram  (first {n_steps_use} bout positions)\n"
+        "Bar height = state occupancy  ·  Ribbon width = transition flow",
+        color=_TEXT_COL, fontsize=11, fontweight="bold")
+    ax.axis("off")
+    plt.tight_layout()
+    _savefig(fig, out_path)
+
+
+def plot_state_space_trajectory(embedding: np.ndarray,
+                                  frame_labels: np.ndarray,
+                                  fps: float,
+                                  out_path: Path,
+                                  tag: str = "",
+                                  max_traj_frames: int = 3000):
+    """
+    2-D UMAP (or other embedding) scatter coloured by behavioral state with a
+    temporal trajectory overlay.  The trajectory is sub-sampled to
+    *max_traj_frames* for readability.
+    Left panel: density-coloured scatter.
+    Right panel: trajectory path through state space (time colour-mapped).
+    """
+    if embedding is None or len(embedding) == 0:
+        return
+    emb = np.asarray(embedding)
+    lbl = np.asarray(frame_labels)
+    if emb.shape[0] != len(lbl) or emb.shape[1] < 2:
+        return
+
+    uniq   = sorted(int(u) for u in np.unique(lbl) if u >= 0)
+    colors = {u: _cmap(u) for u in uniq}
+
+    fig, (ax_sc, ax_tr) = plt.subplots(1, 2, figsize=(16, 7), facecolor=_BG)
+    for ax in (ax_sc, ax_tr):
+        _dark_ax(ax)
+        ax.set_facecolor(_PANEL)
+
+    # ── Left: scatter coloured by state ──────────────────────────────────────
+    valid = lbl >= 0
+    if valid.any():
+        for u in uniq:
+            mask = valid & (lbl == u)
+            if mask.any():
+                ax_sc.scatter(emb[mask, 0], emb[mask, 1],
+                              s=2, alpha=0.45, color=colors[u],
+                              linewidths=0, label=f"S{u}")
+        # Noise in gray
+        noise = ~valid
+        if noise.any():
+            ax_sc.scatter(emb[noise, 0], emb[noise, 1],
+                          s=1, alpha=0.15, color="#555566", linewidths=0)
+
+    handles = [mpatches.Patch(color=colors[u], label=f"S{u}") for u in uniq[:24]]
+    ax_sc.legend(handles=handles, fontsize=6, ncol=3,
+                 facecolor=_PANEL, labelcolor=_TEXT_COL,
+                 loc="upper right", framealpha=0.7)
+    ax_sc.set_title(
+        f"State-space scatter  –  {tag}" if tag else "State-space scatter",
+        color=_TEXT_COL, fontsize=10, fontweight="bold")
+    ax_sc.set_xlabel("Dim 1", color=_TICK_COL, fontsize=9)
+    ax_sc.set_ylabel("Dim 2", color=_TICK_COL, fontsize=9)
+
+    # ── Right: temporal trajectory ────────────────────────────────────────────
+    n_frames = len(emb)
+    step     = max(1, n_frames // max_traj_frames)
+    idx      = np.arange(0, n_frames, step)
+    t_norm   = idx / max(1, n_frames - 1)   # 0→1 time normalised
+
+    # Draw trajectory line with colour mapped to time (purple→yellow)
+    cmap_traj = plt.cm.plasma
+    for k in range(len(idx) - 1):
+        ax_tr.plot(emb[idx[k]:idx[k + 2], 0],
+                   emb[idx[k]:idx[k + 2], 1],
+                   color=cmap_traj(t_norm[k]),
+                   alpha=0.55, linewidth=0.7, solid_capstyle="round")
+
+    # Scatter state identity (sub-sampled) on top
+    for u in uniq:
+        mask = lbl[idx] == u
+        if mask.any():
+            ax_tr.scatter(emb[idx[mask], 0], emb[idx[mask], 1],
+                          s=4, alpha=0.65, color=colors[u],
+                          linewidths=0, zorder=2)
+
+    # Colorbar for time
+    sm = plt.cm.ScalarMappable(cmap=cmap_traj,
+                                norm=plt.Normalize(vmin=0, vmax=n_frames / fps))
+    sm.set_array([])
+    cb = fig.colorbar(sm, ax=ax_tr, shrink=0.75, pad=0.02)
+    cb.ax.tick_params(colors=_TICK_COL, labelsize=7)
+    cb.set_label("Time (s)", color=_TICK_COL, fontsize=8)
+    cb.outline.set_edgecolor(_PANEL)
+
+    ax_tr.set_title("Temporal trajectory through state space\n(colour = time)",
+                    color=_TEXT_COL, fontsize=10, fontweight="bold")
+    ax_tr.set_xlabel("Dim 1", color=_TICK_COL, fontsize=9)
+    ax_tr.set_ylabel("Dim 2", color=_TICK_COL, fontsize=9)
+
+    title = f"Continuous State-Space Projection  –  {tag}" if tag else \
+            "Continuous State-Space Projection"
+    fig.suptitle(title, color=_TEXT_COL, fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    _savefig(fig, out_path)
+
+
+#
 #  BOUT / EPOCH CONVERSION
 #  
 
@@ -1001,8 +1704,8 @@ def epoch_stats(epochs: pd.DataFrame) -> pd.DataFrame:
 
 
 #  
-#  PLOTS  (all dark-themed, save to disk via Agg backend)
-#  
+#  PLOTS  (theme-aware; colours set by _apply_plot_theme() at run start)
+#
 
 def _savefig(fig: plt.Figure, path: Path, dpi: int = 150):
     try:
@@ -1016,13 +1719,14 @@ def _savefig(fig: plt.Figure, path: Path, dpi: int = 150):
 
 
 def _dark_ax(ax):
+    """Style a matplotlib Axes to match the current plot theme."""
     ax.set_facecolor(_PANEL)
-    ax.tick_params(colors="#aaaacc")
+    ax.tick_params(colors=_TICK_COL)
     for sp in ax.spines.values():
         sp.set_edgecolor(_PANEL)
-    ax.xaxis.label.set_color("#aaaacc")
-    ax.yaxis.label.set_color("#aaaacc")
-    ax.title.set_color("white")
+    ax.xaxis.label.set_color(_TICK_COL)
+    ax.yaxis.label.set_color(_TICK_COL)
+    ax.title.set_color(_TEXT_COL)
 
 
 def plot_umap(embedding: np.ndarray, labels: np.ndarray,
@@ -1037,13 +1741,13 @@ def plot_umap(embedding: np.ndarray, labels: np.ndarray,
         m = valid & (labels == u)
         ax.scatter(embedding[m, 0], embedding[m, 1],
                    s=2, alpha=0.5, color=_cmap(u), label=f"C{u}")
-    ax.set_title(f"UMAP embedding  [{tag}]", color="white", fontsize=13)
+    ax.set_title(f"UMAP embedding  [{tag}]", color=_TEXT_COL, fontsize=13)
     ax.set_xlabel("UMAP 1"); ax.set_ylabel("UMAP 2")
     handles = [mpatches.Patch(color=_cmap(u), label=f"C{u}")
                for u in uniq[:20]]
     ax.legend(handles=handles, fontsize=7, ncol=4,
               facecolor=_PANEL, edgecolor=_PANEL,
-              labelcolor="white", loc="upper right")
+              labelcolor=_TEXT_COL, loc="upper right")
     _savefig(fig, out_path)
 
 
@@ -1063,10 +1767,10 @@ def plot_confusion(mlp_model, feats_sc: np.ndarray,
     ax.set_facecolor(_PANEL)
     ConfusionMatrixDisplay(cm).plot(ax=ax, colorbar=True, cmap="Blues")
     ax.set_title("Confusion matrix (normalised, 20 % hold-out)",
-                 color="white", fontsize=11)
-    ax.tick_params(colors="#aaaacc")
-    ax.xaxis.label.set_color("#aaaacc")
-    ax.yaxis.label.set_color("#aaaacc")
+                 color=_TEXT_COL, fontsize=11)
+    ax.tick_params(colors=_TICK_COL)
+    ax.xaxis.label.set_color(_TICK_COL)
+    ax.yaxis.label.set_color(_TICK_COL)
     _savefig(fig, out_path)
 
 
@@ -1080,10 +1784,11 @@ def plot_ethogram(frame_labels: np.ndarray, fps: float,
     for idx_u, lbl in enumerate(uniq):
         sel = np.where(frame_labels == lbl)[0]
         ax.scatter(t[sel], np.full(len(sel), idx_u),
-                   c=_cmap(lbl), s=3, marker="|", linewidths=0.8)
+                   c=_cmap(lbl), s=8, marker="|", linewidths=3.5)
     ax.set_yticks(range(len(uniq)))
-    ax.set_yticklabels([f"C{l}" for l in uniq], color="white", fontsize=8)
-    ax.set_xlabel("Time (s)"); ax.set_title(f"Ethogram - {tag}")
+    ax.set_yticklabels([f"C{l}" for l in uniq], color=_TEXT_COL, fontsize=8)
+    ax.set_xlabel("Time (s)", color=_TICK_COL)
+    ax.set_title(f"Ethogram  –  {tag}", color=_TEXT_COL, fontsize=11)
     _savefig(fig, out_path)
 
 
@@ -1111,8 +1816,8 @@ def plot_cluster_durations(epochs: pd.DataFrame,
     for idx_g in range(len(uniq), nrows * ncols):
         r, c = divmod(idx_g, ncols)
         axes[r][c].set_visible(False)
-    fig.suptitle(f"Epoch duration distributions - {tag}",
-                 color="white", fontsize=11)
+    fig.suptitle(f"Epoch duration distributions  –  {tag}",
+                 color=_TEXT_COL, fontsize=11)
     plt.tight_layout()
     _savefig(fig, out_path)
 
@@ -1141,7 +1846,7 @@ def plot_cluster_stats(epochs: pd.DataFrame, out_path: Path):
                            rotation=60, color="#aaaacc", fontsize=8)
         ax.set_ylabel(ylabel, fontsize=9)
         ax.set_title(ylabel)
-    fig.suptitle("Cluster Statistics", color="white", fontsize=12)
+    fig.suptitle("Cluster Statistics", color=_TEXT_COL, fontsize=12)
     plt.tight_layout()
     _savefig(fig, out_path)
 
@@ -1207,7 +1912,7 @@ def plot_likelihood_qc(dlc_paths: list, out_path: Path):
     ax.set_ylabel("Likelihood")
     ax.set_ylim(0, 1.05)
     ax.set_title("Bodypart detection likelihood  (quality diagnostic)")
-    ax.legend(fontsize=8, facecolor=_PANEL, labelcolor="white", loc="lower right")
+    ax.legend(fontsize=8, facecolor=_PANEL, labelcolor=_TEXT_COL, loc="lower right")
     plt.tight_layout()
     _savefig(fig, out_path)
 
@@ -1330,12 +2035,12 @@ def plot_validation_summary(validation: dict, out_path: Path):
                 ax.text(cv + 0.01, 0, f"{cv:.3f}", va="center",
                         color="#eaeaea", fontsize=8)
 
-        ax.set_title(label, color="white", fontsize=9)
+        ax.set_title(label, color=_TEXT_COL, fontsize=9)
         ax.text(0.98, 0.97, rep.get("status", "?").upper(),
                 transform=ax.transAxes, ha="right", va="top",
                 fontsize=9, color=sc, fontweight="bold")
 
-    fig.suptitle("CUBE Validation Dashboard", color="white", fontsize=12)
+    fig.suptitle("CUBE Validation Dashboard", color=_TEXT_COL, fontsize=12)
     plt.tight_layout()
     _savefig(fig, out_path)
 
@@ -1354,7 +2059,7 @@ def plot_cv_scores(cv_scores: np.ndarray, out_path: Path):
     ax1.set_xticklabels([f"Fold {i+1}" for i in range(k)], color="#aaaacc")
     ax1.set_ylabel("Accuracy"); ax1.set_ylim(0, 1.05)
     ax1.set_title("MLP CV accuracy per fold")
-    ax1.legend(fontsize=8, facecolor=_PANEL, labelcolor="white")
+    ax1.legend(fontsize=8, facecolor=_PANEL, labelcolor=_TEXT_COL)
     ax2.boxplot(cv_scores, patch_artist=True,
                 boxprops=dict(facecolor=_cmap(0), alpha=0.7),
                 medianprops=dict(color="#ffd60a", linewidth=2),
@@ -2093,6 +2798,11 @@ class BSoidEngine:
         delete_labeled_videos = True,   # delete labeled_videos/ folder after run
         # ── Plot appearance ───────────────────────────────────────────────────
         plot_theme            = "dark",   # "dark" or "light"
+        # ── HMM post-hoc smoothing ────────────────────────────────────────────
+        hmm_enabled           = True,    # wrap MLP output with Multinomial HMM
+        hmm_n_states          = None,    # None → n_clusters (smoothing-only mode)
+        hmm_n_iter            = 100,     # Baum-Welch EM iterations
+        hmm_min_prob          = 0.05,    # min edge probability in syntax network plot
     )
 
     def __init__(self, csv_folder, video_folder=None,
@@ -2136,15 +2846,8 @@ class BSoidEngine:
 
     def run(self) -> dict:
         """Run the full V2 pipeline. Returns a results dict."""
-        # Apply plot theme before any figure is drawn
-        _plot_theme = self._cfg.get("plot_theme", "dark")
-        try:
-            if _plot_theme == "light":
-                plt.style.use("seaborn-v0_8-whitegrid")
-            else:
-                plt.style.use("dark_background")
-        except Exception:
-            pass
+        # Apply plot theme before any figure is drawn (updates _BG/_PANEL/_TEXT_COL/_TICK_COL)
+        _apply_plot_theme(self._cfg.get("plot_theme", "dark"))
 
         self._log("=" * 64)
         self._log(f"  CUBE Engine  v{VERSION}")
@@ -2590,6 +3293,57 @@ class BSoidEngine:
 
             self._prog(i + 1, len(pairs))
 
+        # ── HMM smoothing pass (post-hoc Multinomial HMM wrapper) ────────────
+        all_hmm_labels: list = []
+        hmm_model = None
+        if self._cfg.get("hmm_enabled", True) and all_frame_labels:
+            try:
+                _t0 = time.perf_counter()
+                self._log("\n[HMM]  Training Multinomial HMM on MLP label sequences...")
+                _hmm_n_states = self._cfg.get("hmm_n_states") or None
+                if _hmm_n_states is not None:
+                    _hmm_n_states = int(_hmm_n_states)
+                hmm_model = train_hmm(
+                    all_frame_labels,
+                    n_clusters=int(n_cl),
+                    n_states=_hmm_n_states,
+                    n_iter=int(self._cfg.get("hmm_n_iter", 100)),
+                )
+                self._log(f"  HMM trained in {time.perf_counter() - _t0:.2f} s  "
+                          f"({hmm_model.n_components} states, Baum-Welch)")
+                for _raw, _name, _file_fps in zip(
+                        all_frame_labels, all_names, all_fps_list):
+                    _hmm_labels = decode_hmm(hmm_model, _raw)
+                    all_hmm_labels.append(_hmm_labels)
+                    _bout_hmm = labels_to_bouts(_hmm_labels)
+                    _bout_hmm.to_csv(
+                        str(self._out_bouts / f"{_name}_bout_lengths_hmm.csv"),
+                        index=False)
+                    pd.DataFrame({
+                        "frame":  np.arange(len(_hmm_labels)),
+                        "time_s": np.arange(len(_hmm_labels)) / _file_fps,
+                        "label":  _hmm_labels,
+                    }).to_csv(
+                        str(self._out_bouts / f"{_name}_frame_labels_hmm.csv"),
+                        index=False)
+                    _ep_hmm = bouts_to_epochs(
+                        _bout_hmm, _file_fps,
+                        min_dur=float(self._cfg["min_epoch_dur_s"]),
+                        max_dur=float(self._cfg["max_epoch_dur_s"]))
+                    _ep_hmm.to_csv(
+                        str(self._out_bouts / f"{_name}_epochs_hmm.csv"),
+                        index=False)
+                    epoch_stats(_ep_hmm).to_csv(
+                        str(self._out_bouts / f"{_name}_epoch_stats_hmm.csv"),
+                        index=False)
+                _hmm_path = self._out_model / "hmm_model.pkl"
+                with open(str(_hmm_path), "wb") as _fh:
+                    pickle.dump(hmm_model, _fh)
+                self._log(f"  HMM model saved -> {_hmm_path}")
+            except Exception:
+                self._log(f"  [WARN] HMM smoothing failed:\n"
+                          f"{traceback.format_exc()}")
+
         # Example clips — written in shuffled animal order so each cluster's
         # quota is filled from a random mix of animals rather than exhausted
         # by whichever animal happens to appear first.
@@ -2623,6 +3377,86 @@ class BSoidEngine:
                     self._out_plots / "transition_matrix.png")
             except Exception:
                 self._log(f"  [WARN] transition_matrix: "
+                          f"{traceback.format_exc()}")
+
+        # ── HMM diagnostic plots ──────────────────────────────────────────────
+        if self._cfg["save_plots"] and all_hmm_labels:
+            try:
+                plot_duration_comparison(
+                    np.concatenate(all_frame_labels),
+                    np.concatenate(all_hmm_labels),
+                    fps,
+                    self._out_plots / "hmm_duration_comparison.png")
+            except Exception:
+                self._log(f"  [WARN] hmm_duration_comparison: "
+                          f"{traceback.format_exc()}")
+            try:
+                plot_hmm_transition_matrix(
+                    hmm_model,
+                    self._out_plots / "hmm_transition_matrix.png")
+            except Exception:
+                self._log(f"  [WARN] hmm_transition_matrix: "
+                          f"{traceback.format_exc()}")
+            try:
+                for _raw, _hmm_l, _name in zip(
+                        all_frame_labels, all_hmm_labels, all_names):
+                    plot_dual_ethogram(
+                        _raw, _hmm_l, fps,
+                        self._out_plots / f"hmm_ethogram_{_name}.png",
+                        _name)
+            except Exception:
+                self._log(f"  [WARN] hmm_ethogram: "
+                          f"{traceback.format_exc()}")
+            try:
+                plot_syntax_network(
+                    hmm_model,
+                    self._out_plots / "hmm_syntax_network.png",
+                    min_prob=float(self._cfg.get("hmm_min_prob", 0.05)))
+            except Exception:
+                self._log(f"  [WARN] hmm_syntax_network: "
+                          f"{traceback.format_exc()}")
+
+        # ── Section 2: post-analysis publication plots ────────────────────────
+        if self._cfg["save_plots"] and all_frame_labels:
+            _export_labels = (
+                list(all_hmm_labels) if all_hmm_labels else list(all_frame_labels)
+            )
+
+            # Dwell-time violin plots
+            if all_epochs:
+                try:
+                    _comb_ep = pd.concat(
+                        [ep for ep, _ in all_epochs if not ep.empty],
+                        ignore_index=True)
+                    if not _comb_ep.empty:
+                        plot_dwell_violin(
+                            _comb_ep,
+                            self._out_plots / "dwell_time_distributions.png")
+                        self._log("  [PLOT] dwell_time_distributions.png saved")
+                except Exception:
+                    self._log(f"  [WARN] dwell_violin: {traceback.format_exc()}")
+
+            # Sankey behavioral-sequence flow diagram
+            try:
+                plot_sankey_sequences(
+                    _export_labels,
+                    self._out_plots / "sankey_sequences.png")
+                self._log("  [PLOT] sankey_sequences.png saved")
+            except Exception:
+                self._log(f"  [WARN] sankey_sequences: {traceback.format_exc()}")
+
+            # Continuous state-space projection (UMAP embedding + trajectory)
+            try:
+                _tag0 = all_names[0] if all_names else ""
+                plot_state_space_trajectory(
+                    embedding,
+                    hdb_labels,
+                    fps,
+                    self._out_plots / "state_space_projection.png",
+                    _tag0)
+                self._log("  [PLOT] state_space_projection.png saved")
+            except Exception:
+                self._log(f"  [WARN] state_space_projection: "
                           f"{traceback.format_exc()}")
 
         # Auto-groups

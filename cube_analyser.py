@@ -55,6 +55,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.colors as mcolors
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.gridspec import GridSpec
 import numpy as np
@@ -173,11 +174,39 @@ def extract_fps(path: pathlib.Path) -> int:
     return int(m.group(1)) if m else DEFAULT_FPS
 
 
+def _is_hmm_file(p: pathlib.Path) -> bool:
+    return "_hmm" in p.stem.lower()
+
+
+def _prefer_hmm(files: list) -> list:
+    """
+    Given a mixed list of bout_lengths CSV paths, return HMM-smoothed versions
+    when available, otherwise fall back to raw versions.
+
+    Rule: if EVERY raw file has a corresponding *_hmm counterpart, return the
+    HMM set (so the analyser uses the temporally-smoothed labels).  If only
+    some sessions have HMM files, still return the full HMM set (those sessions
+    were processed with HMM; the others weren't).  Never return a mix.
+    """
+    hmm_files = [p for p in files if _is_hmm_file(p)]
+    raw_files  = [p for p in files if not _is_hmm_file(p)]
+    if hmm_files:
+        return sorted(hmm_files)
+    return sorted(raw_files)
+
+
 def find_bsoid_files(root: pathlib.Path) -> list:
     """
     Return sorted list of bout_lengths CSV/TSV files.
-    Searches: root/BSOID/, root/, then recursively any bout_lengths/ subfolder,
-    then any *bout_lengths*.csv anywhere under root (up to arbitrary depth).
+
+    Priority: HMM-smoothed (*_bout_lengths_hmm.csv) files are preferred over
+    raw (*_bout_lengths.csv) files when both are present in the same folder.
+    This ensures the temporally-consistent HMM labels produced by CUBE's
+    post-hoc HMM pass are used for analysis rather than the noisier raw MLP
+    output.  To force raw labels, delete or move the _hmm files.
+
+    Search order: root/BSOID/, root/, any bout_lengths/ subfolder,
+    then any *bout_lengths*.csv anywhere under root.
     """
     # 1. Standard locations
     for d in (root / BSOID_SUBDIR, root):
@@ -187,7 +216,7 @@ def find_bsoid_files(root: pathlib.Path) -> list:
                 if "bout_lengths" in p.name.lower()
             )
             if hits:
-                return hits
+                return _prefer_hmm(hits)
 
     # 2. Any subdirectory named "bout_lengths" (e.g. cube_results/bout_lengths/)
     for candidate in sorted(root.rglob("bout_lengths")):
@@ -197,20 +226,94 @@ def find_bsoid_files(root: pathlib.Path) -> list:
                 if "bout_lengths" in p.name.lower()
             )
             if hits:
-                return hits
+                return _prefer_hmm(hits)
 
     # 3. Full recursive scan for any *bout_lengths*.csv / .tsv file
     hits = sorted(p for p in root.rglob("*bout_lengths*.csv"))
     if not hits:
         hits = sorted(p for p in root.rglob("*bout_lengths*.tsv"))
-    return hits
+    return _prefer_hmm(hits)
 
 
 def find_cluster_mapping(root: pathlib.Path) -> pathlib.Path | None:
-    """Search recursively for a cluster_behaviour_mapping.tsv produced by Video Explorer."""
+    """
+    Search for a cluster_behaviour_mapping.tsv produced by Video Explorer.
+    Checks root recursively first, then walks up to the grandparent directory
+    so the file is found even when Phase 4 exported to a sibling folder.
+    """
     for p in sorted(root.rglob("cluster_behaviour_mapping.tsv")):
-        return p   # return first match
+        return p
+    # Walk up to grandparent (2 levels) to catch exports next to cube_results/
+    for ancestor in [root.parent, root.parent.parent]:
+        if ancestor == root or not ancestor.is_dir():
+            continue
+        for p in sorted(ancestor.rglob("cluster_behaviour_mapping.tsv")):
+            return p
     return None
+
+
+def find_phase4_session_json(root: pathlib.Path) -> pathlib.Path | None:
+    """
+    Search for a Phase 4 (Video Explorer) session JSON file.
+    These contain a 'behaviour_groups' key and are saved to a user-chosen
+    location.  Searches root recursively then parent/grandparent dirs.
+    Returns the first match, or None.
+    """
+    search_roots = [root, root.parent, root.parent.parent]
+    for sr in search_roots:
+        if not sr.is_dir():
+            continue
+        for p in sorted(sr.rglob("*.json")):
+            if p.stat().st_size > 50_000_000:
+                continue  # skip huge files
+            try:
+                import json as _json
+                data = _json.loads(p.read_text(encoding="utf-8", errors="ignore")[:8192])
+                if isinstance(data, dict) and "behaviour_groups" in data:
+                    return p
+            except Exception:
+                continue
+    return None
+
+
+def load_groups_from_phase4_session(path: pathlib.Path) -> dict:
+    """
+    Convert a Phase 4 (Video Explorer) session JSON into the analyser's
+    groups format: {group_name: {"labels": [int, ...], "color": str}}.
+    """
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    behaviour_groups = data.get("behaviour_groups", {})
+    if not behaviour_groups:
+        raise ValueError("No behaviour_groups found in session JSON.")
+    groups: dict = {}
+    pal_idx = 0
+    for _uid, bgd in behaviour_groups.items():
+        name = str(bgd.get("name", f"Group {_uid}")).strip()
+        if not name:
+            continue
+        colour = bgd.get("colour") or bgd.get("color") or PALETTE[pal_idx % len(PALETTE)]
+        cluster_ids = [int(c) for c in bgd.get("cluster_ids", [])]
+        if name not in groups:
+            groups[name] = {"labels": cluster_ids, "color": colour}
+            pal_idx += 1
+        else:
+            groups[name]["labels"].extend(cluster_ids)
+    return groups
+
+
+def groups_from_all_clusters(all_labels: list) -> dict:
+    """
+    Build a one-group-per-cluster mapping when no behaviour groups have been
+    defined.  Each cluster gets its own group named "Cluster N".
+    """
+    groups: dict = {}
+    for i, lbl in enumerate(sorted(all_labels)):
+        groups[f"Cluster {lbl}"] = {
+            "labels": [int(lbl)],
+            "color":  PALETTE[i % len(PALETTE)],
+        }
+    return groups
 
 
 def find_umap_data(root: pathlib.Path):
@@ -921,7 +1024,7 @@ def build_volcano_figure(stats_df: pd.DataFrame, top_n: int, p_thresh: float,
                 marker = "D"
                 size   = 70
                 zorder = 4
-                edge   = "white"
+                edge   = t["border"]
             elif in_grp:
                 color  = cid_to_group[cid][1]
                 marker = "D"
@@ -1106,7 +1209,7 @@ def build_heatmap_figure(stats_df: pd.DataFrame, animal_data: list,
             ax_top.text(mid, 0.5, eg,
                         ha="center", va="center",
                         fontsize=max(6, 8 - len(eg_names) // 3),
-                        color="white", fontweight="bold")
+                        color=t["text"], fontweight="bold")
 
         # Legend in top-left of colour strip
         patches_leg = [mpatches.Patch(color=eg_colors_map[eg], label=eg)
@@ -2053,8 +2156,8 @@ def build_per_group_transition_figure(
         t = T()
     if recluster_result is None:
         fig, ax = plt.subplots(figsize=(6, 3), facecolor=t["fig_bg"])
-        ax.text(0.5, 0.5, "Run Reclustering first.",
-                ha="center", va="center", color=t["tick"], transform=ax.transAxes)
+        ax.text(0.5, 0.5, "No animals loaded.", ha="center", va="center",
+                color=t["tick"], transform=ax.transAxes)
         _style_ax(ax, t)
         return fig
 
@@ -2087,6 +2190,7 @@ def build_per_group_transition_figure(
     ncols     = min(n_eg, 3)
     nrows     = int(np.ceil(n_eg / ncols))
     cell_size = max(3.5, n * 0.25 + 1.5)
+    is_raw    = recluster_result.get("_is_raw_preview", False)
 
     with plt.style.context(t["mpl_style"]):
         fig, axes = plt.subplots(
@@ -2147,8 +2251,9 @@ def build_per_group_transition_figure(
         for ei in range(n_eg, len(axes_flat)):
             axes_flat[ei].set_visible(False)
 
+        note = "  [Original clusters — run Reclustering to update]" if is_raw else ""
         fig.suptitle(
-            "Transition Probabilities by Experimental Group\n"
+            f"Transition Probabilities by Experimental Group{note}\n"
             "(row-stochastic, diagonal = 0 — same cluster order as Transitions view)",
             color=t["tick"], fontweight="bold", fontsize=11)
         fig.tight_layout(rect=[0, 0, 1, 0.92])
@@ -2165,7 +2270,7 @@ def build_per_group_network_figure(
         t = T()
     if recluster_result is None:
         fig, ax = plt.subplots(figsize=(6, 3), facecolor=t["fig_bg"])
-        ax.text(0.5, 0.5, "No data available.", ha="center", va="center",
+        ax.text(0.5, 0.5, "No animals loaded.", ha="center", va="center",
                 color=t["tick"], transform=ax.transAxes)
         _style_ax(ax, t); return fig
 
@@ -2351,6 +2456,964 @@ def build_group_aggregate_network_figure(
             "Arrow width = aggregate transition probability  (top 80 % of edges shown)",
             color=t["tick"], fontweight="bold", fontsize=11)
         fig.tight_layout(rect=[0, 0, 1, 0.91])
+    return fig
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  BEHAVIORAL EXPLORER  —  Group-comparison figure builders
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_diff_heatmap_figure(
+        recluster_result: dict, animal_data: list,
+        ctrl_group: str = None, t: dict = None) -> plt.Figure:
+    """
+    Difference heatmaps for all experimental-group pairs.
+    For each (A, B) pair: Δ = P_B − P_A transition matrix.
+    Warm colours = B transitions more; cool = A transitions more.
+    Ordered by the dendrogram from reclustering for consistent axes.
+    """
+    if t is None:
+        t = T()
+
+    # Gather experimental groups
+    groups_eg: dict = {}
+    for ani in animal_data:
+        groups_eg.setdefault(ani["exp_group"], []).append(ani)
+    eg_names = list(groups_eg.keys())
+    n_eg     = len(eg_names)
+
+    if n_eg < 2:
+        fig, ax = plt.subplots(figsize=(6, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5,
+                "Need ≥ 2 experimental groups for difference heatmaps.",
+                ha="center", va="center", color=t["tick"],
+                transform=ax.transAxes)
+        _style_ax(ax, t)
+        return fig
+
+    if recluster_result is None:
+        fig, ax = plt.subplots(figsize=(6, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, "No animals loaded.", ha="center", va="center",
+                color=t["tick"], transform=ax.transAxes)
+        _style_ax(ax, t); return fig
+
+    cids_all = recluster_result["cluster_ids"]
+    lnk      = recluster_result.get("linkage_matrix")
+    if lnk is not None and len(cids_all) >= 2:
+        from scipy.cluster.hierarchy import dendrogram as _dend
+        order = _dend(lnk, no_plot=True)["leaves"]
+    else:
+        order = list(range(len(cids_all)))
+    cids_ord  = [cids_all[i] for i in order]
+    labels    = [f"C{c}" for c in cids_ord]
+    n         = len(cids_ord)
+
+    def _group_tmat(ani_list):
+        """Average row-stochastic transition matrix over *ani_list*."""
+        idx_eg = {c: i for i, c in enumerate(cids_ord)}
+        tsum   = np.zeros((n, n), dtype=float)
+        cnt    = 0
+        for ani in ani_list:
+            mat, ani_cids = compute_transition_matrix(ani["df"])
+            for ri, ci in enumerate(ani_cids):
+                for cj_i, cj in enumerate(ani_cids):
+                    if ci in idx_eg and cj in idx_eg:
+                        tsum[idx_eg[ci], idx_eg[cj]] += mat[ri, cj_i]
+            cnt += 1
+        tmat = tsum / max(cnt, 1)
+        np.fill_diagonal(tmat, 0)
+        return tmat
+
+    tmats = {eg: _group_tmat(groups_eg[eg]) for eg in eg_names}
+
+    # Determine reference group (ctrl_group or first)
+    ref_eg = ctrl_group if (ctrl_group and ctrl_group in tmats) else eg_names[0]
+
+    # Build pair list: (ctrl, other) for every other group
+    pairs   = [(ref_eg, eg) for eg in eg_names if eg != ref_eg]
+    n_pairs = len(pairs)
+
+    # Layout: n_pairs rows × 3 columns (ctrl | exp | diff)
+    cell    = max(3.5, n * 0.22 + 1.5)
+    fsize   = max(4, 7 - n // 20)
+    tick_step = max(1, n // 15)
+    tick_pos  = list(range(0, n, tick_step))
+    tick_lbl  = [labels[i] for i in tick_pos]
+
+    with plt.style.context(t["mpl_style"]):
+        fig, axes = plt.subplots(
+            n_pairs, 3,
+            figsize=(cell * 3 + 1.0, cell * n_pairs + 1.2),
+            facecolor=t["fig_bg"], squeeze=False)
+
+        for row, (eg_a, eg_b) in enumerate(pairs):
+            col_a = PALETTE[eg_names.index(eg_a) % len(PALETTE)]
+            col_b = PALETTE[eg_names.index(eg_b) % len(PALETTE)]
+
+            for col_i, (mat, title, cmap_name, vmin, vmax, cblabel) in enumerate([
+                (tmats[eg_a], f"{eg_a}  (reference)",
+                 "magma", 0, None, "P(transition)"),
+                (tmats[eg_b], f"{eg_b}",
+                 "magma", 0, None, "P(transition)"),
+                (tmats[eg_b] - tmats[eg_a], f"Δ = {eg_b} − {eg_a}",
+                 "RdBu_r", None, None, "ΔP"),
+            ]):
+                ax = axes[row, col_i]
+                vmax_use = float(np.abs(mat).max()) if vmax is None else vmax
+                vmin_use = -vmax_use if col_i == 2 else 0.0
+                im = ax.imshow(mat, cmap=cmap_name, aspect="auto",
+                               interpolation="nearest",
+                               vmin=vmin_use, vmax=vmax_use)
+                ax.set_xticks(tick_pos)
+                ax.set_xticklabels(tick_lbl, rotation=70,
+                                   fontsize=fsize, color=t["tick"])
+                ax.set_yticks(tick_pos)
+                ax.set_yticklabels(tick_lbl, fontsize=fsize, color=t["tick"])
+                tc = col_a if col_i == 0 else (col_b if col_i == 1 else t["tick"])
+                ax.set_title(title, color=tc, fontsize=9, fontweight="bold")
+                cb = fig.colorbar(im, ax=ax, shrink=0.75, pad=0.02)
+                cb.ax.tick_params(colors=t["tick"], labelsize=7)
+                cb.set_label(cblabel, color=t["tick"], fontsize=7)
+                cb.outline.set_edgecolor(t["spine"])
+                _style_ax(ax, t)
+
+    fig.suptitle(
+        "Transition Difference Heatmaps  (reference group subtracted)\n"
+        "Red = experimental group transitions MORE  ·  Blue = transitions LESS",
+        color=t["tick"], fontweight="bold", fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    return fig
+
+
+def build_dwell_violin_figure(
+        animal_data: list, t: dict = None) -> plt.Figure:
+    """
+    Per-group dwell-time violin plots: one panel per experimental group,
+    one violin per behavioral state.  Dwell time = bout duration in seconds.
+    """
+    if t is None:
+        t = T()
+
+    groups_eg: dict = {}
+    for ani in animal_data:
+        groups_eg.setdefault(ani["exp_group"], []).append(ani)
+    eg_names = list(groups_eg.keys())
+    n_eg     = len(eg_names)
+
+    if n_eg == 0:
+        fig, ax = plt.subplots(figsize=(6, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, "No animals loaded.", ha="center", va="center",
+                color=t["tick"], transform=ax.transAxes)
+        _style_ax(ax, t); return fig
+
+    # Collect all cluster IDs across all animals
+    all_cids = sorted({int(l) for ani in animal_data
+                       for l in ani["df"]["label"].unique()})
+    n_cids   = len(all_cids)
+    if n_cids == 0:
+        fig, ax = plt.subplots(figsize=(6, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, "No labels found.", ha="center", va="center",
+                color=t["tick"], transform=ax.transAxes)
+        _style_ax(ax, t); return fig
+
+    ncols = min(n_eg, 3)
+    nrows = int(np.ceil(n_eg / ncols))
+    cell_w = max(4, n_cids * 0.6 + 2)
+
+    with plt.style.context(t["mpl_style"]):
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(ncols * cell_w, nrows * 5.5 + 1.0),
+            facecolor=t["fig_bg"], squeeze=False)
+
+        for ei, eg in enumerate(eg_names):
+            r, c    = divmod(ei, ncols)
+            ax      = axes[r][c]
+            _style_ax(ax, t)
+            ani_list = groups_eg[eg]
+            eg_color = PALETTE[ei % len(PALETTE)]
+
+            data   = []
+            labels = []
+            colors = []
+            for cid in all_cids:
+                bouts_all = []
+                for ani in ani_list:
+                    fps_a = float(ani.get("fps", 30))
+                    sub   = ani["df"][ani["df"]["label"] == cid]
+                    # Run lengths → seconds (column is "run_len" after load_csv rename)
+                    if "run_len" in sub.columns:
+                        bouts_all.extend((sub["run_len"].values / fps_a).tolist())
+                    elif "Run lengths" in sub.columns:
+                        bouts_all.extend((sub["Run lengths"].values / fps_a).tolist())
+                    elif "duration_sec" in sub.columns:
+                        bouts_all.extend(sub["duration_sec"].values.tolist())
+                data.append(np.array(bouts_all, dtype=float))
+                labels.append(f"C{cid}")
+                colors.append(PALETTE[cid % len(PALETTE)])
+
+            non_empty = [i for i, d in enumerate(data) if len(d) > 0]
+            if not non_empty:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                        color=t["tick"], transform=ax.transAxes)
+                ax.set_title(eg, color=eg_color, fontsize=9, fontweight="bold")
+                continue
+
+            data_ne   = [data[i]   for i in non_empty]
+            labels_ne = [labels[i] for i in non_empty]
+            colors_ne = [colors[i] for i in non_empty]
+
+            parts = ax.violinplot(data_ne, positions=range(len(non_empty)),
+                                  showmedians=True, showextrema=True)
+            parts["cmedians"].set_color("#ffd60a")
+            for sp in ("cmins", "cmaxes", "cbars"):
+                parts[sp].set_color(t["spine"])
+            for i, pc in enumerate(parts["bodies"]):
+                pc.set_facecolor(colors_ne[i])
+                pc.set_edgecolor(t["ax_bg"])
+                pc.set_alpha(0.72)
+
+            rng = np.random.default_rng(42)
+            for i, d in enumerate(data_ne):
+                jit = rng.uniform(-0.12, 0.12, size=len(d))
+                ax.scatter(i + jit, d,
+                           color=colors_ne[i], alpha=0.3, s=5, linewidths=0,
+                           zorder=3)
+
+            ax.set_xticks(range(len(non_empty)))
+            ax.set_xticklabels(labels_ne, color=t["tick"],
+                               fontsize=max(5, 9 - n_cids // 8), rotation=45)
+            ax.set_ylabel("Dwell time (s)", color=t["tick"], fontsize=9)
+            ax.set_yscale("log")
+            ax.set_title(f"{eg}  (n = {len(ani_list)})",
+                         color=eg_color, fontsize=9, fontweight="bold")
+
+        for ei in range(n_eg, nrows * ncols):
+            r, c = divmod(ei, ncols)
+            axes[r][c].set_visible(False)
+
+    fig.suptitle(
+        "Dwell-time distributions by experimental group\n"
+        "Each violin = distribution of bout durations for one state · "
+        "Dots = individual bouts",
+        color=t["tick"], fontweight="bold", fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    return fig
+
+
+def build_sankey_figure(
+        animal_data: list, t: dict = None,
+        n_steps: int = 5) -> plt.Figure:
+    """
+    Sankey (alluvial) flow diagram per experimental group.
+    Each column is a consecutive bout position; ribbons show how the
+    population flows from state to state across the sequence.
+    """
+    if t is None:
+        t = T()
+
+    from matplotlib.path import Path as MPath
+
+    groups_eg: dict = {}
+    for ani in animal_data:
+        groups_eg.setdefault(ani["exp_group"], []).append(ani)
+    eg_names = list(groups_eg.keys())
+    n_eg     = len(eg_names)
+
+    if n_eg == 0:
+        fig, ax = plt.subplots(figsize=(6, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, "No animals loaded.", ha="center", va="center",
+                color=t["tick"], transform=ax.transAxes)
+        _style_ax(ax, t); return fig
+
+    all_cids = sorted({int(l) for ani in animal_data
+                       for l in ani["df"]["label"].unique()})
+    ns = len(all_cids)
+    si = {c: i for i, c in enumerate(all_cids)}
+
+    def _bout_seqs(ani_list):
+        seqs = []
+        for ani in ani_list:
+            seq = ani["df"].sort_values("start_frame")["label"].values
+            if len(seq) >= 2:
+                seqs.append([int(x) for x in seq])
+        return seqs
+
+    def _build_flow(seqs, n_steps_use):
+        counts = np.zeros((n_steps_use, ns), dtype=float)
+        trans  = np.zeros((n_steps_use - 1, ns, ns), dtype=float)
+        for seq in seqs:
+            for k in range(min(n_steps_use, len(seq))):
+                counts[k, si[seq[k]]] += 1
+            for k in range(min(n_steps_use - 1, len(seq) - 1)):
+                trans[k, si[seq[k]], si[seq[k + 1]]] += 1
+        tot = counts.sum(axis=1, keepdims=True)
+        tot[tot == 0] = 1.0
+        props = counts / tot
+        for k in range(n_steps_use - 1):
+            rs = trans[k].sum(axis=1, keepdims=True)
+            rs[rs == 0] = 1.0
+            trans[k] /= rs
+        return props, trans
+
+    ncols = min(n_eg, 2)
+    nrows = int(np.ceil(n_eg / ncols))
+    fw    = max(10, n_steps * 2.2) * ncols
+    fh    = 7.5 * nrows
+
+    colors_state = [PALETTE[c % len(PALETTE)] for c in all_cids]
+    col_w  = 0.04
+    bar_h  = 0.88
+    gap    = 0.005
+
+    with plt.style.context(t["mpl_style"]):
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(fw, fh),
+            facecolor=t["fig_bg"], squeeze=False)
+
+        for ei, eg in enumerate(eg_names):
+            r, c     = divmod(ei, ncols)
+            ax       = axes[r][c]
+            ax.set_facecolor(t["ax_bg"])
+            ax.axis("off")
+            eg_color = PALETTE[ei % len(PALETTE)]
+
+            seqs   = _bout_seqs(groups_eg[eg])
+            if not seqs:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                        color=t["tick"], transform=ax.transAxes)
+                ax.set_title(f"{eg}", color=eg_color, fontsize=10,
+                             fontweight="bold")
+                continue
+
+            n_use = min(n_steps, min(len(s) for s in seqs))
+            if n_use < 2:
+                ax.text(0.5, 0.5, "Sequences too short",
+                        ha="center", va="center", color=t["tick"],
+                        transform=ax.transAxes)
+                continue
+
+            props, trans = _build_flow(seqs, n_use)
+            col_x_use    = np.linspace(0, 1, n_use)
+
+            y_bot = np.zeros((n_use, ns), dtype=float)
+            y_top = np.zeros((n_use, ns), dtype=float)
+            for k in range(n_use):
+                cum = 0.06
+                for si_j in range(ns):
+                    h = props[k, si_j] * bar_h
+                    y_bot[k, si_j] = cum
+                    y_top[k, si_j] = cum + h
+                    cum += h + gap
+
+            # Ribbons
+            for k in range(n_use - 1):
+                x0 = col_x_use[k] + col_w
+                x1 = col_x_use[k + 1]
+                cx0 = x0 + (x1 - x0) * 0.40
+                cx1 = x0 + (x1 - x0) * 0.60
+                src_off = np.zeros(ns, dtype=float)
+                dst_off = np.zeros(ns, dtype=float)
+                for a in range(ns):
+                    sh = y_top[k, a] - y_bot[k, a]
+                    for b in range(ns):
+                        p = float(trans[k, a, b])
+                        if p < 0.01:
+                            continue
+                        rhs = sh * p
+                        rhd = (y_top[k+1, b] - y_bot[k+1, b]) * p
+                        ys0 = y_bot[k, a]   + src_off[a]
+                        ye0 = ys0 + rhs
+                        ys1 = y_bot[k+1, b] + dst_off[b]
+                        ye1 = ys1 + rhd
+                        src_off[a] += rhs
+                        dst_off[b] += rhd
+                        verts = [
+                            (x0, ys0), (cx0, ys0), (cx1, ys1), (x1, ys1),
+                            (x1, ye1), (cx1, ye1), (cx0, ye0), (x0, ye0),
+                            (x0, ys0),
+                        ]
+                        codes = ([MPath.MOVETO] + [MPath.CURVE4]*3 +
+                                 [MPath.LINETO] + [MPath.CURVE4]*3 +
+                                 [MPath.CLOSEPOLY])
+                        patch = mpatches.PathPatch(
+                            MPath(verts, codes),
+                            facecolor=colors_state[a],
+                            edgecolor="none", alpha=0.35, zorder=1)
+                        ax.add_patch(patch)
+
+            # Bars
+            for k in range(n_use):
+                for si_j in range(ns):
+                    h = y_top[k, si_j] - y_bot[k, si_j]
+                    if h < 1e-4:
+                        continue
+                    rect = mpatches.FancyBboxPatch(
+                        (col_x_use[k], y_bot[k, si_j]), col_w, h,
+                        boxstyle="square,pad=0",
+                        facecolor=colors_state[si_j],
+                        edgecolor=t["ax_bg"], linewidth=0.5, zorder=3)
+                    ax.add_patch(rect)
+                    if h > 0.05:
+                        ax.text(col_x_use[k] + col_w/2,
+                                y_bot[k, si_j] + h/2,
+                                f"C{all_cids[si_j]}",
+                                ha="center", va="center",
+                                fontsize=max(4, 8 - ns // 6),
+                                color=t["text"], fontweight="bold", zorder=4)
+
+            for k, x in enumerate(col_x_use):
+                ax.text(x + col_w/2, 0.01, f"Step {k+1}",
+                        ha="center", va="bottom", fontsize=8,
+                        color=t["tick"], fontweight="bold")
+
+            ax.set_xlim(-0.04, 1.06)
+            ax.set_ylim(0, 1.02)
+            ax.set_title(f"{eg}  (n = {len(groups_eg[eg])})",
+                         color=eg_color, fontsize=10, fontweight="bold",
+                         pad=4)
+
+        for ei in range(n_eg, nrows * ncols):
+            r, c = divmod(ei, ncols)
+            axes[r][c].set_visible(False)
+
+    fig.suptitle(
+        f"Behavioral Sequence Sankey  (first {n_steps} bout positions)\n"
+        "Bar height = state occupancy  ·  Ribbon width = transition flow",
+        color=t["tick"], fontweight="bold", fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    return fig
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  BEHAVIORAL EXPLORER  —  Behaviour-group-level figure builders
+#  (Parallel to the cluster-level builders above but nodes = user groups)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_dwell_violin_beh_groups_figure(
+        animal_data: list, groups: dict, t: dict = None) -> plt.Figure:
+    """
+    Dwell-time violin plots using user-defined behavioural groups.
+    One panel per experimental group; one violin per behavioural group
+    aggregating bouts from all constituent clusters.
+    """
+    if t is None:
+        t = T()
+    if not groups:
+        fig, ax = plt.subplots(figsize=(6, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, "No behaviour groups defined.\n"
+                "Create groups in the Group Editor first.",
+                ha="center", va="center", color=t["tick"],
+                transform=ax.transAxes, fontsize=9)
+        _style_ax(ax, t); return fig
+
+    groups_eg: dict = {}
+    for ani in animal_data:
+        groups_eg.setdefault(ani["exp_group"], []).append(ani)
+    eg_names = list(groups_eg.keys())
+    n_eg     = len(eg_names)
+
+    if n_eg == 0:
+        fig, ax = plt.subplots(figsize=(6, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, "No animals loaded.", ha="center", va="center",
+                color=t["tick"], transform=ax.transAxes)
+        _style_ax(ax, t); return fig
+
+    group_names  = list(groups.keys())
+    group_colors = [groups[g].get("color", PALETTE[i % len(PALETTE)])
+                    for i, g in enumerate(group_names)]
+    ng           = len(group_names)
+
+    ncols  = min(n_eg, 3)
+    nrows  = int(np.ceil(n_eg / ncols))
+    cell_w = max(4, ng * 0.7 + 2)
+
+    with plt.style.context(t["mpl_style"]):
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(ncols * cell_w, nrows * 5.5 + 1.0),
+            facecolor=t["fig_bg"], squeeze=False)
+
+        for ei, eg in enumerate(eg_names):
+            r, c     = divmod(ei, ncols)
+            ax       = axes[r][c]
+            _style_ax(ax, t)
+            ani_list = groups_eg[eg]
+            eg_color = PALETTE[ei % len(PALETTE)]
+
+            data = []
+            for gi, gname in enumerate(group_names):
+                cids      = {int(c) for c in groups[gname].get("labels", [])}
+                bouts_all = []
+                for ani in ani_list:
+                    fps_a = float(ani.get("fps", 30))
+                    sub   = ani["df"][ani["df"]["label"].isin(cids)]
+                    if "run_len" in sub.columns and len(sub):
+                        bouts_all.extend(
+                            (sub["run_len"].values / fps_a).tolist())
+                    elif "Run lengths" in sub.columns and len(sub):
+                        bouts_all.extend(
+                            (sub["Run lengths"].values / fps_a).tolist())
+                data.append(np.array(bouts_all, dtype=float))
+
+            non_empty = [i for i, d in enumerate(data) if len(d) > 0]
+            if not non_empty:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                        color=t["tick"], transform=ax.transAxes)
+                ax.set_title(f"{eg}  (n = {len(ani_list)})",
+                             color=eg_color, fontsize=9, fontweight="bold")
+                continue
+
+            data_ne   = [data[i]        for i in non_empty]
+            labels_ne = [group_names[i] for i in non_empty]
+            colors_ne = [group_colors[i] for i in non_empty]
+
+            parts = ax.violinplot(data_ne, positions=range(len(non_empty)),
+                                  showmedians=True, showextrema=True)
+            parts["cmedians"].set_color("#ffd60a")
+            for sp in ("cmins", "cmaxes", "cbars"):
+                parts[sp].set_color(t["spine"])
+            for i, pc in enumerate(parts["bodies"]):
+                pc.set_facecolor(colors_ne[i])
+                pc.set_edgecolor(t["ax_bg"])
+                pc.set_alpha(0.72)
+
+            rng = np.random.default_rng(42)
+            for i, d in enumerate(data_ne):
+                jit = rng.uniform(-0.12, 0.12, size=len(d))
+                ax.scatter(i + jit, d, color=colors_ne[i],
+                           alpha=0.3, s=5, linewidths=0, zorder=3)
+
+            ax.set_xticks(range(len(non_empty)))
+            ax.set_xticklabels(labels_ne, color=t["tick"],
+                               fontsize=max(5, 9 - ng // 6), rotation=45,
+                               ha="right")
+            ax.set_ylabel("Dwell time (s)", color=t["tick"], fontsize=9)
+            ax.set_yscale("log")
+            ax.set_title(f"{eg}  (n = {len(ani_list)})",
+                         color=eg_color, fontsize=9, fontweight="bold")
+
+        for ei in range(n_eg, nrows * ncols):
+            r, c = divmod(ei, ncols)
+            axes[r][c].set_visible(False)
+
+    fig.suptitle(
+        "Dwell-time distributions by experimental group  [Behaviour Groups]\n"
+        "Each violin = bout durations for one behaviour group  ·  Dots = individual bouts",
+        color=t["tick"], fontweight="bold", fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    return fig
+
+
+def build_sankey_beh_groups_figure(
+        animal_data: list, groups: dict, t: dict = None,
+        n_steps: int = 5) -> plt.Figure:
+    """
+    Sankey (alluvial) flow diagram per experimental group using user-defined
+    behavioural groups as states.  Cluster labels are mapped to groups first.
+    """
+    if t is None:
+        t = T()
+
+    from matplotlib.path import Path as MPath
+
+    if not groups:
+        fig, ax = plt.subplots(figsize=(6, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, "No behaviour groups defined.\n"
+                "Create groups in the Group Editor first.",
+                ha="center", va="center", color=t["tick"],
+                transform=ax.transAxes, fontsize=9)
+        _style_ax(ax, t); return fig
+
+    group_names  = list(groups.keys())
+    group_colors = [groups[g].get("color", PALETTE[i % len(PALETTE)])
+                    for i, g in enumerate(group_names)]
+    ng = len(group_names)
+
+    cid_to_gi: dict = {}
+    for gi, gname in enumerate(group_names):
+        for cid in groups[gname].get("labels", []):
+            cid_to_gi[int(cid)] = gi
+
+    groups_eg: dict = {}
+    for ani in animal_data:
+        groups_eg.setdefault(ani["exp_group"], []).append(ani)
+    eg_names = list(groups_eg.keys())
+    n_eg     = len(eg_names)
+
+    if n_eg == 0:
+        fig, ax = plt.subplots(figsize=(6, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, "No animals loaded.", ha="center", va="center",
+                color=t["tick"], transform=ax.transAxes)
+        _style_ax(ax, t); return fig
+
+    def _bout_seqs_grp(ani_list):
+        seqs = []
+        for ani in ani_list:
+            seq  = ani["df"].sort_values("start_frame")["label"].values
+            gseq = [cid_to_gi[int(x)] for x in seq if int(x) in cid_to_gi]
+            if len(gseq) >= 2:
+                seqs.append(gseq)
+        return seqs
+
+    def _build_flow(seqs, n_steps_use):
+        counts = np.zeros((n_steps_use, ng), dtype=float)
+        trans  = np.zeros((n_steps_use - 1, ng, ng), dtype=float)
+        for seq in seqs:
+            for k in range(min(n_steps_use, len(seq))):
+                counts[k, seq[k]] += 1
+            for k in range(min(n_steps_use - 1, len(seq) - 1)):
+                trans[k, seq[k], seq[k + 1]] += 1
+        tot = counts.sum(axis=1, keepdims=True)
+        tot[tot == 0] = 1.0
+        props = counts / tot
+        for k in range(n_steps_use - 1):
+            rs = trans[k].sum(axis=1, keepdims=True)
+            rs[rs == 0] = 1.0
+            trans[k] /= rs
+        return props, trans
+
+    ncols  = min(n_eg, 2)
+    nrows  = int(np.ceil(n_eg / ncols))
+    fw     = max(10, n_steps * 2.2) * ncols
+    fh     = 7.5 * nrows
+    col_w  = 0.04
+    bar_h  = 0.88
+    gap    = 0.005
+
+    with plt.style.context(t["mpl_style"]):
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(fw, fh),
+            facecolor=t["fig_bg"], squeeze=False)
+
+        for ei, eg in enumerate(eg_names):
+            r, c     = divmod(ei, ncols)
+            ax       = axes[r][c]
+            ax.set_facecolor(t["ax_bg"])
+            ax.axis("off")
+            eg_color = PALETTE[ei % len(PALETTE)]
+
+            seqs = _bout_seqs_grp(groups_eg[eg])
+            if not seqs:
+                ax.text(0.5, 0.5, "No data (no clusters assigned to groups?)",
+                        ha="center", va="center", color=t["tick"],
+                        transform=ax.transAxes)
+                ax.set_title(f"{eg}", color=eg_color,
+                             fontsize=10, fontweight="bold")
+                continue
+
+            n_use = min(n_steps, min(len(s) for s in seqs))
+            if n_use < 2:
+                ax.text(0.5, 0.5, "Sequences too short",
+                        ha="center", va="center",
+                        color=t["tick"], transform=ax.transAxes)
+                continue
+
+            props, trans = _build_flow(seqs, n_use)
+            col_x_use    = np.linspace(0, 1, n_use)
+
+            y_bot = np.zeros((n_use, ng), dtype=float)
+            y_top = np.zeros((n_use, ng), dtype=float)
+            for k in range(n_use):
+                cum = 0.06
+                for gi in range(ng):
+                    h = props[k, gi] * bar_h
+                    y_bot[k, gi] = cum
+                    y_top[k, gi] = cum + h
+                    cum += h + gap
+
+            for k in range(n_use - 1):
+                x0  = col_x_use[k] + col_w
+                x1  = col_x_use[k + 1]
+                cx0 = x0 + (x1 - x0) * 0.40
+                cx1 = x0 + (x1 - x0) * 0.60
+                src_off = np.zeros(ng, dtype=float)
+                dst_off = np.zeros(ng, dtype=float)
+                for a in range(ng):
+                    sh = y_top[k, a] - y_bot[k, a]
+                    for b in range(ng):
+                        p = float(trans[k, a, b])
+                        if p < 0.01:
+                            continue
+                        rhs = sh * p
+                        rhd = (y_top[k+1, b] - y_bot[k+1, b]) * p
+                        ys0 = y_bot[k, a]   + src_off[a]
+                        ye0 = ys0 + rhs
+                        ys1 = y_bot[k+1, b] + dst_off[b]
+                        ye1 = ys1 + rhd
+                        src_off[a] += rhs
+                        dst_off[b] += rhd
+                        verts = [
+                            (x0, ys0), (cx0, ys0), (cx1, ys1), (x1, ys1),
+                            (x1, ye1), (cx1, ye1), (cx0, ye0), (x0, ye0),
+                            (x0, ys0),
+                        ]
+                        codes = ([MPath.MOVETO] + [MPath.CURVE4]*3 +
+                                 [MPath.LINETO] + [MPath.CURVE4]*3 +
+                                 [MPath.CLOSEPOLY])
+                        ax.add_patch(mpatches.PathPatch(
+                            MPath(verts, codes),
+                            facecolor=group_colors[a],
+                            edgecolor="none", alpha=0.35, zorder=1))
+
+            for k in range(n_use):
+                for gi in range(ng):
+                    h = y_top[k, gi] - y_bot[k, gi]
+                    if h < 1e-4:
+                        continue
+                    ax.add_patch(mpatches.FancyBboxPatch(
+                        (col_x_use[k], y_bot[k, gi]), col_w, h,
+                        boxstyle="square,pad=0",
+                        facecolor=group_colors[gi],
+                        edgecolor=t["ax_bg"], linewidth=0.5, zorder=3))
+                    if h > 0.04:
+                        ax.text(col_x_use[k] + col_w/2,
+                                y_bot[k, gi] + h/2,
+                                group_names[gi],
+                                ha="center", va="center",
+                                fontsize=max(4, 8 - ng // 4),
+                                color=t["text"], fontweight="bold", zorder=4)
+
+            for k, x in enumerate(col_x_use):
+                ax.text(x + col_w/2, 0.01, f"Step {k+1}",
+                        ha="center", va="bottom", fontsize=8,
+                        color=t["tick"], fontweight="bold")
+            ax.set_xlim(-0.04, 1.06)
+            ax.set_ylim(0, 1.02)
+            ax.set_title(f"{eg}  (n = {len(groups_eg[eg])})",
+                         color=eg_color, fontsize=10, fontweight="bold", pad=4)
+
+        for ei in range(n_eg, nrows * ncols):
+            r, c = divmod(ei, ncols)
+            axes[r][c].set_visible(False)
+
+    fig.suptitle(
+        f"Behaviour Group Sequence Sankey  (first {n_steps} bout positions)  "
+        "[User-Defined Groups]\n"
+        "Bar height = group occupancy  ·  Ribbon width = transition flow",
+        color=t["tick"], fontweight="bold", fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    return fig
+
+
+def build_group_aggregate_transition_figure(
+        animal_data: list, groups: dict, t: dict = None) -> plt.Figure:
+    """
+    Per-experimental-group transition probability heatmaps at the
+    behavioural-group level.  Each cell = mean probability of transitioning
+    from one user-defined group to another.
+    """
+    if t is None:
+        t = T()
+    if not groups:
+        fig, ax = plt.subplots(figsize=(6, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, "No behaviour groups defined.\n"
+                "Create groups in the Group Editor first.",
+                ha="center", va="center", color=t["tick"],
+                transform=ax.transAxes, fontsize=9)
+        _style_ax(ax, t); return fig
+
+    group_names  = list(groups.keys())
+    group_colors = [groups[g].get("color", PALETTE[i % len(PALETTE)])
+                    for i, g in enumerate(group_names)]
+    ng = len(group_names)
+
+    cid_to_gi: dict = {}
+    for gi, gname in enumerate(group_names):
+        for cid in groups[gname].get("labels", []):
+            cid_to_gi[int(cid)] = gi
+
+    groups_eg: dict = {}
+    for ani in animal_data:
+        groups_eg.setdefault(ani["exp_group"], []).append(ani)
+    eg_names = list(groups_eg.keys())
+    n_eg     = len(eg_names)
+
+    if n_eg == 0:
+        fig, ax = plt.subplots(figsize=(6, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, "No animals loaded.", ha="center", va="center",
+                color=t["tick"], transform=ax.transAxes)
+        _style_ax(ax, t); return fig
+
+    def _build_gmat(ani_list: list) -> np.ndarray:
+        gmat = np.zeros((ng, ng), dtype=float)
+        gcnt = np.zeros((ng, ng), dtype=float)
+        for ani in ani_list:
+            mat, ani_cids = compute_transition_matrix(ani["df"])
+            for ri, ci in enumerate(ani_cids):
+                if int(ci) not in cid_to_gi:
+                    continue
+                gi_r = cid_to_gi[int(ci)]
+                for cj_i, cj in enumerate(ani_cids):
+                    if int(cj) not in cid_to_gi:
+                        continue
+                    gi_c = cid_to_gi[int(cj)]
+                    gmat[gi_r, gi_c] += mat[ri, cj_i]
+                    gcnt[gi_r, gi_c] += 1.0
+        safe = np.where(gcnt > 0, gcnt, 1.0)
+        tmat = gmat / safe
+        np.fill_diagonal(tmat, 0)
+        return tmat
+
+    ncols     = min(n_eg, 3)
+    nrows     = int(np.ceil(n_eg / ncols))
+    cell_size = max(3.5, ng * 0.45 + 2)
+    fsize     = max(5, 9 - ng // 5)
+
+    with plt.style.context(t["mpl_style"]):
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(ncols * cell_size + 0.5, nrows * cell_size + 1.2),
+            facecolor=t["fig_bg"], squeeze=False,
+        )
+        axes_flat = axes.flatten()
+
+        for ei, eg in enumerate(eg_names):
+            ax_eg    = axes_flat[ei]
+            gmat     = _build_gmat(groups_eg[eg])
+            eg_color = PALETTE[ei % len(PALETTE)]
+            vmax     = float(gmat.max()) if gmat.max() > 0 else 1.0
+
+            im = ax_eg.imshow(gmat, cmap="magma", aspect="auto",
+                              interpolation="nearest", vmin=0, vmax=vmax)
+            ax_eg.set_xticks(range(ng))
+            ax_eg.set_xticklabels(group_names, rotation=45, ha="right",
+                                   fontsize=fsize, color=t["tick"])
+            ax_eg.set_yticks(range(ng))
+            ax_eg.set_yticklabels(group_names, fontsize=fsize, color=t["tick"])
+            for tick, col in zip(ax_eg.get_xticklabels(), group_colors):
+                tick.set_color(col)
+            for tick, col in zip(ax_eg.get_yticklabels(), group_colors):
+                tick.set_color(col)
+            ax_eg.set_title(f"{eg}  (n = {len(groups_eg[eg])})",
+                            color=eg_color, fontsize=9, fontweight="bold")
+            cb = fig.colorbar(im, ax=ax_eg, shrink=0.75, pad=0.02)
+            cb.ax.tick_params(colors=t["tick"], labelsize=7)
+            cb.outline.set_edgecolor(t["spine"])
+            cb.set_label("P(transition)", color=t["tick"], fontsize=7)
+            _style_ax(ax_eg, t)
+
+        for ei in range(n_eg, len(axes_flat)):
+            axes_flat[ei].set_visible(False)
+
+        fig.suptitle(
+            "Behaviour Group Transition Probabilities by Experimental Group  "
+            "[User-Defined Groups]\n"
+            "(row-stochastic, diagonal = 0  ·  nodes are user-defined groups)",
+            color=t["tick"], fontweight="bold", fontsize=11)
+        fig.tight_layout(rect=[0, 0, 1, 0.92])
+    return fig
+
+
+def build_diff_heatmap_beh_groups_figure(
+        animal_data: list, groups: dict,
+        ctrl_group: str = None, t: dict = None) -> plt.Figure:
+    """
+    Behavioural-group-level difference heatmaps.  Same layout as
+    build_diff_heatmap_figure but nodes are user-defined groups.
+    """
+    if t is None:
+        t = T()
+    if not groups:
+        fig, ax = plt.subplots(figsize=(6, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, "No behaviour groups defined.\n"
+                "Create groups in the Group Editor first.",
+                ha="center", va="center", color=t["tick"],
+                transform=ax.transAxes, fontsize=9)
+        _style_ax(ax, t); return fig
+
+    group_names = list(groups.keys())
+    ng          = len(group_names)
+
+    cid_to_gi: dict = {}
+    for gi, gname in enumerate(group_names):
+        for cid in groups[gname].get("labels", []):
+            cid_to_gi[int(cid)] = gi
+
+    groups_eg: dict = {}
+    for ani in animal_data:
+        groups_eg.setdefault(ani["exp_group"], []).append(ani)
+    eg_names = list(groups_eg.keys())
+    n_eg     = len(eg_names)
+
+    if n_eg < 2:
+        fig, ax = plt.subplots(figsize=(6, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5,
+                "Need ≥ 2 experimental groups for difference heatmaps.",
+                ha="center", va="center", color=t["tick"],
+                transform=ax.transAxes)
+        _style_ax(ax, t); return fig
+
+    def _group_tmat(ani_list: list) -> np.ndarray:
+        gmat = np.zeros((ng, ng), dtype=float)
+        gcnt = np.zeros((ng, ng), dtype=float)
+        for ani in ani_list:
+            mat, ani_cids = compute_transition_matrix(ani["df"])
+            for ri, ci in enumerate(ani_cids):
+                if int(ci) not in cid_to_gi:
+                    continue
+                gi_r = cid_to_gi[int(ci)]
+                for cj_i, cj in enumerate(ani_cids):
+                    if int(cj) not in cid_to_gi:
+                        continue
+                    gi_c = cid_to_gi[int(cj)]
+                    gmat[gi_r, gi_c] += mat[ri, cj_i]
+                    gcnt[gi_r, gi_c] += 1.0
+        safe = np.where(gcnt > 0, gcnt, 1.0)
+        tmat = gmat / safe
+        np.fill_diagonal(tmat, 0)
+        return tmat
+
+    tmats  = {eg: _group_tmat(groups_eg[eg]) for eg in eg_names}
+    ref_eg = ctrl_group if (ctrl_group and ctrl_group in tmats) else eg_names[0]
+    pairs  = [(ref_eg, eg) for eg in eg_names if eg != ref_eg]
+    n_pairs = len(pairs)
+
+    cell  = max(3.5, ng * 0.45 + 2)
+    fsize = max(5, 9 - ng // 5)
+
+    with plt.style.context(t["mpl_style"]):
+        fig, axes = plt.subplots(
+            n_pairs, 3,
+            figsize=(cell * 3 + 1.0, cell * n_pairs + 1.2),
+            facecolor=t["fig_bg"], squeeze=False)
+
+        for row, (eg_a, eg_b) in enumerate(pairs):
+            col_a = PALETTE[eg_names.index(eg_a) % len(PALETTE)]
+            col_b = PALETTE[eg_names.index(eg_b) % len(PALETTE)]
+
+            for col_i, (mat, title, cmap_name, cblabel) in enumerate([
+                (tmats[eg_a], f"{eg_a}  (reference)", "magma", "P(transition)"),
+                (tmats[eg_b], f"{eg_b}",              "magma", "P(transition)"),
+                (tmats[eg_b] - tmats[eg_a],
+                 f"Δ = {eg_b} − {eg_a}", "RdBu_r", "ΔP"),
+            ]):
+                ax = axes[row, col_i]
+                vmax_use = float(np.abs(mat).max()) if np.abs(mat).max() > 0 else 1.0
+                vmin_use = -vmax_use if col_i == 2 else 0.0
+                im = ax.imshow(mat, cmap=cmap_name, aspect="auto",
+                               interpolation="nearest",
+                               vmin=vmin_use, vmax=vmax_use)
+                ax.set_xticks(range(ng))
+                ax.set_xticklabels(group_names, rotation=45, ha="right",
+                                   fontsize=fsize, color=t["tick"])
+                ax.set_yticks(range(ng))
+                ax.set_yticklabels(group_names, fontsize=fsize, color=t["tick"])
+                tc = col_a if col_i == 0 else (col_b if col_i == 1 else t["tick"])
+                ax.set_title(title, color=tc, fontsize=9, fontweight="bold")
+                cb = fig.colorbar(im, ax=ax, shrink=0.75, pad=0.02)
+                cb.ax.tick_params(colors=t["tick"], labelsize=7)
+                cb.set_label(cblabel, color=t["tick"], fontsize=7)
+                cb.outline.set_edgecolor(t["spine"])
+                _style_ax(ax, t)
+
+    fig.suptitle(
+        "Behaviour Group Transition Difference Heatmaps  [User-Defined Groups]\n"
+        "Red = experimental group transitions MORE  ·  Blue = transitions LESS",
+        color=t["tick"], fontweight="bold", fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
     return fig
 
 
@@ -3223,8 +4286,8 @@ class AnimalListPanel(ctk.CTkFrame):
                     "path":      path,
                     "df":        df,
                     "fps":       fps,
-                    "exp_group": tk.StringVar(value="Control"),
-                    "_selected": tk.BooleanVar(value=False),
+                    "exp_group": tk.StringVar(master=self, value="Control"),
+                    "_selected": tk.BooleanVar(master=self, value=False),
                     "_row_frame": None,
                 }
                 self._animals.append(entry)
@@ -3335,8 +4398,8 @@ class AnimalListPanel(ctk.CTkFrame):
                     "path":      path,
                     "df":        df,
                     "fps":       fps,
-                    "exp_group": tk.StringVar(value="Control"),
-                    "_selected": tk.BooleanVar(value=False),
+                    "exp_group": tk.StringVar(master=self, value="Control"),
+                    "_selected": tk.BooleanVar(master=self, value=False),
                     "_row_frame": None,
                 }
                 self._animals.append(entry)
@@ -3553,7 +4616,6 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             values=["Top-N Bar", "Volcano", "Heatmap",
                     "Elbow/Silhouette", "Recombination",
                     "Dist Matrix", "Transitions",
-                    "Group Transitions", "Group Network", "Beh Network",
                     "Cluster Stats"],
             variable=self._plot_mode,
             command=self._switch_plot,
@@ -3713,9 +4775,6 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             "recombination":      ("Recombination",       False, True,  False),
             "dist_matrix":        ("Dist Matrix",         False, False, True),
             "transitions":        ("Transitions",         False, False, True),
-            "group_transitions":  ("Group Transitions",   False, False, True),
-            "group_network":      ("Group Network",       False, False, True),
-            "beh_network":        ("Beh Network",         False, False, False),
             "cluster_stats":      ("Cluster Stats",       False, False, True),
         }
         for fname, (mode, needs_stats, needs_full_rc, raw_ok) in modes.items():
@@ -3756,15 +4815,6 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                     figs_to_save = [build_distance_matrix_figure(recluster_data)]
                 elif mode == "Transitions":
                     figs_to_save = [build_transition_figure(recluster_data)]
-                elif mode == "Group Transitions":
-                    figs_to_save = [build_per_group_transition_figure(
-                        recluster_data, animals)]
-                elif mode == "Group Network":
-                    figs_to_save = [build_per_group_network_figure(
-                        recluster_data, animals)]
-                elif mode == "Beh Network":
-                    figs_to_save = [build_group_aggregate_network_figure(
-                        animals, user_groups or {})]
                 elif mode == "Cluster Stats":
                     figs_to_save = [build_cluster_stats_figure(recluster_data, animals)]
                 else:
@@ -3779,7 +4829,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             except Exception as exc:
                 skipped.append(f"{mode}: {exc}")
 
-        msg = f"Saved {len(saved)} graphs to:\n{directory}"
+        msg = f"Saved {len(saved)} graphs to:\n{out}"
         if skipped:
             msg += f"\n\nSkipped:\n" + "\n".join(skipped)
         messagebox.showinfo("Saved", msg)
@@ -3949,8 +4999,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         # Modes that need full reclustering (no raw preview available)
         full_recluster_needed = mode in ("Elbow/Silhouette", "Recombination")
         # Modes that can run on raw animal data OR reclustered data
-        raw_ok_modes = ("Dist Matrix", "Transitions", "Group Transitions",
-                        "Group Network", "Cluster Stats")
+        raw_ok_modes = ("Dist Matrix", "Transitions", "Cluster Stats")
 
         if stats_needed and self._stats_df is None:
             self._show_placeholder("Run Statistical Analysis first.")
@@ -3961,7 +5010,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
 
         # Determine which recluster dict to pass for raw-ok modes
         recluster_data = None
-        if mode in raw_ok_modes or mode == "Beh Network":
+        if mode in raw_ok_modes:
             if self._recluster is not None:
                 recluster_data = self._recluster
             elif len(animals) > 0:
@@ -4049,16 +5098,6 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                 self._show_figure(build_distance_matrix_figure(recluster_data))
             elif mode == "Transitions":
                 self._show_figure(build_transition_figure(recluster_data))
-            elif mode == "Group Transitions":
-                self._show_figure(
-                    build_per_group_transition_figure(recluster_data, animals))
-            elif mode == "Group Network":
-                self._show_figure(
-                    build_per_group_network_figure(recluster_data, animals))
-            elif mode == "Beh Network":
-                self._show_figure(
-                    build_group_aggregate_network_figure(
-                        animals, user_groups or {}))
             elif mode == "Cluster Stats":
                 self._show_figure(build_cluster_stats_figure(recluster_data, animals))
             else:
@@ -4232,6 +5271,844 @@ def build_umap_comparison_figure(embedding, labels, new_groups: dict,
     return fig
 
 
+def build_energy_landscape_figure(
+        animal_data: list, umap_embedding, umap_labels,
+        t: dict = None) -> "plt.Figure":
+    """
+    3D behavioral energy landscape over UMAP space.
+    Three views per group (groups are rows):
+      col 0 – cluster-coloured, from above  (elev=25, azim=45)
+      col 1 – cluster-coloured, from below  (elev=-20, azim=215)
+      col 2 – coolwarm energy map, from below with mesh backbone
+               blue = low energy (common), red = high energy (rare)
+    Z = −ln(weighted KDE density); no text labels on the surface.
+    """
+    if t is None:
+        t = T()
+
+    import numpy as _np
+
+    def _placeholder(msg):
+        fig, ax = plt.subplots(figsize=(7, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, msg, ha="center", va="center", color=t["tick"],
+                transform=ax.transAxes, fontsize=9, multialignment="center")
+        _style_ax(ax, t)
+        return fig
+
+    if umap_embedding is None or umap_labels is None:
+        return _placeholder(
+            "UMAP data not available.\n"
+            "Run cube_core to generate umap_embedding.npy / umap_labels.npy.")
+
+    if not SCIPY_OK:
+        return _placeholder(
+            "scipy is required for the Energy Landscape.\npip install scipy")
+
+    try:
+        from mpl_toolkits.mplot3d import Axes3D          # noqa: F401  # type: ignore
+        from scipy.ndimage import gaussian_filter as _gfilt
+        from scipy.stats  import gaussian_kde   as _gkde
+    except ImportError:
+        return _placeholder(
+            "scipy / mpl_toolkits not available for 3D plotting.")
+
+    umap_x = _np.asarray(umap_embedding[:, 0], dtype=float)
+    umap_y = _np.asarray(umap_embedding[:, 1], dtype=float)
+    umap_l = _np.asarray(umap_labels, dtype=int)
+
+    groups_eg: dict = {}
+    for ani in animal_data:
+        groups_eg.setdefault(ani["exp_group"], []).append(ani)
+    eg_names = list(groups_eg.keys())
+    n_eg = len(eg_names)
+    if n_eg == 0:
+        return _placeholder("No animals loaded.")
+
+    GRID_N = 60
+    # col 0: cluster-coloured above | col 1: cluster-coloured below | col 2: coolwarm below
+    VIEW_ANGLES = [(25, 45), (-20, 215), (-28, 45)]
+    ncols = 3
+    nrows = n_eg
+    fig_w = max(16.5, ncols * 5.5)
+    fig_h = max(5.0,  nrows * 5.2 + 0.8)
+
+    x_rng = umap_x.max() - umap_x.min()
+    y_rng = umap_y.max() - umap_y.min()
+    xi = _np.linspace(umap_x.min() - x_rng * 0.05,
+                      umap_x.max() + x_rng * 0.05, GRID_N)
+    yi = _np.linspace(umap_y.min() - y_rng * 0.05,
+                      umap_y.max() + y_rng * 0.05, GRID_N)
+    XX, YY = _np.meshgrid(xi, yi)
+
+    # ── Nearest-cluster assignment for every grid point (shared across groups) ──
+    cid_list = sorted(int(c) for c in _np.unique(umap_l))
+    cent_xy  = _np.array(
+        [(float(umap_x[umap_l == c].mean()), float(umap_y[umap_l == c].mean()))
+         for c in cid_list])                                       # (n_cl, 2)
+    pts_flat = _np.column_stack([XX.ravel(), YY.ravel()])          # (GRID_N², 2)
+    dists2   = ((pts_flat[:, None, :] - cent_xy[None, :, :]) ** 2
+                ).sum(axis=2)                                      # (GRID_N², n_cl)
+    nearest_ci       = dists2.argmin(axis=1)
+    nearest_cid_grid = _np.array(
+        [cid_list[i] for i in nearest_ci]).reshape(GRID_N, GRID_N)
+
+    # RGBA face-colour array: (GRID_N-1, GRID_N-1, 4) — one colour per quad
+    face_base = _np.zeros((GRID_N - 1, GRID_N - 1, 4))
+    for cid in cid_list:
+        rgba = _np.array(mcolors.to_rgba(PALETTE[cid % len(PALETTE)], alpha=0.85))
+        face_base[nearest_cid_grid[:-1, :-1] == cid] = rgba
+
+    # Wireframe stride for the mesh backbone (col 2)
+    wstep = max(1, GRID_N // 12)
+
+    # ── Data-support mask (shared across groups) ──────────────────────────────
+    # Empty UMAP corridors between clusters have near-zero KDE density and
+    # produce −ln(≈0) spikes that dominate normalization and bury real clusters.
+    # An unweighted KDE of the raw point positions identifies where data actually
+    # lives; grid cells below the 10th-percentile support are masked to NaN so
+    # they are skipped by plot_surface and excluded from normalisation.
+    try:
+        _kde_support   = _gkde(_np.vstack([umap_x, umap_y]))
+        _ZZ_support    = _kde_support(
+            _np.vstack([XX.ravel(), YY.ravel()])).reshape(GRID_N, GRID_N)
+        _support_thresh = _np.percentile(_ZZ_support, 10)
+        _support_mask   = _ZZ_support < _support_thresh   # True = empty space
+    except Exception:
+        _support_mask = _np.zeros((GRID_N, GRID_N), dtype=bool)
+
+    with plt.style.context(t["mpl_style"]):
+        fig = plt.figure(figsize=(fig_w, fig_h), facecolor=t["fig_bg"])
+
+        for ei, eg in enumerate(eg_names):
+            ani_list = groups_eg[eg]
+            eg_color = PALETTE[ei % len(PALETTE)]
+
+            # Per-cluster occupancy probability for this experimental group
+            cl_counts: dict = {}
+            for ani in ani_list:
+                for lbl in ani["df"]["label"].values:
+                    k = int(lbl)
+                    cl_counts[k] = cl_counts.get(k, 0) + 1
+            total = max(sum(cl_counts.values()), 1)
+            P_cl  = {k: v / total for k, v in cl_counts.items()}
+
+            # Weight each UMAP point by its cluster's occupancy probability
+            # High P → high density → low −ln(P) → valley (common, low energy)
+            # Low P  → low density  → high −ln(P) → peak  (rare,  high energy)
+            weights = _np.array(
+                [P_cl.get(int(l), 1e-9) for l in umap_l], dtype=float)
+            wsum = weights.sum()
+            weights = weights / wsum if wsum > 0 else \
+                      _np.ones_like(weights) / len(weights)
+
+            # Weighted 2-D KDE → density surface
+            try:
+                kde     = _gkde(_np.vstack([umap_x, umap_y]),
+                                weights=weights, bw_method="scott")
+                ZZ_dens = kde(_np.vstack([XX.ravel(), YY.ravel()])
+                              ).reshape(GRID_N, GRID_N)
+            except Exception:
+                ZZ_dens = _np.full((GRID_N, GRID_N), 1e-9)
+                for cid, p in P_cl.items():
+                    mask = umap_l == cid
+                    if not mask.any():
+                        continue
+                    cx, cy = float(umap_x[mask].mean()), float(umap_y[mask].mean())
+                    dist2  = (XX - cx) ** 2 + (YY - cy) ** 2
+                    sigma  = max(x_rng, y_rng) * 0.08
+                    ZZ_dens += p * _np.exp(-dist2 / (2 * sigma ** 2))
+
+            ZZ_dens   = _np.maximum(ZZ_dens, 1e-12)
+            ZZ_smooth = _gfilt(ZZ_dens, sigma=1.5)
+            ZZ_energy = -_np.log(_np.maximum(ZZ_smooth, 1e-12))
+
+            # Mask empty UMAP corridors so their −ln(≈0) spikes don't
+            # dominate normalisation and crush the real cluster landscape.
+            ZZ_energy[_support_mask] = _np.nan
+
+            # Normalise 0–1 over supported region: 0=common, 1=rare
+            E_lo = float(_np.nanmin(ZZ_energy))
+            E_hi = float(_np.nanmax(ZZ_energy))
+            ZZ_norm = (ZZ_energy - E_lo) / max(E_hi - E_lo, 1e-9)
+
+            # ── Top-3 common (blue) and top-3 rare (red) clusters for labels ──
+            sorted_by_p = sorted(P_cl.items(), key=lambda kv: kv[1], reverse=True)
+            n_lbl = min(3, len(sorted_by_p))
+            label_clusters = (
+                [(cid, "#5599ff") for cid, _ in sorted_by_p[:n_lbl]] +   # common
+                [(cid, "#ff4444") for cid, _ in sorted_by_p[-n_lbl:]]    # rare
+            )
+
+            for vi, (elev, azim) in enumerate(VIEW_ANGLES):
+                ax3d = fig.add_subplot(
+                    nrows, ncols, ei * ncols + vi + 1, projection="3d")
+                ax3d.set_facecolor(t["ax_bg"])
+
+                if vi < 2:
+                    # ── Cluster-coloured surface (views 0 & 1) ──────────────
+                    ax3d.plot_surface(XX, YY, ZZ_norm,
+                                      facecolors=face_base,
+                                      linewidth=0, antialiased=True)
+                else:
+                    # ── coolwarm energy surface (view 2) ────────────────────
+                    # blue = low energy = common states
+                    # red  = high energy = rare states
+                    ax3d.plot_surface(XX, YY, ZZ_norm,
+                                      cmap="coolwarm", alpha=0.88,
+                                      linewidth=0, antialiased=True)
+                    # Sparse wireframe backbone to show mesh undulation
+                    ax3d.plot_wireframe(
+                        XX[::wstep, ::wstep],
+                        YY[::wstep, ::wstep],
+                        ZZ_norm[::wstep, ::wstep],
+                        color="#dddddd", alpha=0.22, linewidth=0.5)
+
+                # ── Cluster labels: top-3 common (blue) / top-3 rare (red) ──
+                # Float labels slightly off the surface; direction depends on
+                # whether the viewer is above or below the landscape.
+                z_offset = -0.10 if elev < 0 else 0.08
+                for cid, lcolor in label_clusters:
+                    mask = umap_l == cid
+                    if not mask.any():
+                        continue
+                    cx = float(umap_x[mask].mean())
+                    cy = float(umap_y[mask].mean())
+                    # Z at the nearest grid node to this centroid
+                    ix = int(_np.argmin(_np.abs(xi - cx)))
+                    iy = int(_np.argmin(_np.abs(yi - cy)))
+                    cz = float(ZZ_norm[iy, ix])
+                    ax3d.text(cx, cy, cz + z_offset,
+                              f"C{cid}",
+                              color=lcolor, fontsize=7, fontweight="bold",
+                              ha="center", va="bottom", zorder=8)
+
+                ax3d.view_init(elev=elev, azim=azim)
+                ax3d.set_xlabel("UMAP-1", color=t["tick"], fontsize=7, labelpad=2)
+                ax3d.set_ylabel("UMAP-2", color=t["tick"], fontsize=7, labelpad=2)
+                ax3d.set_zlabel("−ln P",  color=t["tick"], fontsize=7, labelpad=2)
+                VIEW_TITLES = [eg, f"{eg}  ↓", f"{eg}  energy"]
+                ax3d.set_title(VIEW_TITLES[vi], color=eg_color,
+                               fontweight="bold", fontsize=10, pad=4)
+                ax3d.tick_params(colors=t["tick"], labelsize=5)
+                for pane in (ax3d.xaxis.pane, ax3d.yaxis.pane, ax3d.zaxis.pane):
+                    pane.fill = False
+                    pane.set_edgecolor(t["border"])
+                ax3d.grid(True, alpha=0.2, color=t["border"])
+
+        fig.suptitle(
+            "3-D Behavioral Energy Landscape  "
+            "(−ln P: blue = common / low energy, red = rare / high energy)",
+            color=t["tick"], fontsize=11, fontweight="bold")
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+    return fig
+
+
+def build_umap_groups_figure(
+        umap_embedding, umap_labels, groups: dict,
+        t: dict = None) -> "plt.Figure":
+    """
+    Side-by-side 2-D UMAP scatter.
+    Left panel: original clusters (coloured by PALETTE, labelled).
+    Right panel: user-defined behaviour groups overlay.
+    """
+    if t is None:
+        t = T()
+
+    import numpy as _np
+
+    def _placeholder(msg):
+        fig, ax = plt.subplots(figsize=(7, 5), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, msg, ha="center", va="center", color=t["tick"],
+                transform=ax.transAxes, fontsize=9, multialignment="center")
+        _style_ax(ax, t)
+        return fig
+
+    if umap_embedding is None or umap_labels is None:
+        return _placeholder(
+            "UMAP data not available.\n"
+            "Run cube_core to generate umap_embedding.npy / umap_labels.npy.")
+
+    if not groups:
+        return _placeholder(
+            "No behaviour groups defined.\nCreate groups in the Group Editor first.")
+
+    umap_x = _np.asarray(umap_embedding[:, 0], dtype=float)
+    umap_y = _np.asarray(umap_embedding[:, 1], dtype=float)
+    umap_l = _np.asarray(umap_labels, dtype=int)
+
+    group_names = list(groups.keys())
+    cid_to_gi: dict = {}
+    for gi, gname in enumerate(group_names):
+        for cid in groups[gname].get("labels", []):
+            cid_to_gi[int(cid)] = gi
+
+    point_gi = _np.array([cid_to_gi.get(int(l), -1) for l in umap_l], dtype=int)
+
+    with plt.style.context(t["mpl_style"]):
+        fig, (ax_orig, ax_grp) = plt.subplots(
+            1, 2, figsize=(16, 6.5), facecolor=t["fig_bg"])
+
+        # ── Left panel: original clusters ──────────────────────────────────
+        ax_orig.set_facecolor(t["ax_bg"])
+        for cid in sorted(_np.unique(umap_l)):
+            mask = umap_l == cid
+            color = PALETTE[int(cid) % len(PALETTE)]
+            ax_orig.scatter(umap_x[mask], umap_y[mask],
+                            c=[color], s=5, alpha=0.65,
+                            linewidths=0, rasterized=True, zorder=2)
+            cx = float(umap_x[mask].mean())
+            cy = float(umap_y[mask].mean())
+            ax_orig.text(cx, cy, f"C{cid}",
+                         color="white", fontsize=6.5, fontweight="bold",
+                         ha="center", va="center",
+                         bbox=dict(boxstyle="round,pad=0.2",
+                                   facecolor=color, edgecolor="none", alpha=0.82),
+                         zorder=10)
+        ax_orig.set_xlabel("UMAP-1", color=t["tick"], fontsize=11)
+        ax_orig.set_ylabel("UMAP-2", color=t["tick"], fontsize=11)
+        ax_orig.set_title("UMAP — Original Clusters",
+                          color=t["tick"], fontweight="bold", fontsize=13, pad=10)
+        _style_ax(ax_orig, t)
+
+        # ── Right panel: behaviour groups ───────────────────────────────────
+        ax_grp.set_facecolor(t["ax_bg"])
+        unassigned = point_gi < 0
+        if unassigned.any():
+            ax_grp.scatter(umap_x[unassigned], umap_y[unassigned],
+                           c=t.get("muted", "#555566"), s=3, alpha=0.12,
+                           linewidths=0, rasterized=True, zorder=1)
+        handles = []
+        for gi, gname in enumerate(group_names):
+            mask = point_gi == gi
+            if not mask.any():
+                continue
+            color = groups[gname].get("color", PALETTE[gi % len(PALETTE)])
+            ax_grp.scatter(umap_x[mask], umap_y[mask],
+                           c=[color], s=9, alpha=0.78,
+                           linewidths=0, rasterized=True, zorder=2 + gi)
+            cx = float(umap_x[mask].mean())
+            cy = float(umap_y[mask].mean())
+            ax_grp.annotate(
+                gname, xy=(cx, cy),
+                color="white", fontsize=8.5, fontweight="bold",
+                ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.3",
+                          facecolor=color, edgecolor="none", alpha=0.82),
+                zorder=12,
+            )
+            handles.append(mpatches.Patch(color=color, label=gname))
+        ax_grp.set_xlabel("UMAP-1", color=t["tick"], fontsize=11)
+        ax_grp.set_ylabel("UMAP-2", color=t["tick"], fontsize=11)
+        ax_grp.set_title("UMAP — Behavioural Groups",
+                         color=t["tick"], fontweight="bold", fontsize=13, pad=10)
+        if handles:
+            ax_grp.legend(handles=handles, fontsize=9, loc="upper right",
+                          facecolor=t["ax_bg"], edgecolor=t["border"],
+                          labelcolor=t["tick"], framealpha=0.88)
+        _style_ax(ax_grp, t)
+
+        fig.tight_layout()
+    return fig
+
+
+#
+# BEHAVIORAL EXPLORER TAB PANEL
+#
+
+class BehavioralExplorerPanel(ctk.CTkFrame):
+    """
+    Scrollable 'Behavioral Explorer' tab for group-level comparisons.
+
+    Plot views
+    ----------
+    Diff Heatmap     — Δ transition matrices (exp − ctrl)
+    Dwell Violin     — Dwell-time distribution per state × group
+    Sankey           — Alluvial sequence flow per group
+    Group Transitions — Per-group transition probability heatmaps
+    Group Networks   — Per-group circular transition networks
+
+    Requires
+    --------
+    get_animals_fn()  → list  of animal dicts (same format as CombinedAnalysis)
+    get_recluster_fn() → dict | None   recluster_result from UnbiasedAnalytics
+    """
+
+    _VIEWS = [
+        "Diff Heatmap",
+        "Dwell Violin",
+        "Sankey",
+        "Group Transitions",
+        "Group Networks",
+        "Energy Landscape",
+    ]
+
+    def __init__(self, parent,
+                 get_animals_fn,
+                 get_recluster_fn=None,
+                 get_groups_fn=None,
+                 get_umap_fn=None,
+                 **kw):
+        super().__init__(parent, fg_color=T()["panel"], **kw)
+        self._get_animals   = get_animals_fn
+        self._get_recluster = get_recluster_fn or (lambda: None)
+        self._get_groups_fn = get_groups_fn
+        self._get_umap_fn   = get_umap_fn
+        self._current_fig   = None
+        self._current_figs  = []
+        self._current_mpl   = None
+
+        self.columnconfigure(0, weight=0, minsize=256)
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        self._build_controls()
+        self._build_plot_area()
+
+    # ── Controls (left panel) ─────────────────────────────────────────────────
+
+    def _build_controls(self):
+        ctrl = ctk.CTkScrollableFrame(
+            self, fg_color=T()["bg"], corner_radius=0, width=254)
+        ctrl.grid(row=0, column=0, sticky="nsew", padx=(6, 2), pady=6)
+        ctrl.columnconfigure(0, weight=1)
+
+        def section(title):
+            fr = ctk.CTkFrame(ctrl, fg_color=T()["card"], corner_radius=8)
+            fr.pack(fill="x", padx=4, pady=4)
+            ctk.CTkLabel(fr, text=title,
+                         font=ctk.CTkFont(size=12, weight="bold"),
+                         text_color=T()["hdr_text"],
+                         ).pack(anchor="w", padx=10, pady=(8, 2))
+            return fr
+
+        # Diff heatmap settings
+        dh = section("Difference Heatmap")
+        ctk.CTkLabel(dh, text="Reference / Control group:",
+                     text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
+        self._ctrl_var = ctk.StringVar(value="(auto — first group)")
+        self._ctrl_entry = ctk.CTkEntry(dh, textvariable=self._ctrl_var, width=220)
+        self._ctrl_entry.pack(padx=12, pady=(2, 8))
+
+        ctk.CTkLabel(dh,
+                     text="Leave blank to use the first EG as control.\n"
+                          "Type the exact group name to pin a specific group.",
+                     text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=10),
+                     justify="left").pack(anchor="w", padx=12, pady=(0, 8))
+
+        # Sankey settings
+        sk = section("Sankey  (Sequence Flow)")
+        ctk.CTkLabel(sk, text="Bout positions to show:",
+                     text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
+        self._nsteps_var = ctk.StringVar(value="5")
+        self._nsteps_slider = ctk.CTkSlider(
+            sk, from_=2, to=10, number_of_steps=8,
+            command=lambda v: self._nsteps_var.set(str(int(round(v)))),
+            width=220)
+        self._nsteps_slider.set(5)
+        self._nsteps_slider.pack(padx=12, pady=(2, 0))
+        self._nsteps_lbl = ctk.CTkLabel(
+            sk, textvariable=self._nsteps_var,
+            text_color=T()["subtext"], font=ctk.CTkFont(size=10))
+        self._nsteps_lbl.pack(anchor="w", padx=12, pady=(0, 8))
+
+        # Biological Relevance Filter
+        bf = section("Biological Relevance Filter")
+        ctk.CTkLabel(bf,
+                     text="Remove clusters too brief or rare to be\n"
+                          "biologically meaningful. Applied universally\n"
+                          "to all plots. Leave blank to disable.",
+                     text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=10),
+                     justify="left").pack(anchor="w", padx=12, pady=(2, 6))
+
+        ctk.CTkLabel(bf, text="Min mean bout duration (ms):",
+                     text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
+        self._brf_min_mean_ms_var = ctk.StringVar(value="")
+        ctk.CTkEntry(bf, textvariable=self._brf_min_mean_ms_var,
+                     width=120, placeholder_text="e.g. 200"
+                     ).pack(anchor="w", padx=12, pady=(2, 4))
+
+        ctk.CTkLabel(bf, text="Min total duration (s, per animal):",
+                     text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
+        self._brf_min_total_s_var = ctk.StringVar(value="")
+        ctk.CTkEntry(bf, textvariable=self._brf_min_total_s_var,
+                     width=120, placeholder_text="e.g. 2"
+                     ).pack(anchor="w", padx=12, pady=(2, 4))
+
+        ctk.CTkLabel(bf, text="Min frequency (bouts per animal):",
+                     text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
+        self._brf_min_freq_var = ctk.StringVar(value="")
+        ctk.CTkEntry(bf, textvariable=self._brf_min_freq_var,
+                     width=120, placeholder_text="e.g. 5"
+                     ).pack(anchor="w", padx=12, pady=(2, 8))
+
+        # Run button
+        ctk.CTkButton(
+            ctrl, text="   Generate Plot",
+            command=self._generate,
+            fg_color=T()["btn_unbiased"],
+            height=36,
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(fill="x", padx=8, pady=6)
+
+        # Save button
+        ctk.CTkButton(
+            ctrl, text="Save: Save Graph",
+            command=self._save_graph,
+            fg_color=T()["btn_save"],
+        ).pack(fill="x", padx=8, pady=(2, 6))
+
+        # Status label
+        self._status_lbl = ctk.CTkLabel(
+            ctrl, text="",
+            text_color=T()["subtext"],
+            wraplength=240, justify="left",
+            font=ctk.CTkFont(size=11))
+        self._status_lbl.pack(anchor="w", padx=12, pady=4)
+
+    # ── Plot area (right panel) ───────────────────────────────────────────────
+
+    def _build_plot_area(self):
+        right = ctk.CTkFrame(self, fg_color=T()["panel"])
+        right.grid(row=0, column=1, sticky="nsew", padx=(2, 6), pady=6)
+        right.columnconfigure(0, weight=1)
+        right.columnconfigure(1, weight=0)
+        right.rowconfigure(1, weight=1)
+
+        # View selector
+        sel_fr = ctk.CTkFrame(right, fg_color=T()["card"], corner_radius=8)
+        sel_fr.grid(row=0, column=0, columnspan=2, sticky="ew",
+                    padx=4, pady=(4, 2))
+        ctk.CTkLabel(sel_fr, text="View:",
+                     font=ctk.CTkFont(size=11)).pack(side="left", padx=8, pady=6)
+        self._view_var = ctk.StringVar(value=self._VIEWS[0])
+        ctk.CTkSegmentedButton(
+            sel_fr,
+            values=self._VIEWS,
+            variable=self._view_var,
+            command=lambda v: self._generate(),
+        ).pack(side="left", padx=4, pady=6)
+
+        # Scrollable canvas
+        self._canvas = tk.Canvas(
+            right, bg=T()["fig_bg"], highlightthickness=0)
+        self._ysb = ctk.CTkScrollbar(right, command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._ysb.set)
+        self._canvas.grid(row=1, column=0, sticky="nsew",
+                          padx=(4, 0), pady=(2, 4))
+        self._ysb.grid(row=1, column=1, sticky="ns", pady=(2, 4))
+
+        self._inner = ctk.CTkFrame(self._canvas, fg_color=T()["panel"])
+        self._win_id = self._canvas.create_window(
+            (0, 0), window=self._inner, anchor="nw")
+
+        self._inner.bind(
+            "<Configure>",
+            lambda e: self._canvas.configure(
+                scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind(
+            "<Configure>",
+            lambda e: self._canvas.itemconfig(self._win_id, width=e.width))
+        self._canvas.bind(
+            "<MouseWheel>",
+            lambda e: self._canvas.yview_scroll(
+                int(-1 * (e.delta / 120)), "units"))
+
+        self._show_placeholder(
+            "Select a view and click   Generate Plot.\n\n"
+            "Load animals in the Combined Analysis tab first.\n"
+            "For Diff Heatmap & Sankey, run Reclustering in\n"
+            "Unbiased Analytics first (optional but recommended).")
+
+    # ── Display helpers ───────────────────────────────────────────────────────
+
+    def _show_placeholder(self, msg: str):
+        for w in self._inner.winfo_children():
+            w.destroy()
+        ctk.CTkLabel(self._inner, text=msg,
+                     text_color=T()["muted"],
+                     font=ctk.CTkFont(size=13),
+                     justify="center").pack(pady=50, padx=20)
+
+    def _show_figures(self, figs: list):
+        """Display one or more figures stacked in the scrollable canvas."""
+        # Close previous figures
+        for old in self._current_figs:
+            try:
+                plt.close(old)
+            except Exception:
+                pass
+        self._current_figs = list(figs)
+        self._current_fig  = figs[0] if figs else None
+
+        for w in self._inner.winfo_children():
+            w.destroy()
+
+        def _bind_wheel(w):
+            w.bind("<MouseWheel>",
+                   lambda e: self._canvas.yview_scroll(
+                       int(-1 * (e.delta / 120)), "units"))
+            for child in w.winfo_children():
+                _bind_wheel(child)
+
+        last_canvas = None
+        for fi, fig in enumerate(figs):
+            mpl_c = FigureCanvasTkAgg(fig, master=self._inner)
+            mpl_c.draw()
+            widget = mpl_c.get_tk_widget()
+            widget.pack(fill="x", expand=True, padx=2, pady=(0, 2))
+            _bind_wheel(widget)
+            last_canvas = mpl_c
+
+        # Single toolbar on the last figure
+        if last_canvas is not None:
+            self._current_mpl = last_canvas
+            tb_fr = ctk.CTkFrame(self._inner, fg_color=T()["card2"], height=30)
+            tb_fr.pack(fill="x")
+            NavigationToolbar2Tk(last_canvas, tb_fr)
+
+    def _status(self, msg: str, color: str = None):
+        self._status_lbl.configure(
+            text=msg, text_color=color or T()["subtext"])
+
+    def _get_user_groups(self) -> dict:
+        """Return the user-defined behaviour groups, or {} if unavailable."""
+        try:
+            if self._get_groups_fn:
+                return self._get_groups_fn() or {}
+        except Exception:
+            pass
+        return {}
+
+    def _get_umap(self):
+        """Return (embedding, labels) tuple, or (None, None) if unavailable."""
+        try:
+            if self._get_umap_fn:
+                result = self._get_umap_fn()
+                if result and len(result) == 2:
+                    return result[0], result[1]
+        except Exception:
+            pass
+        return None, None
+
+    # ── Biological relevance filter ───────────────────────────────────────────
+
+    def _get_brf_params(self):
+        """Return (min_mean_ms, min_total_s, min_freq) with None for blanks."""
+        out = []
+        for var in (self._brf_min_mean_ms_var,
+                    self._brf_min_total_s_var,
+                    self._brf_min_freq_var):
+            try:
+                v = var.get().strip()
+                out.append(float(v) if v else None)
+            except (ValueError, AttributeError):
+                out.append(None)
+        return tuple(out)
+
+    def _apply_brf(self, animals: list) -> list:
+        """
+        Remove rows whose cluster label belongs to a cluster that fails the
+        biological relevance filter.  Returns a new list of animal dicts with
+        filtered dataframes; the original dicts are not mutated.
+        When no thresholds are set returns the original list unchanged.
+        """
+        min_mean_ms, min_total_s, min_freq = self._get_brf_params()
+        if min_mean_ms is None and min_total_s is None and min_freq is None:
+            return animals
+
+        import numpy as _np
+
+        # Collect per-cluster, per-animal stats (mean bout s, total dur s, freq)
+        cl_stats: dict = {}   # cid -> {"mb": [], "td": [], "fr": []}
+        for ani in animals:
+            df  = ani["df"]
+            fps = float(ani.get("fps", 30) or 30)
+            if "duration_sec" in df.columns:
+                dur = df["duration_sec"]
+            elif "run_len" in df.columns:
+                dur = df["run_len"] / fps
+            else:
+                continue
+            for cid in df["label"].unique():
+                key = int(cid)
+                mask = df["label"] == cid
+                bouts = dur[mask]
+                if key not in cl_stats:
+                    cl_stats[key] = {"mb": [], "td": [], "fr": []}
+                cl_stats[key]["mb"].append(float(bouts.mean()) if len(bouts) else 0.0)
+                cl_stats[key]["td"].append(float(bouts.sum()))
+                cl_stats[key]["fr"].append(int(mask.sum()))
+
+        excluded: set = set()
+        for cid, s in cl_stats.items():
+            if min_mean_ms is not None:
+                if _np.mean(s["mb"]) * 1000 < min_mean_ms:
+                    excluded.add(cid); continue
+            if min_total_s is not None:
+                if _np.mean(s["td"]) < min_total_s:
+                    excluded.add(cid); continue
+            if min_freq is not None:
+                if _np.mean(s["fr"]) < min_freq:
+                    excluded.add(cid)
+
+        if not excluded:
+            return animals
+
+        filtered = []
+        for ani in animals:
+            df_f = ani["df"][~ani["df"]["label"].isin(excluded)].reset_index(drop=True)
+            filtered.append({**ani, "df": df_f})
+
+        n_removed = len(excluded)
+        self._status(
+            f"Bio filter active: {n_removed} cluster(s) removed "
+            f"({', '.join(f'C{c}' for c in sorted(excluded))}).",
+            T().get("warn", "#e8a838"))
+        return filtered
+
+    # ── Generation ────────────────────────────────────────────────────────────
+
+    def _generate(self, _=None):
+        view      = self._view_var.get()
+        animals   = self._apply_brf(self._get_animals())
+        recluster = self._get_recluster()
+        groups    = self._get_user_groups()
+
+        if not animals:
+            self._show_placeholder(
+                "No animals loaded.\nAdd animals in the Combined Analysis tab.")
+            self._status("No animals loaded.", T()["muted"])
+            return
+
+        # If reclustering hasn't been run yet, build a raw preview from the
+        # existing cluster assignments so all plots can render immediately.
+        # After reclustering is performed the caller's getter returns real data
+        # and the plots are regenerated to show the impact.
+        is_raw_preview = False
+        if recluster is None:
+            try:
+                recluster = build_raw_recluster_result(animals)
+                is_raw_preview = True
+            except Exception:
+                recluster = None   # some views don't need it; let them handle None
+
+        self._status(f"Building {view}…")
+        self.update_idletasks()
+        t = T()
+
+        try:
+            figs = []
+
+            if view == "Diff Heatmap":
+                ctrl_raw = self._ctrl_var.get().strip()
+                ctrl     = ctrl_raw if ctrl_raw and ctrl_raw != "(auto — first group)" \
+                           else None
+                figs.append(build_diff_heatmap_figure(recluster, animals, ctrl, t))
+                if groups:
+                    figs.append(
+                        build_diff_heatmap_beh_groups_figure(animals, groups, ctrl, t))
+
+            elif view == "Dwell Violin":
+                figs.append(build_dwell_violin_figure(animals, t))
+                if groups:
+                    figs.append(
+                        build_dwell_violin_beh_groups_figure(animals, groups, t))
+
+            elif view == "Sankey":
+                n_steps = max(2, min(10, int(
+                    round(float(self._nsteps_var.get())))))
+                figs.append(build_sankey_figure(animals, t, n_steps=n_steps))
+                if groups:
+                    figs.append(
+                        build_sankey_beh_groups_figure(
+                            animals, groups, t, n_steps=n_steps))
+
+            elif view == "Group Transitions":
+                figs.append(
+                    build_per_group_transition_figure(recluster, animals, t))
+                if groups:
+                    figs.append(
+                        build_group_aggregate_transition_figure(
+                            animals, groups, t))
+
+            elif view == "Group Networks":
+                figs.append(
+                    build_per_group_network_figure(recluster, animals, t))
+                if groups:
+                    figs.append(
+                        build_group_aggregate_network_figure(animals, groups, t))
+
+            elif view == "Energy Landscape":
+                emb, lbl = self._get_umap()
+                figs.append(
+                    build_energy_landscape_figure(animals, emb, lbl, t))
+                if groups:
+                    figs.append(
+                        build_umap_groups_figure(emb, lbl, groups, t))
+
+            else:
+                self._status("Unknown view.", T()["muted"])
+                return
+
+            self._show_figures(figs)
+            suffix = "  +  behaviour groups" if groups else ""
+            if is_raw_preview:
+                self._status(
+                    f"{view} ready{suffix}  "
+                    "[original clusters — run Reclustering to update]",
+                    T()["warn"] if "warn" in T() else "#e8a838")
+            else:
+                self._status(f"{view} ready{suffix}.", T()["subtext"])
+
+        except Exception as exc:
+            import traceback as _tb
+            self._show_placeholder(
+                f"Error generating {view}:\n{exc}\n\n"
+                f"{_tb.format_exc()[-400:]}")
+            self._status(f"Error: {exc}", "#ff6666")
+
+    # ── Save ─────────────────────────────────────────────────────────────────
+
+    def _save_graph(self):
+        if not self._current_figs:
+            self._status("Nothing to save yet.", T()["muted"])
+            return
+        p = filedialog.asksaveasfilename(
+            title="Save explorer graph",
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg"),
+                       ("All", "*")],
+        )
+        if not p:
+            return
+        try:
+            base  = pathlib.Path(p)
+            saved = []
+            if len(self._current_figs) == 1:
+                self._current_figs[0].savefig(
+                    str(base), dpi=200, bbox_inches="tight",
+                    facecolor=self._current_figs[0].get_facecolor())
+                saved.append(base.name)
+            else:
+                suffixes = ["_clusters", "_beh_groups"]
+                for i, fig in enumerate(self._current_figs):
+                    sfx   = suffixes[i] if i < len(suffixes) else f"_{i}"
+                    fpath = base.parent / (base.stem + sfx + base.suffix)
+                    fig.savefig(str(fpath), dpi=200, bbox_inches="tight",
+                                facecolor=fig.get_facecolor())
+                    saved.append(fpath.name)
+            self._status(f"Saved → {', '.join(saved)}")
+        except Exception as exc:
+            messagebox.showerror("Save Error", str(exc))
+
+
 #
 # MAIN APPLICATION
 #
@@ -4360,9 +6237,11 @@ class BSOiDApp(ctk.CTk):
         self._tab_metrics   = self._tabs.add("Metrics Table")
         self._tab_combined  = self._tabs.add("Combined Analysis")
         self._tab_unbiased  = self._tabs.add("Unbiased Analytics")
+        self._tab_explorer  = self._tabs.add("Behavioral Explorer")
 
         for tab in (self._tab_preview, self._tab_analysis,
-                    self._tab_metrics, self._tab_combined, self._tab_unbiased):
+                    self._tab_metrics, self._tab_combined,
+                    self._tab_unbiased, self._tab_explorer):
             tab.columnconfigure(0, weight=1)
             tab.rowconfigure(0, weight=1)
 
@@ -4397,6 +6276,20 @@ class BSOiDApp(ctk.CTk):
             get_combined_fn=lambda: getattr(self, "_combined", None),
         )
         self._unbiased_panel.grid(row=0, column=0, sticky="nsew")
+
+        # Behavioral Explorer — group-comparison panel
+        self._explorer_panel = BehavioralExplorerPanel(
+            self._tab_explorer,
+            get_animals_fn=self._get_animals_for_unbiased,
+            get_recluster_fn=lambda: getattr(
+                self._unbiased_panel, "_recluster", None),
+            get_groups_fn=self._get_groups,
+            get_umap_fn=lambda: (
+                getattr(self, "_umap_embedding", None),
+                getattr(self, "_umap_labels",    None),
+            ),
+        )
+        self._explorer_panel.grid(row=0, column=0, sticky="nsew")
 
     def _get_animals_for_unbiased(self) -> list:
         if hasattr(self, "_animal_panel"):
@@ -4647,22 +6540,20 @@ class BSOiDApp(ctk.CTk):
             # Auto-populate Combined Analysis animal panel with all found files
             self._animal_panel.clear_all()
             self._animal_panel.add_files_from_paths(files)
-
-            # Auto-load cluster→behaviour mapping if found (from Video Explorer)
-            mapping_path = find_cluster_mapping(self._root_dir)
-            if mapping_path:
+            n = self._animal_panel.animal_count()
+            if n:
+                self._status(
+                    f"Loaded {n} animal file{'s' if n != 1 else ''} from "
+                    f"{self._root_dir.name}",
+                    T()["subtext"],
+                )
                 try:
-                    groups = load_mapping_tsv(mapping_path)
-                    if groups:
-                        self._open_editor()
-                        self._editor.load_groups_from_dict(groups, self._all_labels)
-                        self._status(
-                            f"Auto-loaded mapping ({len(groups)} groups) from:\n"
-                            f"{mapping_path.name}",
-                            T()["subtext"],
-                        )
+                    self._tabs.set("Combined Analysis")
                 except Exception:
-                    pass   # mapping auto-load is best-effort
+                    pass
+
+            # Auto-load cluster→behaviour mapping (Phase 4 output or fallback)
+            self._auto_load_groups()
 
             # Load UMAP embedding/labels if cube_core saved them
             emb_p, lbl_p = find_umap_data(self._root_dir)
@@ -4700,24 +6591,111 @@ class BSOiDApp(ctk.CTk):
         )
         self._refresh_preview()
 
+    def _auto_load_groups(self):
+        """
+        Try to auto-detect behaviour groups for the current root directory:
+          1. cluster_behaviour_mapping.tsv exported by Phase 4 Video Explorer
+          2. Phase 4 session JSON  (contains 'behaviour_groups' key)
+          3. Fallback: one group per cluster so analysis can proceed immediately
+        Safe to call multiple times; silently skips if _root_dir or _all_labels
+        are not yet set.
+        """
+        if not self._root_dir or not self._all_labels:
+            return
+        groups_loaded = False
+
+        # 1. TSV exported by Phase 4
+        mapping_path = find_cluster_mapping(self._root_dir)
+        if mapping_path:
+            try:
+                groups = load_mapping_tsv(mapping_path)
+                if groups:
+                    self._open_editor()
+                    self._editor.load_groups_from_dict(groups, self._all_labels)
+                    self._status(
+                        f"Auto-loaded mapping ({len(groups)} groups) from:\n"
+                        f"{mapping_path.name}",
+                        T()["subtext"],
+                    )
+                    groups_loaded = True
+            except Exception:
+                pass
+
+        # 2. Phase 4 session JSON
+        if not groups_loaded:
+            session_path = find_phase4_session_json(self._root_dir)
+            if session_path:
+                try:
+                    groups = load_groups_from_phase4_session(session_path)
+                    if groups:
+                        self._open_editor()
+                        self._editor.load_groups_from_dict(groups, self._all_labels)
+                        self._status(
+                            f"Auto-loaded {len(groups)} groups from Phase 4 session:\n"
+                            f"{session_path.name}",
+                            T()["subtext"],
+                        )
+                        groups_loaded = True
+                except Exception:
+                    pass
+
+        # 3. Fallback: one group per cluster
+        if not groups_loaded:
+            auto_groups = groups_from_all_clusters(self._all_labels)
+            self._open_editor()
+            self._editor.load_groups_from_dict(auto_groups, self._all_labels)
+            self._status(
+                f"No behaviour mapping found. Created {len(auto_groups)} groups "
+                f"(one per cluster). Use the Group Editor to merge/rename them.",
+                T()["subtext"],
+            )
+
     def _load_mapping(self):
         path = filedialog.askopenfilename(
-            title="Load Mapping_Log / Preset (.json)",
-            filetypes=[("JSON", "*.json"), ("All", "*")],
+            title="Load Mapping / Preset  (JSON preset, Phase 4 session JSON, or TSV)",
+            filetypes=[
+                ("All supported", "*.json *.tsv"),
+                ("JSON preset / Phase 4 session", "*.json"),
+                ("Video Explorer TSV", "*.tsv"),
+                ("All", "*"),
+            ],
         )
         if not path:
             return
-        try:
-            with open(path) as fh:
-                data = json.load(fh)
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-            return
-        groups = data.get("groups", {})
+        p = pathlib.Path(path)
+        groups: dict = {}
+        fps = DEFAULT_FPS
+
+        if p.suffix.lower() == ".tsv":
+            # TSV exported by Phase 4 Video Explorer
+            try:
+                groups = load_mapping_tsv(p)
+            except Exception as e:
+                messagebox.showerror("TSV Load Error", str(e))
+                return
+        else:
+            # JSON — could be analyser preset OR Phase 4 session JSON
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+                return
+            if "behaviour_groups" in data:
+                # Phase 4 (Video Explorer) session JSON
+                try:
+                    groups = load_groups_from_phase4_session(p)
+                except Exception as e:
+                    messagebox.showerror("Phase 4 Session Load Error", str(e))
+                    return
+            else:
+                # Analyser preset JSON  {"groups": {...}, "fps": ...}
+                groups = data.get("groups", {})
+                fps    = data.get("fps", DEFAULT_FPS)
+
         if not groups:
             messagebox.showerror("Error", "No groups found in file.")
             return
-        fps = data.get("fps", DEFAULT_FPS)
         self._fps_var.set(str(fps))
         self._open_editor()
         self._editor.load_groups_from_dict(groups, self._all_labels)
