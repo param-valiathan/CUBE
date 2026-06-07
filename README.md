@@ -9,15 +9,16 @@
 
 ## Overview
 
-CUBE integrates **DeepLabCut pose estimation** with unsupervised machine learning (UMAP + HDBSCAN + MLP classifier) to automatically segment, cluster, and analyze animal behavioral patterns from raw video recordings. The full pipeline runs from raw video to statistical reports without requiring any predefined behavioral categories.
+CUBE integrates **DeepLabCut pose estimation** with unsupervised machine learning (UMAP + HDBSCAN + MLP classifier) to automatically segment, cluster, and analyse animal behavioural patterns from raw video recordings. The full pipeline runs from raw video to statistical reports without requiring any predefined behavioural categories.
 
 **Key features:**
 - Batch DLC inference using the SuperAnimal quadruped model
 - Smart Adapt mode: adapts the model once on a representative video, then reuses weights for all videos
-- V2 multi-scale feature extraction with body-size normalization and angular body-axis features
+- V2 multi-scale feature extraction with body-size normalisation and angular body-axis features
 - Automatic HDBSCAN cluster sweep with DBCV-guided selection
+- Post-hoc Multinomial HMM wrapper that eliminates MLP state-flickering and enforces temporal consistency
 - Built-in validation layer (silhouette, UMAP trustworthiness, CV accuracy, DLC quality gates)
-- Interactive video annotation and behavioral analysis with group statistics and ethograms
+- Interactive video annotation and behavioural analysis with group statistics and ethograms
 - Session autosave — resume after a crash from the last completed step
 
 ---
