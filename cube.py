@@ -2946,6 +2946,10 @@ class AdvancedCUBEWindow(tk.Toplevel):
         max_clips_per_cluster = 3,
         save_plots            = True,
         save_videos           = True,
+        hmm_enabled           = True,
+        hmm_n_states          = 0,     # 0 = auto (= n_clusters)
+        hmm_n_iter            = 100,
+        hmm_min_prob          = 0.05,
     )
 
     def __init__(self, parent, session: "SessionState"):
@@ -3138,6 +3142,24 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  lambda r: _spin_i(r, "cv_folds", 2, 10, 1, 5))
         tk.Label(s4,
                  text="    Hidden layers: comma-separated sizes, e.g. '100,50' or '256,128,64'",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+
+        # ── HMM smoothing ─────────────────────────────────────────────────────
+        s_hmm = _adv_section(p, "HMM SMOOTHING  (post-hoc temporal filter)", C["green"])
+        _adv_row(s_hmm, "Enable HMM smoothing",
+                 lambda r: _check(r, "hmm_enabled", True))
+        _adv_row(s_hmm, "HMM states  (0 = auto)",
+                 lambda r: _spin_i(r, "hmm_n_states", 0, 200, 1, 0))
+        _adv_row(s_hmm, "Baum-Welch iterations",
+                 lambda r: _spin_i(r, "hmm_n_iter", 10, 500, 10, 100))
+        _adv_row(s_hmm, "Min edge prob (syntax graph)",
+                 lambda r: _spin_f(r, "hmm_min_prob", 0.01, 0.50, 0.01, 0.05))
+        tk.Label(s_hmm,
+                 text="    Wraps B-SOiD MLP output with a Multinomial HMM (Baum-Welch + Viterbi).\n"
+                      "    Eliminates single-frame state flickers due to tracking jitter.\n"
+                      "    States = 0 uses n_clusters from HDBSCAN (smoothing-only mode).\n"
+                      "    States < n_clusters groups motifs into behavioral macro-states.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
 
@@ -3944,6 +3966,11 @@ class PipelineApp(tk.Tk):
                                 app._load_csv(files[0])
                             except Exception:
                                 pass
+                            # Auto-detect behaviour groups from Phase 4 output
+                            try:
+                                app._auto_load_groups()
+                            except Exception:
+                                pass
                             self._logger.success(
                                 f"Auto-loaded {len(files)} file(s) from {bout_root}")
                             # Populate the Combined Analysis animal panel
@@ -3951,6 +3978,11 @@ class PipelineApp(tk.Tk):
                                 ap = getattr(app, "_animal_panel", None)
                                 if ap is not None:
                                     ap.add_files_from_paths(files)
+                                    if ap.animal_count():
+                                        try:
+                                            app._tabs.set("Combined Analysis")
+                                        except Exception:
+                                            pass
                             except Exception:
                                 pass
                             # Inject experimental group assignments if set in session
