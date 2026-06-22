@@ -185,4 +185,23 @@ CUBE_logs/
 *.mp4
 *.avi
 *.mov
+
+# All docx except the comprehensive user guide
 *.docx
+!CUBE_Complete_Guide.docx
+
+# Local-only files (docs, tools, launchers — not needed on GitHub)
+CUBE_GUIDE.md
+GROUP_PREDICTOR_REFERENCE.md
+3D_Integration_Plan_v5.md
+TEST_README.md
+md_to_docx.py
+CUBE.bat
+UMAP Video/
+
+# Extra logo variants (keep only CUBE_logo.png for README)
+CUBE_logo dark theme.png
+dark logo.png
+CUBE_icon.png
+CUBE.ico
+HMM_Smoothing_Section_Addendum.docx

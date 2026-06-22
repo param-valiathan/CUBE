@@ -134,6 +134,63 @@ Loads `*_bout_lengths[_hmm].csv` from a user-selected folder → builds per-anim
 
 ---
 
+## Git and GitHub — Version Control Workflow
+
+### Git executable
+
+**Do NOT use conda git for pushing.** Use the Visual Studio bundled git, which has proper Windows Credential Manager integration:
+
+```bat
+set GIT="C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\Git\cmd\git.exe"
+```
+
+The conda git at `C:\Users\param\anaconda3\Library\bin\git.exe` works for local operations (status, diff, log) but fails on push due to credential helper conflicts.
+
+### Commit and push workflow
+
+Run these after completing a session with meaningful changes:
+
+```bat
+set GIT="C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\Git\cmd\git.exe"
+cd d:\CUBE
+
+%GIT% add -A
+%GIT% commit -m "short description of what changed"
+%GIT% push origin main
+```
+
+Or in PowerShell:
+
+```powershell
+$git = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\Git\cmd\git.exe"
+Set-Location d:\CUBE
+& $git add -A
+& $git commit -m "short description"
+& $git push origin main
+```
+
+### Authentication
+
+Credentials are stored in **Windows Credential Manager** (set up June 2026). No token is needed in the URL. If a push is rejected with 401/403:
+1. Open Windows Credential Manager → Windows Credentials
+2. Find the entry for `git:https://github.com`
+3. Edit it and paste a new PAT as the password
+
+GitHub user: `param-valiathan`  
+Commit email: `288124827+param-valiathan@users.noreply.github.com` (noreply — required by GitHub email privacy settings)  
+Remote: `https://github.com/param-valiathan/CUBE.git`
+
+### When to commit
+
+Commit after:
+- Any feature addition or bug fix to the four source files
+- Documentation updates (README.md, CUBE_GUIDE.md, GROUP_PREDICTOR_REFERENCE.md)
+- Running `md_to_docx.py` is **not** needed before committing — `.docx` files are gitignored
+
+Use clear commit messages: `"feat: add X"`, `"fix: Y was broken"`, `"docs: update README for Z"`.
+
+---
+
 ## Documentation Maintenance — MANDATORY
 
 CUBE's documentation lives in three markdown files that must stay current. After **any** significant change to the pipeline or analyser, follow these rules before closing the session.
