@@ -51,9 +51,11 @@ The pipeline runs from raw video to full statistical group comparisons in five s
 ```bat
 conda create -n CUBE python=3.10
 conda activate CUBE
-pip install pillow opencv-python-headless scipy scikit-learn umap-learn customtkinter plotly hmmlearn
+pip install pillow opencv-python-headless scipy scikit-learn umap-learn customtkinter plotly hmmlearn deeplabcut
 conda install -c conda-forge hdbscan
 ```
+
+> **Note:** DeepLabCut must be installed in the `CUBE` environment — Step 1 (DLC inference) will fail if it is installed in a separate environment or not installed at all. Steps 2–5 do not require it.
 
 ### Launch
 
