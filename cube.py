@@ -31,11 +31,21 @@ Sessions are saved as JSON after every step so analysis can resume after crash.
 
 Requirements
 ------------
-    pip install pillow opencv-python-headless scipy scikit-learn umap-learn customtkinter
+    pip install pillow opencv-python-headless scipy scikit-learn umap-learn customtkinter plotly
     conda install -c conda-forge hdbscan
 """
 
-#  " "  stdlib  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " 
+# Force single-threaded BLAS/MKL before any numpy import so loky workers
+# spawned from this process inherit the correct threading config on Windows.
+# cube_analyser.py sets the same vars at its own module level for standalone
+# use; this block covers cube.py as the primary entry point.
+import os as _os_env
+for _k_env in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
+               "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    _os_env.environ[_k_env] = "1"
+del _os_env, _k_env
+
+#  " "  stdlib  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
 import importlib.util
 import json
 import os
@@ -55,24 +65,14 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-#  " "  local engine  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " 
-try:
-    from cube_core import (
-        PipelineLogger, BSoidEngine, run_bsoid_prep, filter_dlc_h5,
-        cleanup_video_byproducts,
-    )
-    CORE_OK = True
-except ImportError as _ce:
-    CORE_OK = False
-    _CORE_ERR = str(_ce)
-    def cleanup_video_byproducts(*_a, **_kw): pass   # safe no-op if core missing
-    def filter_dlc_h5(h5_path, *_a, out_path=None, **_kw):  # no-op; just copy
-        import shutil as _sh
-        dst = out_path or h5_path.with_name(h5_path.stem + "_filtered.h5")
-        _sh.copy2(str(h5_path), str(dst))
-        return dst
+#  " "  local engine  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+# Deferred to _deferred_imports() so the loading splash renders first.
+CORE_OK      = False
+_CORE_ERR    = ""
+PipelineLogger = BSoidEngine = run_bsoid_prep = None
+filter_dlc_h5 = cleanup_video_byproducts = create_umap_evolution_video = None
 
-#  " "   optional companion scripts  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " 
+#  " "   optional companion scripts  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
 HERE = Path(__file__).resolve().parent
 
 def _load_script(names: list):
@@ -89,10 +89,8 @@ def _load_script(names: list):
                 return None, p
     return None, None
 
-_MOD_VIDEO,    _PATH_VIDEO    = _load_script(["cube_video_explorer.py",
-                                               "BSOID_VIDEO_EXPLR.py"])
-_MOD_ANALYSER, _PATH_ANALYSER = _load_script(
-    ["cube_analyser.py"])
+_MOD_VIDEO = _PATH_VIDEO = None
+_MOD_ANALYSER = _PATH_ANALYSER = None
 
 CTK_OK = importlib.util.find_spec("customtkinter") is not None
 
@@ -119,6 +117,9 @@ C = dict(
     log_bg  = "#07070d",
     log_fg  = "#00ff88",
 )
+# Button-specific colour slots (allow light mode to make flat buttons visible)
+C["btn"]    = C["card2"]   # button background
+C["btn_fg"] = C["subtext"] # text on secondary/muted buttons
 
 try:
     with open(HERE / "theme.txt", "r", encoding="utf-8") as _f:
@@ -132,8 +133,18 @@ try:
             C["subtext"] = "#666666"
             C["log_bg"] = "#ffffff"
             C["log_fg"] = "#333333"
+            # Light-mode button overrides: flat buttons need a mid-gray bg to
+            # be visible against the near-white page; dark amber replaces the
+            # bright yellow that is invisible on light backgrounds.
+            C["btn"]    = "#8892a0"  # mid-gray — clearly distinct from #f0f2f5
+            C["btn_fg"] = "#1c1c30"  # near-black — readable on mid-gray
+            C["yellow"] = "#7a4e00"  # dark amber — replaces #ffd60a in light mode
 except Exception:
     pass
+
+# Resolved once at import so the splash and any future theme-aware widgets can
+# read it without re-parsing theme.txt.
+_DARK_THEME: bool = C["bg"] == "#09090f"
 
 # Per-step colours
 STEP_META = [
@@ -203,7 +214,10 @@ class SessionState:
         dlc_run_prep    = True,
         dlc_smart_adapt = False,
         # BSOID prep
-        bsoid_min_conf  = 0.35,
+        bsoid_min_conf  = 0.30,
+        bsoid_conf_metric    = "median",
+        bsoid_min_sess_frac  = 0.6,
+        bsoid_min_keep       = 6,
         # BSOID engine
         engine_cfg      = {},
         # Experimental group assignments  {folder_path: group_name}
@@ -280,11 +294,11 @@ class LogPanel(tk.Frame):
                  font=("Segoe UI", 9, "bold"),
                  bg=C["panel"], fg=C["cyan"]).pack(side="left")
         tk.Button(tb, text="Clear",
-                  font=("Segoe UI", 8), bg=C["card2"], fg=C["subtext"],
+                  font=("Segoe UI", 8), bg=C["btn"], fg=C["btn_fg"],
                   relief="flat", padx=6, cursor="hand2",
                   command=self.clear).pack(side="right", padx=2)
         tk.Button(tb, text="  Open log",
-                  font=("Segoe UI", 8), bg=C["card2"], fg=C["subtext"],
+                  font=("Segoe UI", 8), bg=C["btn"], fg=C["btn_fg"],
                   relief="flat", padx=6, cursor="hand2",
                   command=self._open_log).pack(side="right", padx=2)
 
@@ -515,30 +529,41 @@ class SettingsPanel(tk.Frame):
          "GPU cooldown between videos"),
         ("fps",              "Recording FPS",       "int",  (1,500,1), 30,
          "Frames per second"),
-        ("bsoid_min_conf",   "Min BP confidence",   "float",(0.1,0.9,0.05),0.35,
-         "Bodyparts below this are excluded"),
+        ("bsoid_min_conf",   "Min BP confidence",   "float",(0.1,0.9,0.05),0.30,
+         "Bodyparts below this confidence are excluded"),
+        ("bsoid_conf_metric","BP conf metric",      "combo",
+         ["median","mean"], "median",
+         "median resists brief occlusion dropouts (single-view cameras)"),
+        ("bsoid_min_sess_frac","BP keep if passes ≥","float",(0.1,1.0,0.1),0.6,
+         "Keep a bodypart if it passes in >= this fraction of sessions (not all)"),
+        ("bsoid_min_keep",   "Min bodyparts kept",  "int",  (2,40,1), 6,
+         "Floor: fall back to top-N by confidence if fewer pass"),
         ("ntfy_topic",       "Notification Topic",  "str",  None, "",
          "ntfy.sh topic name for push alerts"),
     ]
     _ENGINE_ROWS = [
-        ("body_normalise",       "Body normalisation",   "bool", None, True,
+        ("body_normalise",       "Body normalisation",   "bool", None, False,
          "Divide distances by nose-to-tailbase length"),
         ("likelihood_thresh",    "Likelihood threshold", "float",(0.1,0.9,0.05),0.30,""),
+        ("max_interp_gap_sec",   "Max interp gap (s)",   "float",(0.0,5.0,0.1),0.50,
+         "Occlusions longer than this are held flat, not ramped (0 = legacy)"),
         ("boxcar_win_sec",       "Boxcar smooth (s)",    "float",(0.0,0.5,0.01),0.07,""),
         ("train_frac",           "UMAP train fraction",  "float",(0.05,1.0,0.05),0.30,""),
         ("umap_n_neighbors",     "UMAP n_neighbors",     "int",  (5,200,5),   60,""),
-        ("umap_n_components",    "UMAP n_components",    "int",  (2,8,1),      2,""),
-        ("umap_min_dist",        "UMAP min_dist",        "float",(0.0,1.0,0.05),0.10,""),
+        ("umap_n_components",    "UMAP n_components",    "int",  (2,8,1),      3,""),
+        ("umap_min_dist",        "UMAP min_dist",        "float",(0.0,1.0,0.05),0.1,""),
         ("umap_random_state",    "UMAP random seed",     "int",  (0,9999,1),  42,""),
         ("hdbscan_metric",       "HDBSCAN metric",       "combo",
          ["euclidean","manhattan","cosine"],"euclidean",""),
         ("hdbscan_method",       "HDBSCAN method",       "combo",
-         ["eom","leaf"],"eom","eom=larger, leaf=finer clusters"),
+         ["both","eom","leaf"],"both","both=DBCV picks best; eom=larger; leaf=finer"),
         ("mlp_hidden",           "MLP layers",           "str",  None, "100,50",""),
         ("mlp_max_iter",         "MLP max iter",         "int",  (100,5000,100),1000,""),
+        ("mlp_confidence_thresh","MLP conf threshold",   "float",(0.0,1.0,0.05),0.0,
+         "Bins below this top-class probability become unclassified (0 = off)"),
         ("cv_folds",             "CV folds",             "int",  (2,10,1),     5,""),
         ("min_epoch_dur_s",      "Min epoch dur (s)",    "float",(0.0,60.0,0.1),0.0,""),
-        ("max_epoch_dur_s",      "Max epoch dur (s)",    "float",(1.0,600.0,1.0),999.0,""),
+        ("max_epoch_dur_s",      "Max epoch dur (s)",    "float",(0.0,9999.0,1.0),300.0,""),
         ("output_fps",           "Output video FPS",     "int",  (1,60,1),    15,""),
         ("max_clips_per_cluster","Max clips/cluster",    "int",  (1,10,1),     3,""),
         ("save_plots",           "Save plots",           "bool", None, True,""),
@@ -575,7 +600,7 @@ class SettingsPanel(tk.Frame):
         hdr.pack(fill="x", pady=(4, 0))
         btn = tk.Button(hdr, text=f"   {title}",
                         font=("Segoe UI", 9, "bold"),
-                        bg=C["card2"], fg=C["yellow"],
+                        bg=C["btn"], fg=C["yellow"],
                         relief="flat", anchor="w", padx=12, pady=5,
                         cursor="hand2")
         btn.pack(fill="x")
@@ -921,6 +946,18 @@ def _resolve_ffmpeg() -> str:
     return "ffmpeg"
 
 
+def _ffmpeg_transcode(src: str, dst: str, vf: str) -> None:
+    """Transcode src → dst; tries h264_nvenc first, falls back to libx264."""
+    _ff   = _resolve_ffmpeg()
+    _base = [_ff, "-y", "-noautorotate", "-i", src, "-vf", vf, "-an"]
+    try:
+        subprocess.run(_base + ["-c:v", "h264_nvenc", "-preset", "p4", dst],
+                       check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        subprocess.run(_base + ["-c:v", "libx264", "-preset", "fast", "-crf", "18", dst],
+                       check=True, capture_output=True)
+
+
 def send_push_notification(session: SessionState, message: str,
                            title: str = "CUBE", logger=None):
     """Send an instant push notification via ntfy.sh."""
@@ -976,6 +1013,31 @@ def _validated_dlc_model_name(model_name: str, session, logger, fallback: str = 
     except Exception:
         pass
     return model_name
+
+
+def _validated_dlc_detector_name(detector_name: str, session, logger,
+                                 fallback: str = "fasterrcnn_mobilenet_v3_large_fpn") -> str:
+    """Return detector_name if DLC has a model_config YAML for it; otherwise fall back and warn."""
+    try:
+        import os as _os
+        import deeplabcut as _dlc_tmp
+        cfg_dir = _os.path.join(_os.path.dirname(_dlc_tmp.__file__),
+                                "modelzoo", "model_configs")
+        if not _os.path.isfile(_os.path.join(cfg_dir, f"{detector_name}.yaml")):
+            avail = sorted(
+                _os.path.splitext(f)[0]
+                for f in _os.listdir(cfg_dir)
+                if f.endswith(".yaml")
+            )
+            msg = (f"Detector '{detector_name}' has no model config in the installed "
+                   f"DeepLabCut version (available: {', '.join(avail)}). "
+                   f"Falling back to '{fallback}'.")
+            logger.warn(f"  [DLC] {msg}")
+            send_push_notification(session, msg, title="CUBE — Unsupported Detector", logger=logger)
+            return fallback
+    except Exception:
+        pass
+    return detector_name
 
 
 def _apply_dlc_monkeypatch(logger):
@@ -1073,8 +1135,10 @@ def _run_dlc_step(session: SessionState, settings: SettingsPanel,
     _model_name     = _validated_dlc_model_name(
                           str(_adv.get("dlc_architecture", "hrnet_w32")),
                           session, logger)
-    _detector_name  = str(_adv.get("dlc_detector",
-                          "fasterrcnn_mobilenet_v3_large_fpn"))
+    _detector_name  = _validated_dlc_detector_name(
+                          str(_adv.get("dlc_detector",
+                              "fasterrcnn_mobilenet_v3_large_fpn")),
+                          session, logger)
     _pcutoff        = float(_adv.get("dlc_pcutoff",        0.6))
     _bbox_thr       = float(_adv.get("dlc_bbox_threshold", 0.6))
     _max_ind        = int(_adv.get("dlc_max_individuals",  1))
@@ -1088,6 +1152,12 @@ def _run_dlc_step(session: SessionState, settings: SettingsPanel,
     _scale_step     = int(_adv.get("dlc_scale_step",       50))
     _inf_batch_ov   = int(_adv.get("dlc_inf_batch",        0))
     _det_batch_ov   = int(_adv.get("dlc_det_batch",        0))
+    _crop_enable    = bool(_adv.get("dlc_crop_enable",     False))
+    _crop_x         = int(_adv.get("dlc_crop_x",           0))
+    _crop_y         = int(_adv.get("dlc_crop_y",           0))
+    _crop_w         = int(_adv.get("dlc_crop_w",           0))
+    _crop_h         = int(_adv.get("dlc_crop_h",           0))
+    _do_crop        = _crop_enable and _crop_w > 0 and _crop_h > 0
 
     # GPU batch size (auto-detect unless user overrides); capped at 85% of free VRAM
     inf_batch = 8
@@ -1115,14 +1185,13 @@ def _run_dlc_step(session: SessionState, settings: SettingsPanel,
 
         logger(f"[{idx}/{total}]  {vname}")
 
-        # resize
-        if long_edge:
+        # resize / crop
+        if long_edge or _do_crop:
             inf_path = os.path.join(dest_folder, f"resized_{base_noext}.mp4")
             if not os.path.exists(inf_path):
                 _cap = cv2.VideoCapture(video_path)
                 _ow_raw = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 _oh_raw = int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                _fps    = _cap.get(cv2.CAP_PROP_FPS) or 30
                 try:
                     _rot = int(_cap.get(cv2.CAP_PROP_ORIENTATION_META))
                 except Exception:
@@ -1132,33 +1201,37 @@ def _run_dlc_step(session: SessionState, settings: SettingsPanel,
                     _ow, _oh = _oh_raw, _ow_raw
                 else:
                     _ow, _oh = _ow_raw, _oh_raw
-                _scale = min(long_edge / max(_ow, _oh), 1.0)
-                _nw = int(_ow * _scale) & ~1
-                _nh = int(_oh * _scale) & ~1
-                if _nw == _ow and _nh == _oh and _rot == 0:
+                # Post-crop source dimensions drive the resize target
+                _src_w = _crop_w if _do_crop else _ow
+                _src_h = _crop_h if _do_crop else _oh
+                if long_edge:
+                    _scale = min(long_edge / max(_src_w, _src_h), 1.0)
+                    _nw = int(_src_w * _scale) & ~1
+                    _nh = int(_src_h * _scale) & ~1
+                else:
+                    _nw = _src_w & ~1
+                    _nh = _src_h & ~1
+                if _nw == _ow and _nh == _oh and _rot == 0 and not _do_crop:
                     _cap.release()
                     shutil.copy2(video_path, inf_path)
                     logger(f"  Video already at/below target — copied to workspace")
                 else:
-                    logger(f"  Resizing {_ow}x{_oh} → {_nw}x{_nh} via cv2 (rotation={_rot}°)")
-                    _fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    _writer = cv2.VideoWriter(inf_path, _fourcc, _fps, (_nw, _nh))
-                    _rot_map = {
-                        90:  cv2.ROTATE_90_CLOCKWISE,
-                        180: cv2.ROTATE_180,
-                        270: cv2.ROTATE_90_COUNTERCLOCKWISE,
-                    }
-                    while True:
-                        _ret, _frame = _cap.read()
-                        if not _ret:
-                            break
-                        if _rot in _rot_map:
-                            _frame = cv2.rotate(_frame, _rot_map[_rot])
-                        _writer.write(cv2.resize(_frame, (_nw, _nh),
-                                                 interpolation=cv2.INTER_AREA))
                     _cap.release()
-                    _writer.release()
-                    logger(f"  Resized video saved (long edge {long_edge})")
+                    _msg = f"  Processing {_ow}x{_oh} → {_nw}x{_nh} (rotation={_rot}°)"
+                    if _do_crop:
+                        _msg += f" [crop {_crop_w}x{_crop_h} @ {_crop_x},{_crop_y}]"
+                    logger(_msg)
+                    _vf_parts = []
+                    if _rot in (90, 270, 180):
+                        _vf_parts.append(
+                            {90: "transpose=1", 180: "transpose=2,transpose=2",
+                             270: "transpose=2"}[_rot])
+                    if _do_crop:
+                        _vf_parts.append(
+                            f"crop={_crop_w}:{_crop_h}:{_crop_x}:{_crop_y}")
+                    _vf_parts.append(f"scale={_nw}:{_nh}:flags=area")
+                    _ffmpeg_transcode(video_path, inf_path, ",".join(_vf_parts))
+                    logger(f"  Processed video saved (long edge {long_edge})")
                 if delete_orig:
                     try: os.remove(video_path)
                     except Exception: pass
@@ -1341,7 +1414,10 @@ def _run_dlc_step(session: SessionState, settings: SettingsPanel,
         for folder in folders:
             root = run_bsoid_prep(
                 folder, log_fn=logger,
-                min_confidence=float(session["bsoid_min_conf"]))
+                min_confidence=float(session["bsoid_min_conf"]),
+                conf_metric=str(session.get("bsoid_conf_metric", "median")),
+                min_session_frac=float(session.get("bsoid_min_sess_frac", 0.6)),
+                min_keep=int(session.get("bsoid_min_keep", 6)))
             if root:
                 bsoid_roots.append(str(root))
         session["bsoid_ready_dirs"] = bsoid_roots
@@ -1489,14 +1565,22 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
     _model_name    = _validated_dlc_model_name(
                          str(_adv.get("dlc_architecture", "hrnet_w32")),
                          session, logger)
-    _detector_name = str(_adv.get("dlc_detector",
-                          "fasterrcnn_mobilenet_v3_large_fpn"))
+    _detector_name = _validated_dlc_detector_name(
+                         str(_adv.get("dlc_detector",
+                             "fasterrcnn_mobilenet_v3_large_fpn")),
+                         session, logger)
     _pcutoff       = float(_adv.get("dlc_pcutoff",        0.6))
     _bbox_thr      = float(_adv.get("dlc_bbox_threshold", 0.6))
     _max_ind       = int(_adv.get("dlc_max_individuals",  1))
     _det_epochs    = int(_adv.get("dlc_det_epochs",       15))
     _pose_epochs   = int(_adv.get("dlc_pose_epochs",      15))
     _transfer      = bool(_adv.get("dlc_transfer",        True))
+    _crop_enable   = bool(_adv.get("dlc_crop_enable",    False))
+    _crop_x        = int(_adv.get("dlc_crop_x",          0))
+    _crop_y        = int(_adv.get("dlc_crop_y",          0))
+    _crop_w        = int(_adv.get("dlc_crop_w",          0))
+    _crop_h        = int(_adv.get("dlc_crop_h",          0))
+    _do_crop       = _crop_enable and _crop_w > 0 and _crop_h > 0
 
     n_epochs      = int(settings.get("dlc_epochs", 15))
     filter_key    = settings.get("dlc_filter", "Sequential  Median  ’ Gaussian")
@@ -1600,13 +1684,19 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
     pb.step_done()
 
     # =========================================================================
-    #  Phase 1.5 — Convert all videos to target resolution (if enabled)
+    #  Phase 1.5 — Convert all videos to target resolution / crop (if enabled)
     # =========================================================================
     long_edge = RESOLUTION_PRESETS.get(settings.get("dlc_resolution"))
-    if long_edge:
+    if long_edge or _do_crop:
+        if long_edge and _do_crop:
+            _phase_msg = f"cropping to {_crop_w}x{_crop_h} and resizing to long-edge {long_edge}px"
+        elif long_edge:
+            _phase_msg = f"resizing to long-edge {long_edge}px"
+        else:
+            _phase_msg = f"cropping to {_crop_w}x{_crop_h}"
         logger.step(f"[{datetime.now().strftime('%H:%M:%S')}] "
                     f"Smart Adapt: Converting {len(valid_entries)} video(s) "
-                    f"to long-edge {long_edge}px …")
+                    f"({_phase_msg}) …")
         pb.step_start("Smart Adapt: Video Conversion", len(valid_entries))
         converted_entries = []
         _conv_errors = []
@@ -1621,7 +1711,6 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
                     _cap2    = cv2.VideoCapture(_vpath)
                     _ow2_raw = int(_cap2.get(cv2.CAP_PROP_FRAME_WIDTH))
                     _oh2_raw = int(_cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    _fps2    = _cap2.get(cv2.CAP_PROP_FPS) or 30
                     try:
                         _rot2 = int(_cap2.get(cv2.CAP_PROP_ORIENTATION_META))
                     except Exception:
@@ -1631,33 +1720,37 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
                         _ow2, _oh2 = _oh2_raw, _ow2_raw
                     else:
                         _ow2, _oh2 = _ow2_raw, _oh2_raw
-                    _sc2  = min(long_edge / max(_ow2, _oh2), 1.0)
-                    _nw2  = int(_ow2 * _sc2) & ~1
-                    _nh2  = int(_oh2 * _sc2) & ~1
-                    if _nw2 == _ow2 and _nh2 == _oh2 and _rot2 == 0:
+                    # Post-crop source dimensions drive the resize target
+                    _src2_w = _crop_w if _do_crop else _ow2
+                    _src2_h = _crop_h if _do_crop else _oh2
+                    if long_edge:
+                        _sc2 = min(long_edge / max(_src2_w, _src2_h), 1.0)
+                        _nw2 = int(_src2_w * _sc2) & ~1
+                        _nh2 = int(_src2_h * _sc2) & ~1
+                    else:
+                        _nw2 = _src2_w & ~1
+                        _nh2 = _src2_h & ~1
+                    if _nw2 == _ow2 and _nh2 == _oh2 and _rot2 == 0 and not _do_crop:
                         _cap2.release()
                         shutil.copy2(_vpath, _inf_path)
                         logger.info(f"  {_vname}: already at/below target — copied")
                     else:
-                        logger.info(f"  Resizing {_vname}: {_ow2}x{_oh2} → {_nw2}x{_nh2} (rotation={_rot2}°)")
-                        _fc2   = cv2.VideoWriter_fourcc(*"mp4v")
-                        _wrt2  = cv2.VideoWriter(_inf_path, _fc2, _fps2, (_nw2, _nh2))
-                        _rmap2 = {
-                            90:  cv2.ROTATE_90_CLOCKWISE,
-                            180: cv2.ROTATE_180,
-                            270: cv2.ROTATE_90_COUNTERCLOCKWISE,
-                        }
-                        while True:
-                            _r2, _fr2 = _cap2.read()
-                            if not _r2:
-                                break
-                            if _rot2 in _rmap2:
-                                _fr2 = cv2.rotate(_fr2, _rmap2[_rot2])
-                            _wrt2.write(cv2.resize(_fr2, (_nw2, _nh2),
-                                                   interpolation=cv2.INTER_AREA))
                         _cap2.release()
-                        _wrt2.release()
-                        logger.info(f"  Resized → {Path(_inf_path).name}")
+                        _log2 = (f"  Processing {_vname}: {_ow2}x{_oh2} → {_nw2}x{_nh2}"
+                                 f"{f' [crop {_crop_w}x{_crop_h} @ {_crop_x},{_crop_y}]' if _do_crop else ''}"
+                                 f" (rotation={_rot2}°)")
+                        logger.info(_log2)
+                        _vf2_parts = []
+                        if _rot2 in (90, 270, 180):
+                            _vf2_parts.append(
+                                {90: "transpose=1", 180: "transpose=2,transpose=2",
+                                 270: "transpose=2"}[_rot2])
+                        if _do_crop:
+                            _vf2_parts.append(
+                                f"crop={_crop_w}:{_crop_h}:{_crop_x}:{_crop_y}")
+                        _vf2_parts.append(f"scale={_nw2}:{_nh2}:flags=area")
+                        _ffmpeg_transcode(_vpath, _inf_path, ",".join(_vf2_parts))
+                        logger.info(f"  Processed → {Path(_inf_path).name}")
                 converted_entries.append((_inf_path, _vsub, _mean_b))
             except Exception as _conv_exc:
                 logger.error(f"  Conversion failed for {_vname}: {_conv_exc}")
@@ -1687,7 +1780,7 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
                 f"Representative: {Path(rep_video_path).name}")
             send_push_notification(
                 session,
-                f"All {len(valid_entries)} video(s) converted to {long_edge}px. "
+                f"All {len(valid_entries)} video(s) converted ({_phase_msg}). "
                 f"Starting DLC inference.",
                 title="CUBE — Conversion Complete", logger=logger)
         pb.step_done()
@@ -2109,7 +2202,10 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
         for folder in folders:
             root = run_bsoid_prep(
                 folder, log_fn=logger,
-                min_confidence=float(session.get("bsoid_min_conf", 0.35)))
+                min_confidence=float(session.get("bsoid_min_conf", 0.30)),
+                conf_metric=str(session.get("bsoid_conf_metric", "median")),
+                min_session_frac=float(session.get("bsoid_min_sess_frac", 0.6)),
+                min_keep=int(session.get("bsoid_min_keep", 6)))
             if root:
                 bsoid_roots.append(str(root))
         session["bsoid_ready_dirs"] = bsoid_roots
@@ -2138,8 +2234,10 @@ def _run_dlc_zoo_per_video(dlc, cv2, gc, valid_entries, session, settings,
     _model_name    = _validated_dlc_model_name(
                          str(_adv.get("dlc_architecture", "hrnet_w32")),
                          session, logger)
-    _detector_name = str(_adv.get("dlc_detector",
-                          "fasterrcnn_mobilenet_v3_large_fpn"))
+    _detector_name = _validated_dlc_detector_name(
+                         str(_adv.get("dlc_detector",
+                             "fasterrcnn_mobilenet_v3_large_fpn")),
+                         session, logger)
     _pcutoff  = float(_adv.get("dlc_pcutoff",        0.6))
     _bbox_thr = float(_adv.get("dlc_bbox_threshold", 0.6))
     _max_ind  = int(_adv.get("dlc_max_individuals",  1))
@@ -2243,7 +2341,10 @@ def _run_dlc_zoo_per_video(dlc, cv2, gc, valid_entries, session, settings,
         for folder in folders:
             root = run_bsoid_prep(
                 folder, log_fn=logger,
-                min_confidence=float(session.get("bsoid_min_conf", 0.35)))
+                min_confidence=float(session.get("bsoid_min_conf", 0.30)),
+                conf_metric=str(session.get("bsoid_conf_metric", "median")),
+                min_session_frac=float(session.get("bsoid_min_sess_frac", 0.6)),
+                min_keep=int(session.get("bsoid_min_keep", 6)))
             if root:
                 bsoid_roots.append(str(root))
         session["bsoid_ready_dirs"] = bsoid_roots
@@ -2277,7 +2378,10 @@ def _run_bsoid_prep_step(session: SessionState, settings: SettingsPanel,
                f"{Path(folder).name}")
         root = run_bsoid_prep(
             folder, log_fn=logger,
-            min_confidence=float(settings.get("bsoid_min_conf", 0.35)))
+            min_confidence=float(settings.get("bsoid_min_conf", 0.30)),
+            conf_metric=str(settings.get("bsoid_conf_metric", "median")),
+            min_session_frac=float(settings.get("bsoid_min_sess_frac", 0.6)),
+            min_keep=int(settings.get("bsoid_min_keep", 6)))
         if root:
             roots.append(str(root))
         after_fn(lambda cur=i: pb.step_tick(cur, len(folders)))
@@ -2289,6 +2393,134 @@ def _run_bsoid_prep_step(session: SessionState, settings: SettingsPanel,
         session,
         f"Pre-processing complete: {len(roots)} project(s) ready in BSOID_Project_Ready/.",
         title="CUBE — Pre-processing Complete", logger=logger)
+
+
+def _find_video_by_stem(stem: str, search_dirs: list):
+    """Locate a video file named '<stem>.<ext>' under any of search_dirs
+    (recursively).  Returns the first match as a Path, or None."""
+    exts = (".mp4", ".avi", ".mov", ".mkv", ".m4v")
+    for d in search_dirs or []:
+        try:
+            base = Path(d)
+            if not base.exists():
+                continue
+            for ext in exts:
+                hit = next(base.rglob(f"{stem}{ext}"), None)
+                if hit is not None and hit.is_file():
+                    return hit
+        except Exception:
+            continue
+    return None
+
+
+def _export_umap_evolution_videos(out_dir, n_req: int, source_fps: float,
+                                  logger, output_fps: float = 15.0,
+                                  seed=None, search_dirs: list = None) -> list:
+    """Export up to ``n_req`` side-by-side UMAP-evolution videos for a finished
+    run directory.  Reusable by both the automatic post-Step-3 export and the
+    manual launcher.  Returns the list of produced paths; logs and returns []
+    on any problem rather than raising (never breaks the surrounding step).
+
+    Reads the per-session 3-D embedding (model/umap_embedding.npy), the bin
+    ranges + embedded video paths (model/session_bin_ranges.json), and the
+    per-frame cluster labels (bout_lengths/<stem>_frame_labels[_hmm].csv).
+    """
+    if not CORE_OK:
+        return []
+    import numpy as _np, pandas as _pd, random as _rnd
+    out_dir   = Path(out_dir)
+    model_dir = out_dir / "model"
+    emb_p     = model_dir / "umap_embedding.npy"
+    lab_p     = model_dir / "umap_labels.npy"
+    sbr_p     = model_dir / "session_bin_ranges.json"
+    if not (emb_p.is_file() and sbr_p.is_file()):
+        logger.warn("  [umap-evo] umap_embedding.npy / session_bin_ranges.json "
+                    "missing — cannot export.")
+        return []
+    try:
+        embedding   = _np.load(str(emb_p))
+        umap_labels = _np.load(str(lab_p)) if lab_p.is_file() else None
+        sbr         = json.loads(sbr_p.read_text())
+    except Exception as e:
+        logger.warn(f"  [umap-evo] cannot load UMAP data: {e}")
+        return []
+
+    ready = []
+    missing = []
+    for k, v in sbr.items():
+        if k == "_total_bins" or not isinstance(v, list) or len(v) < 3:
+            continue
+        vp = str(v[2]) if v[2] else None
+        if vp and Path(vp).is_file():
+            ready.append((k, int(v[0]), int(v[1]), vp))
+            continue
+        # Embedded path missing (e.g. the BSOID_Project_Ready/videos copy was
+        # deleted after the run, or files moved) — try to locate by name.
+        alt = _find_video_by_stem(k, search_dirs)
+        if alt is not None:
+            ready.append((k, int(v[0]), int(v[1]), str(alt)))
+        else:
+            missing.append(k)
+    if missing:
+        logger.warn(f"  [umap-evo] {len(missing)} session(s) had no locatable "
+                    f"source video (searched embedded path + provided folders): "
+                    f"{', '.join(missing[:6])}{'...' if len(missing) > 6 else ''}")
+    if not ready:
+        logger.warn("  [umap-evo] no sessions with an available source video — "
+                    "skipped. (If you enabled 'delete BSOID_Project_Ready/videos', "
+                    "the source copies were removed; keep them or point CUBE at the "
+                    "original videos to enable this export.)")
+        return []
+
+    chosen   = _rnd.Random(seed).sample(ready, min(int(n_req), len(ready)))
+    evo_dir  = out_dir / "videos" / "umap_evolution"
+    evo_dir.mkdir(parents=True, exist_ok=True)
+    bout_dir = out_dir / "bout_lengths"
+    produced = []
+    for i, (stem, sb, eb, vp) in enumerate(chosen, 1):
+        try:
+            if eb > len(embedding):
+                logger.warn(f"  [umap-evo] {stem}: bin range exceeds embedding — "
+                            f"skipped.")
+                continue
+            # Per-frame labels: prefer HMM-smoothed, then raw.  These CSVs have a
+            # header row (frame,time_s,label) — read with the header and select
+            # the 'label' column (NOT iloc[:,0], which is the frame index).
+            frame_labels = None
+            for suffix in (f"{stem}_frame_labels_hmm.csv",
+                           f"{stem}_frame_labels.csv"):
+                cand = bout_dir / suffix
+                if cand.is_file():
+                    dfl = _pd.read_csv(str(cand))
+                    col = "label" if "label" in dfl.columns else dfl.columns[-1]
+                    frame_labels = (_pd.to_numeric(dfl[col], errors="coerce")
+                                    .dropna().to_numpy(dtype=int))
+                    break
+            if frame_labels is None or frame_labels.size == 0:
+                logger.warn(f"  [umap-evo] {stem}: no usable frame-label CSV — "
+                            f"skipped.")
+                continue
+            out_p = evo_dir / f"{stem}_umap_evolution.mp4"
+            logger.info(f"  [umap-evo] {i}/{len(chosen)}  '{stem}' -> {out_p.name}")
+            res = create_umap_evolution_video(
+                video_path=Path(vp),
+                embedding=embedding[sb:eb],
+                umap_labels=(umap_labels[sb:eb] if umap_labels is not None
+                             else _np.zeros(eb - sb, dtype=int)),
+                frame_labels=frame_labels,
+                source_fps=source_fps,
+                out_path=out_p,
+                output_fps=output_fps,
+            )
+            if res is not None:
+                produced.append(res)
+                logger.success(f"  [umap-evo] saved -> {res}")
+            else:
+                logger.warn(f"  [umap-evo] {stem}: export returned no output "
+                            f"(is opencv installed and the video readable?).")
+        except Exception:
+            logger.warn(f"  [umap-evo] {stem}: {traceback.format_exc()}")
+    return produced
 
 
 def _run_engine_step(session: SessionState, settings: SettingsPanel,
@@ -2378,14 +2610,43 @@ def _run_engine_step(session: SessionState, settings: SettingsPanel,
         vid_dir = rp / "videos"
         if _has_videos(vid_dir):
             all_vid_dirs.append(vid_dir)
+        else:
+            # Per-root fallback: BSOID_Project_Ready lives directly inside the
+            # source folder, so rp.parent IS the source folder.  The old global
+            # "if not all_vid_dirs" guard caused all roots to be skipped whenever
+            # at least one sibling root had a populated videos/ directory.
+            _parent = rp.parent
+            if _has_videos(_parent):
+                all_vid_dirs.append(_parent)
+                logger.warn(
+                    f"    [{rp.name}] videos/ empty — "
+                    f"using parent folder: {_parent.name}")
 
-    # Fall back to session source folders when BSOID video dirs are empty
-    if not all_vid_dirs:
-        for src_folder in session.get("video_folders", []):
-            sp = Path(src_folder)
-            if _has_videos(sp):
-                all_vid_dirs.append(sp)
-                logger.warn(f"    BSOID videos/ empty — using source folder: {sp.name}")
+    # ── Build stem→group mapping so analyser can assign exp_group per file ──────
+    # video_groups maps source-folder-path → group name; the bout CSVs live in a
+    # completely different output tree, so we map by DLC-file stem instead.
+    _video_groups_session = session.get("video_groups", {})
+    if _video_groups_session:
+        _stem_to_group: dict = {}
+        for _bsoid_root, _csv_d in zip(bsoid_roots, all_csv_dirs):
+            _bsoid_res = Path(_bsoid_root).resolve()
+            for _fg_str, _fg_grp in _video_groups_session.items():
+                try:
+                    _bsoid_res.relative_to(Path(_fg_str).resolve())
+                    # This bsoid_root lives inside this source folder
+                    for _ext in ("*.csv", "*.h5"):
+                        for _cf in sorted(Path(_csv_d).glob(_ext)):
+                            _stem_to_group[_cf.stem] = _fg_grp
+                    break
+                except ValueError:
+                    continue
+        if _stem_to_group:
+            session["stem_to_group"] = _stem_to_group
+            logger.info(f"  Group mapping: {len(_stem_to_group)} DLC stem(s) → group "
+                        f"({len(set(_stem_to_group.values()))} group(s))")
+        else:
+            logger.warn("  Group mapping: no DLC stems could be matched to source folders — "
+                        "exp_group will not be auto-populated in Analyser.")
 
     # ── Single combined output directory (timestamped to preserve prior runs) ──
     _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2454,6 +2715,52 @@ def _run_engine_step(session: SessionState, settings: SettingsPanel,
 
     session["bout_lengths_paths"] = bout_all
     session["engine_out_dirs"]    = [str(this_out)]
+
+    # Persist group assignments so future sessions can inject them without
+    # needing the original session file to be loaded.
+    if session.get("stem_to_group"):
+        try:
+            _ga_path = this_out / "model" / "group_assignments.json"
+            _ga_path.parent.mkdir(parents=True, exist_ok=True)
+            _ga_path.write_text(
+                json.dumps(session.get("stem_to_group", {}), indent=2),
+                encoding="utf-8")
+            logger.info(f"  Group assignments saved to {_ga_path.name}")
+        except Exception:
+            pass
+
+    # ── UMAP evolution videos: fallback export ────────────────────────────────
+    # The engine (cube_core.run) already auto-exports umap_evolution videos in
+    # the normal case.  Only retry here if it produced nothing AND the user has
+    # not disabled it — this adds the by-name video search (recovers sessions
+    # whose embedded path is missing) without double-rendering when the engine
+    # already succeeded.  MUST run BEFORE the video-folder cleanup below so the
+    # source videos still exist.
+    _evo_n = cfg.get("umap_evolution_n",
+                     session.get("engine_cfg", {}).get("umap_evolution_n", 1))
+    try:
+        _evo_n = int(_evo_n or 0)
+    except (TypeError, ValueError):
+        _evo_n = 1
+    _evo_dir = Path(this_out) / "videos" / "umap_evolution"
+    _engine_made = _evo_dir.exists() and any(_evo_dir.glob("*.mp4"))
+    if _evo_n > 0 and not _engine_made:
+        try:
+            logger.step(f"UMAP evolution: engine produced none — retrying export "
+                        f"(up to {_evo_n}) with by-name video search...")
+            _evo_search = (list(all_vid_dirs or []) +
+                           list(session.get("video_folders", [])))
+            _vids = _export_umap_evolution_videos(
+                this_out, _evo_n, fps_val, logger, search_dirs=_evo_search)
+            if _vids:
+                logger.success(
+                    f"UMAP evolution: {len(_vids)} video(s) saved to {_evo_dir}.")
+            else:
+                logger.warn("UMAP evolution: no videos produced (see [umap-evo] "
+                            "messages above).")
+        except Exception:
+            logger.warn(f"  [umap-evo] fallback export failed:\n"
+                        f"{traceback.format_exc()}")
 
     # ── Delete BSOID_Project_Ready/videos/ copies if user requested ──────────
     if bool(session.get("bsoid_delete_videos_folder", False)):
@@ -2598,11 +2905,11 @@ class DLCPrepSettingsWindow(tk.Toplevel):
                 messagebox.showerror("Error", str(e), parent=self)
 
         tk.Button(btn_row, text="Test Notification", font=("Segoe UI", 9),
-                  bg=C["card2"], fg=C["cyan"], relief="flat",
+                  bg=C["btn"], fg=C["cyan"], relief="flat",
                   padx=14, pady=5, cursor="hand2",
                   command=_test_notification).pack(side="left", padx=6)
         tk.Button(btn_row, text="Close", font=("Segoe UI", 9, "bold"),
-                  bg=C["card2"], fg=C["text"], relief="flat",
+                  bg=C["btn"], fg=C["text"], relief="flat",
                   padx=20, pady=5, cursor="hand2",
                   command=self.destroy).pack(side="left", padx=6)
 
@@ -2626,8 +2933,8 @@ class AdvancedDLCWindow(tk.Toplevel):
     ARCHITECTURES = ["hrnet_w32", "resnet_50", "rtmpose_s", "rtmpose_x"]
     DETECTORS     = [
         "fasterrcnn_mobilenet_v3_large_fpn",
-        "fasterrcnn_resnet50_fpn",
-        "ssd300_vgg16",
+        "fasterrcnn_resnet50_fpn_v2",
+        "ssdlite",
     ]
     DEFAULTS = dict(
         dlc_use_custom       = False,
@@ -2647,6 +2954,11 @@ class AdvancedDLCWindow(tk.Toplevel):
         dlc_scale_min        = 100,
         dlc_scale_max        = 600,
         dlc_scale_step       = 50,
+        dlc_crop_enable      = False,
+        dlc_crop_x           = 0,
+        dlc_crop_y           = 0,
+        dlc_crop_w           = 0,
+        dlc_crop_h           = 0,
     )
 
     def __init__(self, parent, session: "SessionState"):
@@ -2664,11 +2976,11 @@ class AdvancedDLCWindow(tk.Toplevel):
         btn_f = tk.Frame(self, bg=C["bg"])
         btn_f.pack(side="bottom", fill="x", pady=8, padx=12)
         tk.Button(btn_f, text="Cancel", font=("Segoe UI", 9),
-                  bg=C["card2"], fg=C["subtext"], relief="flat",
+                  bg=C["btn"], fg=C["btn_fg"], relief="flat",
                   padx=10, pady=5, cursor="hand2",
                   command=self.destroy).pack(side="left")
         tk.Button(btn_f, text="Restore Defaults", font=("Segoe UI", 9),
-                  bg=C["card2"], fg=C["yellow"], relief="flat",
+                  bg=C["btn"], fg=C["yellow"], relief="flat",
                   padx=10, pady=5, cursor="hand2",
                   command=self._restore).pack(side="left", padx=6)
         tk.Button(btn_f, text="Apply & Close", font=("Segoe UI", 10, "bold"),
@@ -2865,6 +3177,44 @@ class AdvancedDLCWindow(tk.Toplevel):
                        buttonbackground=C["card2"],
                        font=("Segoe UI", 9)).pack(side="left", padx=(2, 0))
 
+        # ── Video crop ────────────────────────────────────────────────────────
+        sec6 = _adv_section(p, "VIDEO CROP  (spatial region applied before inference)", C["yellow"])
+        crop_en_row = tk.Frame(sec6, bg=C["card"])
+        crop_en_row.pack(anchor="w", padx=8, pady=4)
+        self._v("dlc_crop_enable", tk.BooleanVar(value=False))
+        tk.Checkbutton(
+            crop_en_row,
+            text="Enable spatial crop  (trim each video to a defined pixel region)",
+            variable=self._vars["dlc_crop_enable"],
+            bg=C["card"], fg=C["text"],
+            selectcolor=C["card2"], activebackground=C["card"],
+            font=("Segoe UI", 9),
+        ).pack(side="left")
+        for key, default in [("dlc_crop_x", 0), ("dlc_crop_y", 0),
+                              ("dlc_crop_w", 0), ("dlc_crop_h", 0)]:
+            self._v(key, tk.IntVar(value=default))
+        tk.Label(sec6,
+                 text="  Current region (pixels, 0 = not set — use Preview button to set):",
+                 font=("Segoe UI", 8), bg=C["card"], fg=C["dim"]).pack(anchor="w", padx=8)
+        crop_coord_row = tk.Frame(sec6, bg=C["card"])
+        crop_coord_row.pack(anchor="w", padx=8, pady=(0, 4))
+        for lbl, key in [("X:", "dlc_crop_x"), ("Y:", "dlc_crop_y"),
+                          ("W:", "dlc_crop_w"), ("H:", "dlc_crop_h")]:
+            tk.Label(crop_coord_row, text=lbl, font=("Segoe UI", 9),
+                     bg=C["card"], fg=C["text"]).pack(side="left", padx=(6, 0))
+            tk.Spinbox(crop_coord_row, from_=0, to=9999, increment=1,
+                       textvariable=self._vars[key], width=6,
+                       bg=C["card2"], fg=C["text"],
+                       buttonbackground=C["card2"],
+                       font=("Segoe UI", 9)).pack(side="left", padx=(2, 0))
+        tk.Button(sec6,
+                  text="  Preview / Set Crop Region…",
+                  font=("Segoe UI", 9, "bold"),
+                  bg=C["yellow"], fg=C["bg"],
+                  activebackground="#e6c200", relief="flat",
+                  padx=10, pady=5, cursor="hand2",
+                  command=self._open_crop_preview).pack(anchor="w", padx=8, pady=(0, 6))
+
     def _toggle_model_type(self):
         if self._vars["dlc_use_custom"].get():
             self._sa_sec.pack_forget()
@@ -2885,6 +3235,25 @@ class AdvancedDLCWindow(tk.Toplevel):
             filetypes=[("YAML config", "*.yaml *.yml"), ("All", "*")])
         if p:
             self._vars["dlc_custom_config"].set(p)
+
+    def _open_crop_preview(self):
+        cfg = {}
+        for k, var in self._vars.items():
+            try:
+                cfg[k] = var.get()
+            except Exception:
+                pass
+        self._session["dlc_advanced_cfg"] = cfg
+        dlg = CropPreviewDialog(self, self._session)
+        self.wait_window(dlg)
+        if dlg.confirmed:
+            adv = self._session.get("dlc_advanced_cfg", {})
+            for k in ("dlc_crop_x", "dlc_crop_y", "dlc_crop_w", "dlc_crop_h"):
+                if k in self._vars:
+                    try:
+                        self._vars[k].set(int(adv.get(k, 0)))
+                    except Exception:
+                        pass
 
     def _load(self):
         cfg = self._session.get("dlc_advanced_cfg", {})
@@ -2922,41 +3291,57 @@ class AdvancedDLCWindow(tk.Toplevel):
 class AdvancedCUBEWindow(tk.Toplevel):
     """Modal popup for advanced CUBE engine / analysis parameters."""
 
-    DEFAULTS = dict(
-        body_normalise        = True,
+    # GUI-managed parameters.  This baseline is OVERLAID by BSoidEngine.DEFAULTS
+    # (the canonical source) so the GUI can never drift from the engine — see
+    # DEFAULTS below.  The baseline values are used only as a fallback when the
+    # core engine failed to import (in which case no run can happen anyway).
+    # Keys here that are NOT in the engine (e.g. umap_evolution_n) are GUI-only.
+    _BASELINE = dict(
+        body_normalise        = False,
         pca_pre_reduce        = "auto",
         likelihood_thresh     = 0.30,
+        max_interp_gap_sec    = 0.50,
         boxcar_win_sec        = 0.07,
         train_frac            = 0.30,
         umap_full_thresh      = 10_000,
-        umap_n_neighbors      = 60,
+        umap_n_neighbors      = 0,     # 0 = auto (scales with recording length)
         umap_n_components     = 3,
         umap_min_dist         = 0.10,
         umap_random_state     = 42,
         hdbscan_metric        = "euclidean",
-        hdbscan_method        = "eom",
+        hdbscan_method        = "both",
         hdbscan_methods_to_try = "eom,leaf",
         target_n_clusters     = 0,
-        preferred_clusters_lo = 8,
+        preferred_clusters_lo = 5,
         preferred_clusters_hi = 30,
+        min_cluster_freq      = 0.2,   # percentage of total bins; 0 = disabled
         mlp_hidden            = "100,50",
         mlp_max_iter          = 1000,
+        mlp_confidence_thresh = 0.0,
         cv_folds              = 5,
         output_fps            = 15,
         max_clips_per_cluster = 3,
         save_plots            = True,
         save_videos           = True,
+        umap_evolution_n      = 1,     # GUI-only: videos auto-exported after Step 3
         hmm_enabled           = True,
         hmm_n_states          = 0,     # 0 = auto (= n_clusters)
         hmm_n_iter            = 100,
         hmm_min_prob          = 0.05,
+        compat_mode           = "current",  # "current" or "legacy_v2"
+        seed_sweep_n          = 0,     # >0 = run cluster-stability seed sweep
     )
+    try:
+        # Engine defaults win for every shared key; GUI-only keys persist.
+        DEFAULTS = {**_BASELINE, **dict(BSoidEngine.DEFAULTS)}
+    except Exception:
+        DEFAULTS = dict(_BASELINE)
 
     def __init__(self, parent, session: "SessionState"):
         super().__init__(parent)
         self.title("⚙  Advanced CUBE Analysis Parameters")
         self.configure(bg=C["bg"])
-        self.geometry("520x720")
+        self.geometry("520x760")
         self.resizable(True, True)
         self.transient(parent)
         self.grab_set()
@@ -2967,11 +3352,11 @@ class AdvancedCUBEWindow(tk.Toplevel):
         btn_f = tk.Frame(self, bg=C["bg"])
         btn_f.pack(side="bottom", fill="x", pady=8, padx=12)
         tk.Button(btn_f, text="Cancel", font=("Segoe UI", 9),
-                  bg=C["card2"], fg=C["subtext"], relief="flat",
+                  bg=C["btn"], fg=C["btn_fg"], relief="flat",
                   padx=10, pady=5, cursor="hand2",
                   command=self.destroy).pack(side="left")
         tk.Button(btn_f, text="Restore Defaults", font=("Segoe UI", 9),
-                  bg=C["card2"], fg=C["yellow"], relief="flat",
+                  bg=C["btn"], fg=C["yellow"], relief="flat",
                   padx=10, pady=5, cursor="hand2",
                   command=self._restore).pack(side="left", padx=6)
         tk.Button(btn_f, text="Apply & Close", font=("Segoe UI", 10, "bold"),
@@ -3019,8 +3404,15 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  font=("Segoe UI", 8), bg=C["bg"], fg=C["dim"],
                  justify="left").pack(anchor="w", padx=10, pady=(0, 4))
 
+        # Widget defaults are sourced from self.DEFAULTS (which is the canonical
+        # BSoidEngine.DEFAULTS overlaid on the GUI baseline) so the seeded value
+        # can never drift from the engine.  The literal passed at the call site
+        # is only a fallback for keys absent from DEFAULTS.
         def _spin_f(row, key, lo, hi, step, default):
-            v = self._v(key, tk.DoubleVar(value=default))
+            _dv = self.DEFAULTS.get(key, default)
+            if _dv is None:          # engine default may be None (e.g. auto) — use literal
+                _dv = default
+            v = self._v(key, tk.DoubleVar(value=float(_dv)))
             tk.Spinbox(row, from_=lo, to=hi, increment=step,
                        format="%.3f", textvariable=v, width=8,
                        bg=C["card2"], fg=C["text"],
@@ -3028,7 +3420,10 @@ class AdvancedCUBEWindow(tk.Toplevel):
                        font=("Segoe UI", 9)).pack(side="left")
 
         def _spin_i(row, key, lo, hi, step, default):
-            v = self._v(key, tk.IntVar(value=default))
+            _dv = self.DEFAULTS.get(key, default)
+            if _dv is None:          # engine default may be None (e.g. hmm_n_states) — use literal
+                _dv = default
+            v = self._v(key, tk.IntVar(value=int(_dv)))
             tk.Spinbox(row, from_=lo, to=hi, increment=step,
                        textvariable=v, width=8,
                        bg=C["card2"], fg=C["text"],
@@ -3036,13 +3431,13 @@ class AdvancedCUBEWindow(tk.Toplevel):
                        font=("Segoe UI", 9)).pack(side="left")
 
         def _check(row, key, default):
-            v = self._v(key, tk.BooleanVar(value=default))
+            v = self._v(key, tk.BooleanVar(value=bool(self.DEFAULTS.get(key, default))))
             tk.Checkbutton(row, variable=v, bg=C["card"], fg=C["green"],
                            selectcolor=C["card2"],
                            activebackground=C["card"]).pack(side="left")
 
         def _combo(row, key, values, default):
-            v = self._v(key, tk.StringVar(value=default))
+            v = self._v(key, tk.StringVar(value=str(self.DEFAULTS.get(key, default))))
             ttk.Combobox(row, textvariable=v, values=values,
                          state="readonly", width=18,
                          font=("Segoe UI", 9)).pack(side="left")
@@ -3050,7 +3445,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
         # ── Feature extraction ────────────────────────────────────────────────
         s = _adv_section(p, "FEATURE EXTRACTION", C["cyan"])
         _adv_row(s, "Body normalisation",
-                 lambda r: _check(r, "body_normalise", True))
+                 lambda r: _check(r, "body_normalise", False))
         tk.Label(s,
                  text="    Divide all distances by nose-to-tailbase spine length.\n"
                       "    Requires 'nose' and 'tailbase' bodypart names in DLC output.",
@@ -3070,7 +3465,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  lambda r: _spin_f(r, "boxcar_win_sec", 0.0, 0.5, 0.01, 0.07))
 
         # ── UMAP ─────────────────────────────────────────────────────────────
-        s2 = _adv_section(p, "UMAP EMBEDDING  (Hsu & Bhatt 2021 defaults)", C["cyan"])
+        s2 = _adv_section(p, "UMAP EMBEDDING  (Hsu & Yttri 2021 reference)", C["cyan"])
         _adv_row(s2, "Full-data threshold",
                  lambda r: _spin_i(r, "umap_full_thresh", 1000, 100_000, 1000, 10_000))
         tk.Label(s2,
@@ -3080,12 +3475,23 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s2, "Train fraction",
                  lambda r: _spin_f(r, "train_frac", 0.05, 1.0, 0.05, 0.30))
-        _adv_row(s2, "n_neighbors",
-                 lambda r: _spin_i(r, "umap_n_neighbors", 5, 300, 5, 60))
+        _adv_row(s2, "n_neighbors  (0 = auto)",
+                 lambda r: _spin_i(r, "umap_n_neighbors", 0, 300, 5, 0))
+        tk.Label(s2,
+                 text="    0 = auto: scales with recording length, clip(n_bins/25, 15, 60).\n"
+                      "    Set a positive value to fix it (B-SOiD reference = 60).",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s2, "n_components",
                  lambda r: _spin_i(r, "umap_n_components", 2, 10, 1, 3))
         _adv_row(s2, "min_dist",
                  lambda r: _spin_f(r, "umap_min_dist", 0.0, 1.0, 0.05, 0.10))
+        tk.Label(s2,
+                 text="    Recommended: 0.1.  Values < 0.05 pack UMAP points so tightly\n"
+                      "    that HDBSCAN's density graph degenerates (DBCV becomes non-finite)\n"
+                      "    and noise fraction rises sharply.  Use 0.0 only with legacy_v2.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 4))
         _adv_row(s2, "Random seed",
                  lambda r: _spin_i(r, "umap_random_state", 0, 9999, 1, 42))
 
@@ -3097,11 +3503,12 @@ class AdvancedCUBEWindow(tk.Toplevel):
                                   "euclidean"))
         _adv_row(s3, "Cluster selection method",
                  lambda r: _combo(r, "hdbscan_method",
-                                  ["eom", "leaf"], "eom"))
+                                  ["both", "eom", "leaf"], "both"))
         tk.Label(s3,
-                 text="    Both eom and leaf are tried automatically; DBCV score selects\n"
-                      "    the best result (most internally cohesive + maximally separated).\n"
-                      "    min_cluster_size is swept adaptively (anchored to full dataset size).",
+                 text="    both = tries eom and leaf at every step; DBCV score picks best.\n"
+                      "    eom  = larger, more stable clusters (overlapping densities).\n"
+                      "    leaf = finer, denser clusters (stereotyped/brief events).\n"
+                      "    min_cluster_size is swept adaptively (anchored to clustered points).",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
 
@@ -3124,10 +3531,18 @@ class AdvancedCUBEWindow(tk.Toplevel):
                       "    Ignored when Target cluster count > 0.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s3b, "Min cluster frequency (%)",
+                 lambda r: _spin_f(r, "min_cluster_freq", 0.0, 10.0, 0.1, 0.5))
+        tk.Label(s3b,
+                 text="    Clusters whose share of total analysis time is below this\n"
+                      "    percentage are removed before MLP training (reassigned to noise).\n"
+                      "    0.2 % = default.  Set to 0 to disable pruning.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
 
         # ── MLP classifier ────────────────────────────────────────────────────
         def _adv_entry(row, key, default):
-            v = self._v(key, tk.StringVar(value=default))
+            v = self._v(key, tk.StringVar(value=str(self.DEFAULTS.get(key, default))))
             tk.Entry(row, textvariable=v, width=14,
                      bg=C["card2"], fg=C["text"],
                      insertbackground=C["text"],
@@ -3163,6 +3578,26 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
 
+        # ── Reproducibility & methodology ─────────────────────────────────────
+        s_rep = _adv_section(p, "REPRODUCIBILITY & METHODOLOGY", C["cyan"])
+        _adv_row(s_rep, "Compatibility mode",
+                 lambda r: _combo(r, "compat_mode",
+                                  ["current", "legacy_v2"], "current"))
+        tk.Label(s_rep,
+                 text="    current = v2.1 corrected behaviour (recommended).\n"
+                      "    legacy_v2 = reproduce pre-2.1 runs exactly (min_dist=0,\n"
+                      "    full-dataset mcs anchor, evenly-spaced angular fallback).",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s_rep, "Cluster-stability seed sweep  (0 = off)",
+                 lambda r: _spin_i(r, "seed_sweep_n", 0, 50, 1, 0))
+        tk.Label(s_rep,
+                 text="    >0 re-runs UMAP+HDBSCAN over this many seeds to measure\n"
+                      "    cluster-count / partition stability (plots cluster_stability.png).\n"
+                      "    Adds runtime proportional to the number of seeds.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+
         # ── Output options ─────────────────────────────────────────────────────
         s5 = _adv_section(p, "OUTPUT OPTIONS", C["accent"])
         _adv_row(s5, "Example clip FPS",
@@ -3173,6 +3608,13 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  lambda r: _check(r, "save_plots", True))
         _adv_row(s5, "Save labeled videos",
                  lambda r: _check(r, "save_videos", True))
+        _adv_row(s5, "UMAP evolution videos  (0 = off)",
+                 lambda r: _spin_i(r, "umap_evolution_n", 0, 50, 1, 1))
+        tk.Label(s5,
+                 text="    Auto-export this many side-by-side evolution videos\n"
+                      "    at the end of Step 3.  Sessions are chosen randomly.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s5, "Plot theme",
                  lambda r: _combo(r, "plot_theme", ["dark", "light"], "dark"))
         tk.Label(s5,
@@ -3181,8 +3623,14 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
 
     def _load(self):
+        # Recompute at open-time so BSoidEngine.DEFAULTS is available (deferred import
+        # has run by the time the user clicks to open this window).
+        try:
+            effective = {**self._BASELINE, **dict(BSoidEngine.DEFAULTS)}
+        except Exception:
+            effective = dict(self._BASELINE)
         cfg = self._session.get("engine_cfg", {})
-        for k, default in self.DEFAULTS.items():
+        for k, default in effective.items():
             val = cfg.get(k, default)
             if k in self._vars:
                 try:
@@ -3191,7 +3639,11 @@ class AdvancedCUBEWindow(tk.Toplevel):
                     pass
 
     def _restore(self):
-        for k, default in self.DEFAULTS.items():
+        try:
+            effective = {**self._BASELINE, **dict(BSoidEngine.DEFAULTS)}
+        except Exception:
+            effective = dict(self._BASELINE)
+        for k, default in effective.items():
             if k in self._vars:
                 try:
                     self._vars[k].set(default)
@@ -3210,25 +3662,638 @@ class AdvancedCUBEWindow(tk.Toplevel):
 
 
 #
+#  CROP PREVIEW DIALOG
+#
+
+class CropPreviewDialog(tk.Toplevel):
+    """Interactive crop-region picker shown before DLC Step 1.
+
+    Loads random frames from ≥50 % of all queued videos and shows them on an
+    interactive canvas where the user can drag to draw / move / resize the crop
+    rectangle.  A thumbnail strip below shows the same overlay on all sampled
+    frames so the user can check that nothing critical is cut off.
+    """
+
+    _HANDLE_R = 6    # half-side of corner / midpoint handle squares (display px)
+    _THUMB_H  = 110  # thumbnail height in the preview strip
+
+    def __init__(self, parent, session: "SessionState"):
+        super().__init__(parent)
+        self.title("Set Video Crop Region")
+        self.configure(bg=C["bg"])
+        self.geometry("960x760")
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        self._session  = session
+        self.confirmed = False
+
+        adv = session.get("dlc_advanced_cfg", {})
+        self._rx = int(adv.get("dlc_crop_x", 0))
+        self._ry = int(adv.get("dlc_crop_y", 0))
+        self._rw = int(adv.get("dlc_crop_w", 0))
+        self._rh = int(adv.get("dlc_crop_h", 0))
+
+        self._vx = tk.IntVar(value=self._rx)
+        self._vy = tk.IntVar(value=self._ry)
+        self._vw = tk.IntVar(value=self._rw)
+        self._vh = tk.IntVar(value=self._rh)
+
+        self._frames: list       = []   # [(PIL.Image, video_path), ...]
+        self._main_photo         = None
+        self._thumb_photos: list = []   # [[label_widget, orig_img, photo_ref], ...]
+        self._scale              = 1.0
+        self._main_w             = 1
+        self._main_h             = 1
+        self._canvas_offset      = (0, 0)
+
+        self._drag_mode     = None  # None | "draw" | "move" | "handle_XX"
+        self._drag_ox       = 0
+        self._drag_oy       = 0
+        self._rect_snapshot = None
+
+        self._build_ui()
+        self.after(50, self._load_frames)
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        tk.Label(self, text="  Set Video Crop Region",
+                 font=("Segoe UI", 13, "bold"),
+                 bg=C["bg"], fg=C["yellow"]).pack(anchor="w", padx=12, pady=(10, 0))
+        tk.Label(self,
+                 text="  Drag on the preview to draw a crop box.  "
+                      "Drag corner / edge handles to resize.  "
+                      "Drag inside the box to move it.",
+                 font=("Segoe UI", 8), bg=C["bg"], fg=C["dim"],
+                 justify="left").pack(anchor="w", padx=12, pady=(0, 4))
+
+        self._canvas = tk.Canvas(self, bg="#111111",
+                                 cursor="crosshair", highlightthickness=0)
+        self._canvas.pack(fill="both", expand=True, padx=12)
+        self._canvas.bind("<ButtonPress-1>",   self._on_press)
+        self._canvas.bind("<B1-Motion>",       self._on_drag)
+        self._canvas.bind("<ButtonRelease-1>", self._on_release)
+        self._canvas.bind("<Motion>",          self._on_hover)
+        self._canvas.bind("<Configure>",       lambda _e: self._refresh_main())
+
+        coord_f = tk.Frame(self, bg=C["bg"])
+        coord_f.pack(fill="x", padx=12, pady=4)
+        tk.Label(coord_f, text="Crop region (original pixels):",
+                 font=("Segoe UI", 9), bg=C["bg"], fg=C["text"]).pack(side="left")
+        for lbl, var in [("  X:", self._vx), ("  Y:", self._vy),
+                          ("  W:", self._vw), ("  H:", self._vh)]:
+            tk.Label(coord_f, text=lbl,
+                     font=("Segoe UI", 9), bg=C["bg"], fg=C["dim"]).pack(side="left")
+            ent = tk.Entry(coord_f, textvariable=var, width=6,
+                           bg=C["card2"], fg=C["text"],
+                           font=("Segoe UI", 9),
+                           insertbackground=C["text"], relief="flat")
+            ent.pack(side="left", padx=(1, 0))
+            ent.bind("<Return>",   self._on_entry_commit)
+            ent.bind("<FocusOut>", self._on_entry_commit)
+
+        tk.Label(self,
+                 text="  Sample frames (≥50 % of queued videos) — verify nothing critical is cut off:",
+                 font=("Segoe UI", 8), bg=C["bg"], fg=C["dim"]).pack(anchor="w", padx=12)
+
+        strip_outer = tk.Frame(self, bg=C["bg"],
+                               height=self._THUMB_H + 24)
+        strip_outer.pack(fill="x", padx=12, pady=(2, 4))
+        strip_outer.pack_propagate(False)
+        self._strip_cv = tk.Canvas(strip_outer, bg=C["card"],
+                                   height=self._THUMB_H + 10,
+                                   highlightthickness=0)
+        h_sb = tk.Scrollbar(strip_outer, orient="horizontal",
+                             command=self._strip_cv.xview,
+                             bg=C["card"], troughcolor=C["bg"])
+        self._strip_cv.configure(xscrollcommand=h_sb.set)
+        h_sb.pack(side="bottom", fill="x")
+        self._strip_cv.pack(fill="both", expand=True)
+        self._strip_inner = tk.Frame(self._strip_cv, bg=C["card"])
+        self._strip_cv.create_window((0, 0), window=self._strip_inner, anchor="nw")
+        self._strip_inner.bind(
+            "<Configure>",
+            lambda _e: self._strip_cv.configure(
+                scrollregion=self._strip_cv.bbox("all")))
+
+        btn_f = tk.Frame(self, bg=C["bg"])
+        btn_f.pack(fill="x", padx=12, pady=(4, 10))
+        tk.Button(btn_f, text="Cancel",
+                  font=("Segoe UI", 9), bg=C["btn"], fg=C["btn_fg"],
+                  relief="flat", padx=10, pady=5, cursor="hand2",
+                  command=self.destroy).pack(side="left")
+        tk.Button(btn_f, text="Reset to Full Frame",
+                  font=("Segoe UI", 9), bg=C["btn"], fg=C["yellow"],
+                  relief="flat", padx=10, pady=5, cursor="hand2",
+                  command=self._reset).pack(side="left", padx=6)
+        tk.Button(btn_f,
+                  text="  Accept — proceed with this crop  ",
+                  font=("Segoe UI", 10, "bold"),
+                  bg=C["green"], fg="white",
+                  relief="flat", padx=16, pady=5, cursor="hand2",
+                  command=self._accept).pack(side="right")
+
+    # ── Frame loading ─────────────────────────────────────────────────────────
+
+    def _load_frames(self):
+        import random
+        import math
+        try:
+            import cv2
+            from PIL import Image
+        except ImportError:
+            self._canvas.create_text(
+                10, 10, anchor="nw",
+                text="OpenCV / Pillow not available — cannot show preview.",
+                fill="white", font=("Segoe UI", 10))
+            return
+
+        VIDEO_EXTS = {".avi", ".mp4", ".mov", ".mkv", ".wmv"}
+        folders    = self._session.get("video_folders", [])
+        all_videos = []
+        for root_folder in folders:
+            for sub, dirs, files in os.walk(root_folder):
+                dirs[:] = [d for d in dirs if not d.endswith("_results")]
+                if Path(sub).name.endswith("_results"):
+                    continue
+                for fname in sorted(files):
+                    if fname.startswith("resized_"):
+                        continue
+                    if Path(fname).suffix.lower() in VIDEO_EXTS:
+                        all_videos.append(os.path.join(sub, fname))
+
+        if not all_videos:
+            self._canvas.create_text(
+                self._canvas.winfo_width() // 2 or 300,
+                self._canvas.winfo_height() // 2 or 200,
+                text="No videos found in the selected folders.",
+                fill="white", font=("Segoe UI", 11))
+            return
+
+        n_sample = max(1, math.ceil(len(all_videos) / 2))
+        sampled  = random.sample(all_videos, min(n_sample, len(all_videos)))
+
+        pil_frames = []
+        for vpath in sampled:
+            cap   = cv2.VideoCapture(vpath)
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total < 1:
+                cap.release()
+                continue
+            lo  = int(total * 0.2)
+            hi  = max(lo + 1, int(total * 0.8))
+            idx = random.randint(lo, hi - 1)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            cap.release()
+            if not ret:
+                continue
+            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            pil_frames.append((img, vpath))
+
+        if not pil_frames:
+            self._canvas.create_text(
+                self._canvas.winfo_width() // 2 or 300,
+                self._canvas.winfo_height() // 2 or 200,
+                text="Could not read frames from any video.",
+                fill="white", font=("Segoe UI", 11))
+            return
+
+        self._frames  = pil_frames
+        self._main_w  = pil_frames[0][0].width
+        self._main_h  = pil_frames[0][0].height
+
+        if self._rw == 0 and self._rh == 0:
+            self._rx, self._ry = 0, 0
+            self._rw, self._rh = self._main_w, self._main_h
+            self._sync_vars()
+
+        self._refresh_main()
+        self._rebuild_thumbs()
+
+    # ── Canvas drawing ────────────────────────────────────────────────────────
+
+    def _refresh_main(self, *_):
+        if not self._frames:
+            return
+        try:
+            from PIL import ImageTk, ImageDraw, Image
+        except ImportError:
+            return
+
+        cw = max(1, self._canvas.winfo_width())
+        ch = max(1, self._canvas.winfo_height())
+        img_orig, _ = self._frames[0]
+        ow, oh      = img_orig.width, img_orig.height
+
+        scale       = min(cw / ow, ch / oh, 1.0)
+        dw          = max(1, int(ow * scale))
+        dh          = max(1, int(oh * scale))
+        self._scale = scale
+
+        off_x = (cw - dw) // 2
+        off_y = (ch - dh) // 2
+        self._canvas_offset = (off_x, off_y)
+
+        img_disp = img_orig.resize((dw, dh), Image.LANCZOS).convert("RGBA")
+
+        if self._rw > 0 and self._rh > 0:
+            x0 = max(0, min(dw - 1, int(self._rx * scale)))
+            y0 = max(0, min(dh - 1, int(self._ry * scale)))
+            x1 = max(0, min(dw - 1, int((self._rx + self._rw) * scale)))
+            y1 = max(0, min(dh - 1, int((self._ry + self._rh) * scale)))
+            if x0 > x1:
+                x0, x1 = x1, x0
+            if y0 > y1:
+                y0, y1 = y1, y0
+
+            overlay = Image.new("RGBA", (dw, dh), (0, 0, 0, 110))
+            ovd = ImageDraw.Draw(overlay)
+            ovd.rectangle([x0, y0, x1, y1], fill=(0, 0, 0, 0))
+            img_disp = Image.alpha_composite(img_disp, overlay)
+
+            draw = ImageDraw.Draw(img_disp)
+            draw.rectangle([x0,     y0,     x1,     y1    ], outline="#FFD700", width=2)
+            draw.rectangle([x0 + 1, y0 + 1, x1 - 1, y1 - 1], outline="#000000", width=1)
+
+            R = self._HANDLE_R
+            for hx, hy in self._get_handle_positions_display().values():
+                draw.rectangle([hx - R, hy - R, hx + R, hy + R],
+                                fill="#FFD700", outline="#000000")
+
+        self._main_photo = ImageTk.PhotoImage(img_disp.convert("RGB"))
+        self._canvas.delete("all")
+        self._canvas.create_image(off_x, off_y, anchor="nw",
+                                  image=self._main_photo)
+
+    def _rebuild_thumbs(self):
+        for w in self._strip_inner.winfo_children():
+            w.destroy()
+        self._thumb_photos = []
+        for img_orig, vpath in self._frames:
+            cell = tk.Frame(self._strip_inner, bg=C["card2"])
+            cell.pack(side="left", padx=2, pady=4)
+            lbl  = tk.Label(cell, bg=C["card2"])
+            lbl.pack()
+            tk.Label(cell, text=Path(vpath).name[:22],
+                     font=("Segoe UI", 7), bg=C["card2"],
+                     fg=C["dim"]).pack()
+            self._thumb_photos.append([lbl, img_orig, None])
+        self._update_thumbs()
+
+    def _update_thumbs(self):
+        try:
+            from PIL import ImageTk, ImageDraw, Image
+        except ImportError:
+            return
+        for entry in self._thumb_photos:
+            lbl, img_orig, _ = entry
+            ow, oh = img_orig.width, img_orig.height
+            s  = self._THUMB_H / oh if oh > 0 else 1.0
+            tw = max(1, int(ow * s))
+            th = max(1, int(oh * s))
+            img_d = img_orig.resize((tw, th), Image.LANCZOS).convert("RGBA")
+
+            if self._rw > 0 and self._rh > 0:
+                x0 = max(0, min(tw - 1, int(self._rx * s)))
+                y0 = max(0, min(th - 1, int(self._ry * s)))
+                x1 = max(0, min(tw - 1, int((self._rx + self._rw) * s)))
+                y1 = max(0, min(th - 1, int((self._ry + self._rh) * s)))
+                if x0 > x1:
+                    x0, x1 = x1, x0
+                if y0 > y1:
+                    y0, y1 = y1, y0
+                ov = Image.new("RGBA", (tw, th), (0, 0, 0, 110))
+                ImageDraw.Draw(ov).rectangle([x0, y0, x1, y1], fill=(0, 0, 0, 0))
+                img_d = Image.alpha_composite(img_d, ov)
+                ImageDraw.Draw(img_d).rectangle([x0, y0, x1, y1],
+                                                outline="#FFD700", width=1)
+
+            photo = ImageTk.PhotoImage(img_d.convert("RGB"))
+            entry[2] = photo
+            lbl.configure(image=photo)
+
+    # ── Handle positions ──────────────────────────────────────────────────────
+
+    def _get_handle_positions_display(self) -> dict:
+        s  = self._scale or 1.0
+        ox, oy = self._canvas_offset
+        x0 = int(self._rx * s) + ox
+        y0 = int(self._ry * s) + oy
+        x1 = int((self._rx + self._rw) * s) + ox
+        y1 = int((self._ry + self._rh) * s) + oy
+        mx = (x0 + x1) // 2
+        my = (y0 + y1) // 2
+        return {
+            "nw": (x0, y0), "n":  (mx, y0), "ne": (x1, y0),
+            "w":  (x0, my),                   "e":  (x1, my),
+            "sw": (x0, y1), "s":  (mx, y1), "se": (x1, y1),
+        }
+
+    def _hit_handle(self, cx: int, cy: int):
+        if self._rw == 0 or self._rh == 0:
+            return None
+        R = self._HANDLE_R + 3
+        for key, (hx, hy) in self._get_handle_positions_display().items():
+            if abs(cx - hx) <= R and abs(cy - hy) <= R:
+                return key
+        return None
+
+    def _inside_rect(self, cx: int, cy: int) -> bool:
+        s  = self._scale or 1.0
+        ox, oy = self._canvas_offset
+        x0 = int(self._rx * s) + ox
+        y0 = int(self._ry * s) + oy
+        x1 = int((self._rx + self._rw) * s) + ox
+        y1 = int((self._ry + self._rh) * s) + oy
+        return x0 <= cx <= x1 and y0 <= cy <= y1
+
+    def _canvas_to_orig(self, cx: int, cy: int):
+        ox, oy = self._canvas_offset
+        s = self._scale or 1.0
+        return (cx - ox) / s, (cy - oy) / s
+
+    # ── Mouse events ─────────────────────────────────────────────────────────
+
+    def _on_press(self, event):
+        cx, cy = event.x, event.y
+        h = self._hit_handle(cx, cy)
+        if h:
+            self._drag_mode = f"handle_{h}"
+        elif self._rw > 0 and self._rh > 0 and self._inside_rect(cx, cy):
+            self._drag_mode = "move"
+        else:
+            self._drag_mode = "draw"
+        self._drag_ox       = cx
+        self._drag_oy       = cy
+        self._rect_snapshot = (self._rx, self._ry, self._rw, self._rh)
+
+    def _on_drag(self, event):
+        if self._drag_mode is None:
+            return
+        cx, cy = event.x, event.y
+        s = self._scale or 1.0
+        dx = (cx - self._drag_ox) / s
+        dy = (cy - self._drag_oy) / s
+        W, H = self._main_w, self._main_h
+        rx0, ry0, rw0, rh0 = self._rect_snapshot
+
+        def clamp(v, lo, hi):
+            return max(lo, min(hi, int(round(v))))
+
+        if self._drag_mode == "draw":
+            ox_o, oy_o = self._canvas_to_orig(self._drag_ox, self._drag_oy)
+            nx_o, ny_o = self._canvas_to_orig(cx, cy)
+            lx, rx_ = sorted([ox_o, nx_o])
+            ty, by  = sorted([oy_o, ny_o])
+            self._rx = clamp(lx,  0, W - 1)
+            self._ry = clamp(ty,  0, H - 1)
+            self._rw = clamp(rx_ - lx, 1, W - self._rx)
+            self._rh = clamp(by  - ty, 1, H - self._ry)
+
+        elif self._drag_mode == "move":
+            self._rx = clamp(rx0 + dx, 0, W - rw0)
+            self._ry = clamp(ry0 + dy, 0, H - rh0)
+            self._rw, self._rh = rw0, rh0
+
+        elif self._drag_mode.startswith("handle_"):
+            h  = self._drag_mode[len("handle_"):]
+            lx, ty  = float(rx0),        float(ry0)
+            rx_, by = float(rx0 + rw0),  float(ry0 + rh0)
+            if "w" in h:
+                lx  = clamp(lx + dx,  0,     rx_ - 1)
+            if "e" in h:
+                rx_ = clamp(rx_ + dx, lx + 1, W)
+            if "n" in h:
+                ty  = clamp(ty + dy,  0,     by - 1)
+            if "s" in h:
+                by  = clamp(by + dy,  ty + 1, H)
+            self._rx = int(lx);  self._ry = int(ty)
+            self._rw = int(rx_ - lx);  self._rh = int(by - ty)
+
+        self._sync_vars()
+        self._refresh_main()
+        self._update_thumbs()
+
+    def _on_release(self, _event):
+        self._drag_mode     = None
+        self._rect_snapshot = None
+
+    _CURSOR_MAP = {
+        "nw": "top_left_corner",    "n":  "top_side",
+        "ne": "top_right_corner",   "w":  "left_side",
+        "e":  "right_side",         "sw": "bottom_left_corner",
+        "s":  "bottom_side",        "se": "bottom_right_corner",
+    }
+
+    def _on_hover(self, event):
+        if self._drag_mode is not None:
+            return
+        h = self._hit_handle(event.x, event.y)
+        if h:
+            self._canvas.configure(cursor=self._CURSOR_MAP.get(h, "crosshair"))
+        elif self._rw > 0 and self._rh > 0 and self._inside_rect(event.x, event.y):
+            self._canvas.configure(cursor="fleur")
+        else:
+            self._canvas.configure(cursor="crosshair")
+
+    # ── Entry sync ────────────────────────────────────────────────────────────
+
+    def _sync_vars(self):
+        self._vx.set(self._rx)
+        self._vy.set(self._ry)
+        self._vw.set(self._rw)
+        self._vh.set(self._rh)
+
+    def _on_entry_commit(self, *_):
+        try:
+            rx = max(0, min(self._main_w - 1, int(self._vx.get())))
+            ry = max(0, min(self._main_h - 1, int(self._vy.get())))
+            rw = max(1, min(self._main_w - rx, int(self._vw.get())))
+            rh = max(1, min(self._main_h - ry, int(self._vh.get())))
+            self._rx, self._ry, self._rw, self._rh = rx, ry, rw, rh
+            self._sync_vars()
+            self._refresh_main()
+            self._update_thumbs()
+        except (tk.TclError, ValueError):
+            pass
+
+    # ── Buttons ───────────────────────────────────────────────────────────────
+
+    def _reset(self):
+        self._rx, self._ry = 0, 0
+        self._rw, self._rh = self._main_w or 0, self._main_h or 0
+        self._sync_vars()
+        self._refresh_main()
+        self._update_thumbs()
+
+    def _accept(self):
+        adv = dict(self._session.get("dlc_advanced_cfg", {}))
+        adv["dlc_crop_x"] = self._rx
+        adv["dlc_crop_y"] = self._ry
+        # store 0 when the rect covers the full frame (= no crop needed)
+        adv["dlc_crop_w"] = self._rw if not (
+            self._rx == 0 and self._ry == 0 and
+            self._rw == self._main_w and self._rh == self._main_h) else 0
+        adv["dlc_crop_h"] = self._rh if not (
+            self._rx == 0 and self._ry == 0 and
+            self._rw == self._main_w and self._rh == self._main_h) else 0
+        self._session["dlc_advanced_cfg"] = adv
+        self.confirmed = True
+        self.destroy()
+
+
+#
 #  MAIN APPLICATION
 #
+
+class CubeSplash(tk.Toplevel):
+    """
+    Borderless startup splash shown briefly before the main window.
+
+    Extensibility note — publication citation
+    -----------------------------------------
+    Set `_citation_text` to a non-empty string when a publication is ready
+    (e.g. "Valiathan et al. 2026, Nature Methods").  The citation label in the
+    centre-bottom of the splash will appear automatically; no other code changes
+    are needed.  Keep the string short (<80 chars) so it fits on one line.
+    """
+
+    DISPLAY_MS  = 2400   # ms the splash is fully visible before fade begins
+    FADE_STEPS  = 20     # alpha increments during fade-out
+    FADE_MS     = 15     # ms between fade steps  (20 × 15 = 300 ms total fade)
+
+    # Future: assign the citation string here once the paper is published.
+    _citation_text: str = ""
+
+    def __init__(self, parent: tk.Tk, is_dark: bool, on_done):
+        super().__init__(parent)
+        self._on_done = on_done
+
+        bg  = "#09090f" if is_dark else "#f0f2f5"
+        sub = "#4a4a6a" if is_dark else "#aaaaaa"
+        bdr = "#2a2a4a" if is_dark else "#dee2e6"
+
+        self.overrideredirect(True)
+        self.configure(bg=bg)
+        self.attributes("-alpha", 1.0)
+        try:
+            self.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        W, H = 560, 300
+
+        logo_file = "CUBE_logo dark theme.png" if is_dark else "CUBE_logo.png"
+        self._logo_img = None
+        try:
+            from PIL import Image, ImageTk
+            p = HERE / logo_file
+            if p.is_file():
+                img = Image.open(p).convert("RGBA")
+                img.thumbnail((440, 200), Image.LANCZOS)
+                self._logo_img = ImageTk.PhotoImage(img)
+        except Exception:
+            pass
+
+        cv = tk.Canvas(self, width=W, height=H, bg=bg,
+                       highlightthickness=0, bd=0)
+        cv.pack(fill="both", expand=True)
+
+        if self._logo_img:
+            cv.create_image(W // 2, H // 2 - 22, image=self._logo_img, anchor="center")
+        else:
+            fg = "#eaeaea" if is_dark else "#222222"
+            cv.create_text(W // 2, H // 2 - 20, text="CUBE",
+                           fill=fg, font=("Helvetica", 52, "bold"), anchor="center")
+
+        # subtle 1-px border
+        cv.create_rectangle(1, 1, W - 2, H - 2, outline=bdr, width=1)
+
+        pad = 16
+        bot = H - pad
+
+        # bottom-left: author / year
+        cv.create_text(pad, bot, text="P.Valiathan · 2026",
+                       fill=sub, font=("Helvetica", 9), anchor="sw")
+
+        # bottom-right: institution
+        cv.create_text(W - pad, bot, text="Karolinska Institutet",
+                       fill=sub, font=("Helvetica", 9), anchor="se")
+
+        # centre-bottom: future publication citation (invisible when empty)
+        if self._citation_text:
+            cv.create_text(W // 2, bot, text=self._citation_text,
+                           fill=sub, font=("Helvetica", 8, "italic"), anchor="s")
+
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        self.geometry(f"{W}x{H}+{(sw - W) // 2}+{(sh - H) // 2}")
+
+        hold_ms = max(0, self.DISPLAY_MS - self.FADE_STEPS * self.FADE_MS)
+        self.after(hold_ms, self._begin_fade)
+
+    def _begin_fade(self):
+        self._fade(1.0)
+
+    def _fade(self, alpha: float):
+        alpha -= 1.0 / self.FADE_STEPS
+        if alpha <= 0.05:
+            self._finish()
+            return
+        try:
+            self.attributes("-alpha", alpha)
+        except Exception:
+            self._finish()
+            return
+        self.after(self.FADE_MS, lambda: self._fade(alpha))
+
+    def _finish(self):
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        self._on_done()
+
 
 class PipelineApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
+        self.withdraw()   # hidden while building UI; shown at end of __init__
         self.title("CUBE: Comprehensive Unsupervised Behavioral Explorer  v3.0")
+
+        _ico = HERE / "CUBE.ico"
+        if _ico.is_file():
+            try:
+                # default= stamps the icon on every window in this interpreter,
+                # not just the root, so child Toplevels also get the CUBE icon.
+                self.iconbitmap(default=str(_ico))
+            except Exception:
+                pass
+
         self.configure(bg=C["bg"])
-        self.geometry("1300x820")
+        self.geometry("1440x820")
         self.minsize(1100, 660)
         self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # core state — output_root is left empty until video folders are added;
-        # _resolve_work_dir() will derive it from the data drive at that point.
+        # Show splash as a Toplevel of this — the one and only — Tk root.
+        # Creating a second tk.Tk() for the splash steals _default_root, which
+        # causes every tk.Var created later (BooleanVar, IntVar, etc.) to bind
+        # to the splash's Tcl interpreter.  When that splash is later destroyed
+        # the interpreter dies and every settings field goes blank.
+        _splash = CubeSplash(self, _DARK_THEME, on_done=lambda: None)
+        self.update()   # render splash before blocking on imports
+
+        # Heavy imports while splash is visible (main thread blocks; splash frozen)
+        _deferred_imports()   # must run before PipelineLogger is instantiated below
+        _check_and_warn()
+
         self._session  = SessionState()
-        # Temporary logger in the script directory (same drive as CUBE install)
-        # until a video folder is added, at which point it migrates to the data drive.
         _init_log_dir = HERE / "CUBE_logs"
         _init_log_dir.mkdir(parents=True, exist_ok=True)
         self._logger   = PipelineLogger(_init_log_dir)
@@ -3239,19 +4304,53 @@ class PipelineApp(tk.Tk):
         self._initial_log()
         self._tick_timer()
 
-    #  " "  timer  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " 
+        # Hold ~2 s so splash stays visible after imports finish; animation plays
+        _deadline = time.monotonic() + 2.0
+        while time.monotonic() < _deadline:
+            try:
+                self.update()
+            except Exception:
+                break
+            time.sleep(0.05)
+
+        try:
+            _splash.destroy()
+        except Exception:
+            pass
+        self.deiconify()
+
+    #  " "  timer  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
     def _tick_timer(self):
         self.after(1000, self._tick_timer)
 
     #  " "  UI  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " 
 
     def _build_ui(self):
+        self._build_menubar()
         self._build_header()
         body = tk.PanedWindow(self, orient="vertical",
                               bg=C["bg"], sashwidth=6, sashrelief="flat")
         body.pack(fill="both", expand=True)
         self._build_top_pane(body)
         self._build_log_pane(body)
+
+    def _build_menubar(self):
+        """Native menu bar.  Utility actions (e.g. the manual UMAP-evolution
+        video export) live here rather than as buttons cluttering the main panel.
+        The evolution video is produced automatically after Step 3; this menu item
+        is only for exporting additional sessions on demand."""
+        menubar = tk.Menu(self)
+
+        tools = tk.Menu(menubar, tearoff=0)
+        tools.add_command(label="Export Extra UMAP Evolution Videos...",
+                          command=self._launch_umap_evolution_video)
+        menubar.add_cascade(label="Tools", menu=tools)
+
+        helpm = tk.Menu(menubar, tearoff=0)
+        helpm.add_command(label="Help", command=lambda: show_help(self))
+        menubar.add_cascade(label="Help", menu=helpm)
+
+        self.config(menu=menubar)
 
     def _build_header(self):
         hdr = tk.Frame(self, bg=C["log_bg"])
@@ -3273,7 +4372,7 @@ class PipelineApp(tk.Tk):
             ("Output",        self._set_output),
         ]:
             tk.Button(right, text=txt, font=("Segoe UI", 9),
-                      bg=C["card2"], fg=C["subtext"],
+                      bg=C["btn"], fg=C["btn_fg"],
                       relief="flat", padx=10, pady=5,
                       cursor="hand2", command=cmd).pack(
                 side="left", padx=3, pady=8)
@@ -3406,13 +4505,13 @@ class PipelineApp(tk.Tk):
                    font=("Segoe UI", 9)).pack(side="left", padx=(2, 14))
         tk.Label(bd_row, text="Max (s):", font=("Segoe UI", 9),
                  bg=C["card"], fg=C["text"]).pack(side="left")
-        self._bd_max = tk.DoubleVar(value=5.0)
-        tk.Spinbox(bd_row, from_=0.1, to=600.0, increment=1.0,
+        self._bd_max = tk.DoubleVar(value=10.0)
+        tk.Spinbox(bd_row, from_=0.1, to=9999.0, increment=1.0,
                    format="%.1f", textvariable=self._bd_max, width=7,
                    bg=C["card2"], fg=C["text"],
                    buttonbackground=C["card2"],
                    font=("Segoe UI", 9)).pack(side="left", padx=(2, 0))
-        tk.Label(bd_row, text="  (per publication methodology)",
+        tk.Label(bd_row, text="  (raise to capture longer sustained bouts)",
                  font=("Segoe UI", 8), bg=C["card"],
                  fg=C["dim"]).pack(side="left", padx=6)
 
@@ -3422,17 +4521,20 @@ class PipelineApp(tk.Tk):
         adv_row = tk.Frame(left, bg=C["bg"])
         adv_row.pack(fill="x", pady=(4, 2))
         tk.Button(adv_row, text="⚙  DLC & Prep Settings...",
-                  font=("Segoe UI", 8, "bold"), bg=C["card2"], fg=C["yellow"],
+                  font=("Segoe UI", 8, "bold"), bg=C["btn"], fg=C["yellow"],
                   relief="flat", padx=8, pady=4, cursor="hand2",
                   command=self._open_dlc_prep).pack(side="left", padx=(0, 4), pady=2)
         tk.Button(adv_row, text="⚙  Advanced DLC Parameters...",
-                  font=("Segoe UI", 8, "bold"), bg=C["card2"], fg=C["green"],
+                  font=("Segoe UI", 8, "bold"), bg=C["btn"], fg=C["green"],
                   relief="flat", padx=8, pady=4, cursor="hand2",
                   command=self._open_dlc_advanced).pack(side="left", padx=(0, 4), pady=2)
         tk.Button(adv_row, text="⚙  Advanced CUBE Analysis...",
-                  font=("Segoe UI", 8, "bold"), bg=C["card2"], fg=C["purple"],
+                  font=("Segoe UI", 8, "bold"), bg=C["btn"], fg=C["purple"],
                   relief="flat", padx=8, pady=4, cursor="hand2",
                   command=self._open_cube_advanced).pack(side="left", pady=2)
+
+        # "Export Extra UMAP Evolution Videos" lives in the Tools menu bar
+        # (see _build_menubar) rather than as a button in the main panel.
 
         # right column  " step cards
         right = tk.Frame(top, bg=C["bg"])
@@ -3684,6 +4786,12 @@ class PipelineApp(tk.Tk):
             messagebox.showwarning("No folders",
                 "Add at least one video folder first.")
             return
+        adv = self._session.get("dlc_advanced_cfg", {})
+        if adv.get("dlc_crop_enable", False):
+            dlg = CropPreviewDialog(self, self._session)
+            self.wait_window(dlg)
+            if not dlg.confirmed:
+                return
         self._run_step("dlc", _run_dlc_step,
                        self._session, self._settings, self._logger,
                        self._pb, self._after)
@@ -3737,15 +4845,20 @@ class PipelineApp(tk.Tk):
 
         # Ask once per session whether to delete the BSOID_Project_Ready/videos/
         # copies after clustering completes (they duplicate source videos).
+        # When auto_bsoid is on (Steps 2+3 run automatically after DLC) we default
+        # to deleting to keep disk usage low without interrupting the unattended run.
         if "bsoid_delete_videos_folder" not in self._session._d:
-            ans = messagebox.askyesno(
-                "Delete copied videos after analysis?",
-                "BSOID_Project_Ready/videos/ contains copies of your source\n"
-                "videos used for example-clip generation.\n\n"
-                "Delete these copies once clustering completes?\n"
-                "(Your original source videos are NOT affected.)",
-                parent=self)
-            self._session["bsoid_delete_videos_folder"] = ans
+            if bool(self._settings.get("auto_bsoid", False)):
+                self._session["bsoid_delete_videos_folder"] = True
+            else:
+                ans = messagebox.askyesno(
+                    "Delete copied videos after analysis?",
+                    "BSOID_Project_Ready/videos/ contains copies of your source\n"
+                    "videos used for example-clip generation.\n\n"
+                    "Delete these copies once clustering completes?\n"
+                    "(Your original source videos are NOT affected.)",
+                    parent=self)
+                self._session["bsoid_delete_videos_folder"] = ans
 
         bd_min = float(self._bd_min.get()) if hasattr(self, "_bd_min") else 0.0
         bd_max = float(self._bd_max.get()) if hasattr(self, "_bd_max") else 999.0
@@ -3896,7 +5009,8 @@ class PipelineApp(tk.Tk):
                     _comp_plot_dir = _d
 
         # Capture group assignments for injection into the analyser
-        _video_groups = dict(self._session.get("video_groups", {}))
+        _video_groups  = dict(self._session.get("video_groups", {}))
+        _stem_to_group = dict(self._session.get("stem_to_group", {}))
 
         self._cards["analyse"].set_status("running")
         self._status("Step 5: Analysis — window opening")
@@ -3931,6 +5045,24 @@ class PipelineApp(tk.Tk):
                             bout_root = candidate
                             break
                 if bout_root:
+                    break
+
+        # If the session is missing group assignments (e.g. fresh GUI run without
+        # loading the old session), look for the file written after Step 3.
+        if not _stem_to_group and bout_root is not None:
+            for _ga_p in (
+                bout_root.parent / "model" / "group_assignments.json",
+                bout_root / "group_assignments.json",
+            ):
+                if _ga_p.is_file():
+                    try:
+                        _stem_to_group = json.loads(
+                            _ga_p.read_text(encoding="utf-8"))
+                        self._logger.info(
+                            f"  Loaded {len(_stem_to_group)} group assignment(s) "
+                            f"from {_ga_p.name}")
+                    except Exception:
+                        pass
                     break
 
         _plot_theme = self._session.get("engine_cfg", {}).get("plot_theme", "dark")
@@ -3971,6 +5103,24 @@ class PipelineApp(tk.Tk):
                                 app._auto_load_groups()
                             except Exception:
                                 pass
+                            # Load UMAP embedding/labels.  _select_folder is
+                            # bypassed during auto-launch, so we do this explicitly.
+                            # model/ is a sibling of bout_lengths/ under cube_results_*
+                            # so search from the parent directory.
+                            try:
+                                _umap_root = bout_root.parent \
+                                    if bout_root.name == "bout_lengths" \
+                                    else bout_root
+                                _emb_p, _lbl_p = _MOD_ANALYSER.find_umap_data(
+                                    _umap_root)
+                                if _emb_p and _lbl_p:
+                                    import numpy as _np_umap
+                                    app._umap_embedding = _np_umap.load(str(_emb_p))
+                                    app._umap_labels    = _np_umap.load(str(_lbl_p))
+                                    self._logger.info(
+                                        f"  UMAP data loaded: {_emb_p.parent}")
+                            except Exception:
+                                pass
                             self._logger.success(
                                 f"Auto-loaded {len(files)} file(s) from {bout_root}")
                             # Populate the Combined Analysis animal panel
@@ -3985,21 +5135,41 @@ class PipelineApp(tk.Tk):
                                             pass
                             except Exception:
                                 pass
-                            # Inject experimental group assignments if set in session
-                            if _video_groups:
+                            # Inject experimental group assignments if set in session.
+                            # Primary method: stem_to_group maps each DLC-file stem
+                            # to a group; the bout CSV stem is <dlc_stem>_bout_lengths[_hmm]
+                            # so we strip the known suffix to recover the DLC stem.
+                            # Fallback: folder-prefix matching (works when analyser loads
+                            # files directly from the source folder tree).
+                            if _video_groups or _stem_to_group:
                                 try:
+                                    _BOUT_SUFFIXES = (
+                                        "_bout_lengths_hmm", "_bout_lengths",
+                                        "_frame_labels_hmm", "_frame_labels",
+                                    )
                                     ap = getattr(app, "_animal_panel", None)
                                     panel_animals = getattr(ap, "_animals", []) if ap else []
                                     assigned = 0
                                     for animal in panel_animals:
                                         apath = str(animal.get("path", ""))
-                                        for folder, grp in _video_groups.items():
-                                            if apath.startswith(folder):
-                                                eg_var = animal.get("exp_group")
-                                                if eg_var is not None:
-                                                    eg_var.set(grp)
-                                                    assigned += 1
+                                        # Derive DLC stem by stripping bout-CSV suffixes
+                                        astem = Path(apath).stem
+                                        for _sfx in _BOUT_SUFFIXES:
+                                            if astem.endswith(_sfx):
+                                                astem = astem[: -len(_sfx)]
                                                 break
+                                        grp = _stem_to_group.get(astem)
+                                        if grp is None:
+                                            # Fallback: path-prefix check
+                                            for folder, g in _video_groups.items():
+                                                if apath.startswith(folder):
+                                                    grp = g
+                                                    break
+                                        if grp is not None:
+                                            eg_var = animal.get("exp_group")
+                                            if eg_var is not None:
+                                                eg_var.set(grp)
+                                                assigned += 1
                                     if assigned:
                                         self._logger.success(
                                             f"  Injected exp_group for "
@@ -4037,7 +5207,213 @@ class PipelineApp(tk.Tk):
         # Must run on main thread: BSOiDApp is a ctk.CTk (tk.Tk) root window.
         self.after(0, _run)
 
-    #  " "  session management  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " 
+    def _launch_umap_evolution_video(self):
+        """Export side-by-side UMAP evolution videos to the CUBE analysis folder.
+
+        Only user input required: how many videos to export.  Sessions with
+        embedded video paths are auto-discovered; videos are randomly sampled
+        from the full pool and saved to <cube_results>/videos/umap_evolution/.
+        """
+        if not CORE_OK:
+            messagebox.showerror("Missing", "cube_core.py not found.")
+            return
+        if self._running:
+            messagebox.showwarning("Busy", "Another step is already running.")
+            return
+
+        # ── Locate model/ directory automatically ────────────────────────────
+        model_dir = None
+        search_roots = (self._session.get("engine_out_dirs", []) +
+                        self._session.get("bsoid_ready_dirs", []))
+        for d in search_roots:
+            candidate = Path(d) / "model"
+            if (candidate / "umap_embedding.npy").is_file():
+                model_dir = candidate
+                break
+        if model_dir is None:
+            for folder in self._session.get("video_folders", []):
+                for cr in sorted(Path(folder).glob("cube_results*"), reverse=True):
+                    candidate = cr / "model"
+                    if (candidate / "umap_embedding.npy").is_file():
+                        model_dir = candidate
+                        break
+                if model_dir:
+                    break
+        if model_dir is None or not (model_dir / "umap_embedding.npy").is_file():
+            messagebox.showerror(
+                "Model not found",
+                "Could not locate umap_embedding.npy automatically.\n\n"
+                "Run Step 3 (CUBE Clustering) first, then try again.")
+            return
+
+        # ── Load session_bin_ranges.json ─────────────────────────────────────
+        sbr_path = model_dir / "session_bin_ranges.json"
+        if not sbr_path.is_file():
+            messagebox.showerror(
+                "Missing data",
+                "session_bin_ranges.json not found.\n\n"
+                "Re-run Step 3 to generate it.")
+            return
+        try:
+            sbr = json.loads(sbr_path.read_text())
+        except Exception as e:
+            messagebox.showerror("Load error", f"Cannot read session_bin_ranges.json:\n{e}")
+            return
+
+        def _parse_sbr(entry):
+            if isinstance(entry, list) and len(entry) >= 2:
+                start, end = int(entry[0]), int(entry[1])
+                vpath = str(entry[2]) if len(entry) >= 3 and entry[2] else None
+                return start, end, vpath
+            return None, None, None
+
+        sessions = {k: _parse_sbr(v) for k, v in sbr.items()
+                    if k != "_total_bins"}
+        # Embedded path first; if it is missing (e.g. the BSOID_Project_Ready
+        # video copies were deleted after the run) fall back to searching the
+        # configured video folders by session name.
+        _evo_search = list(self._session.get("video_folders", []))
+        ready = []
+        for k, (s, e, v) in sessions.items():
+            if v and Path(v).is_file():
+                ready.append((k, s, e, v))
+            else:
+                alt = _find_video_by_stem(k, _evo_search)
+                if alt is not None:
+                    ready.append((k, s, e, str(alt)))
+
+        if not ready:
+            messagebox.showerror(
+                "No sessions ready",
+                "No source videos could be located for this run.\n\n"
+                "session_bin_ranges.json points at videos that no longer exist "
+                "(if you enabled 'delete BSOID_Project_Ready/videos', the copies "
+                "were removed). Keep the source videos, or add their folder to "
+                "the video sources, then try again.")
+            return
+
+        # ── Ask how many videos to export ────────────────────────────────────
+        from tkinter import simpledialog as _sd
+        n_req = _sd.askinteger(
+            "UMAP Evolution Videos",
+            f"How many evolution videos to export?\n"
+            f"({len(ready)} session(s) available)",
+            initialvalue=min(1, len(ready)),
+            minvalue=1, maxvalue=len(ready),
+            parent=self,
+        )
+        if n_req is None:
+            return
+
+        import random as _rnd
+        chosen = _rnd.sample(ready, min(n_req, len(ready)))
+
+        # ── Load embedding + labels ───────────────────────────────────────────
+        try:
+            import numpy as _np_ev
+            embedding   = _np_ev.load(str(model_dir / "umap_embedding.npy"))
+            umap_labels = _np_ev.load(str(model_dir / "umap_labels.npy"))
+        except Exception as e:
+            messagebox.showerror("Load error", f"Cannot load UMAP data:\n{e}")
+            return
+
+        fps_val = float(self._settings.get("fps", 30))
+        out_dir = model_dir.parent / "videos" / "umap_evolution"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self._logger.info(f"  Output folder: {out_dir}")
+
+        n_exports = len(chosen)
+        self._running = True
+        self._logger.step(f"Exporting {n_exports} UMAP evolution video(s)...")
+
+        def _progress_factory(label: str):
+            def _progress(phase: str, pct: float):
+                self._logger.info(f"  [{label}] {phase}: {int(pct * 100)} %")
+            return _progress
+
+        def _worker():
+            try:
+                import pandas as _pd_ev
+                produced = []
+                for i, (key, start_bin, end_bin, vpath_str) in enumerate(chosen, 1):
+                    vid_path = Path(vpath_str)
+                    stem     = vid_path.stem
+                    self._logger.info(
+                        f"Exporting UMAP evolution video {i}/{n_exports} "
+                        f"for '{stem}'...")
+
+                    if end_bin > len(embedding):
+                        self._logger.error(
+                            f"  Skipping '{stem}': bin range [{start_bin}:{end_bin}] "
+                            f"exceeds embedding length {len(embedding)}.")
+                        continue
+
+                    session_embedding   = embedding[start_bin:end_bin]
+                    session_umap_labels = umap_labels[start_bin:end_bin]
+
+                    bout_dir = model_dir.parent / "bout_lengths"
+                    frame_labels_path = None
+                    for suffix in (f"{stem}_frame_labels_hmm.csv",
+                                   f"{stem}_frame_labels.csv"):
+                        candidate = bout_dir / suffix
+                        if candidate.is_file():
+                            frame_labels_path = candidate
+                            break
+                    if frame_labels_path is None:
+                        self._logger.error(
+                            f"  Skipping '{stem}': no frame_labels CSV in {bout_dir}")
+                        continue
+                    try:
+                        # frame_labels CSVs have a header (frame,time_s,label);
+                        # select the 'label' column, not iloc[:,0] (frame index).
+                        fl_df = _pd_ev.read_csv(str(frame_labels_path))
+                        _lc   = "label" if "label" in fl_df.columns else fl_df.columns[-1]
+                        frame_labels = (_pd_ev.to_numeric(fl_df[_lc], errors="coerce")
+                                        .dropna().to_numpy(dtype=int))
+                    except Exception as e:
+                        self._logger.error(
+                            f"  Skipping '{stem}': cannot load frame labels: {e}")
+                        continue
+
+                    out_path = out_dir / f"{stem}_umap_evolution.mp4"
+                    result = create_umap_evolution_video(
+                        video_path=vid_path,
+                        embedding=session_embedding,
+                        umap_labels=session_umap_labels,
+                        frame_labels=frame_labels,
+                        source_fps=fps_val,
+                        out_path=out_path,
+                        output_fps=15.0,
+                        progress_cb=_progress_factory(stem),
+                    )
+                    if result is not None:
+                        self._logger.success(f"  Saved → {result}")
+                        produced.append(result)
+                    else:
+                        self._logger.error(
+                            f"  Export failed for '{stem}' (no output written).")
+
+                if produced:
+                    summary = "\n".join(str(p) for p in produced)
+                    self._after(lambda s=summary: messagebox.showinfo(
+                        "Export complete",
+                        f"UMAP evolution video(s) saved to:\n{out_dir}\n\n{s}"))
+                else:
+                    self._after(lambda: messagebox.showerror(
+                        "Export failed",
+                        "No UMAP evolution videos were produced.  "
+                        "Check the log for details."))
+            except Exception:
+                tb = traceback.format_exc()
+                self._logger.error(f"UMAP evolution video error:\n{tb}")
+                self._after(lambda: messagebox.showerror(
+                    "Export error", tb[:800]))
+            finally:
+                self._running = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    #  " "  session management  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
 
 
     def _toggle_theme(self):
@@ -4207,12 +5583,52 @@ def _check_and_warn():
         root_tmp.destroy()
 
 
-#  
+#
+#  DEFERRED HEAVY IMPORTS  (called from main() after loading splash is visible)
+#
+
+def _deferred_imports():
+    """Import cube_core and companion scripts. Called after the loading splash renders."""
+    global CORE_OK, _CORE_ERR
+    global PipelineLogger, BSoidEngine, run_bsoid_prep
+    global filter_dlc_h5, cleanup_video_byproducts, create_umap_evolution_video
+    global _MOD_VIDEO, _PATH_VIDEO, _MOD_ANALYSER, _PATH_ANALYSER
+
+    try:
+        from cube_core import (
+            PipelineLogger, BSoidEngine, run_bsoid_prep, filter_dlc_h5,
+            cleanup_video_byproducts, create_umap_evolution_video,
+        )
+        CORE_OK = True
+    except ImportError as _ce:
+        CORE_OK = False
+        _CORE_ERR = str(_ce)
+        def cleanup_video_byproducts(*_a, **_kw): pass
+        def filter_dlc_h5(h5_path, *_a, out_path=None, **_kw):
+            import shutil as _sh
+            dst = out_path or h5_path.with_name(h5_path.stem + "_filtered.h5")
+            _sh.copy2(str(h5_path), str(dst))
+            return dst
+
+    _MOD_VIDEO,    _PATH_VIDEO    = _load_script(["cube_video_explorer.py",
+                                                   "BSOID_VIDEO_EXPLR.py"])
+    _MOD_ANALYSER, _PATH_ANALYSER = _load_script(["cube_analyser.py"])
+
+
+#
 #  ENTRY POINT
-#  
+#
 
 def main():
-    _check_and_warn()
+    # Tell Windows who this process is before any window is created.
+    # This ensures the taskbar always uses the CUBE icon, not Python's feather.
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Cube.BehaviouralExplorer.v3")
+    except Exception:
+        pass
+
     app = PipelineApp()
     app.mainloop()
 

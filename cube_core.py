@@ -40,6 +40,14 @@ warnings.filterwarnings("ignore")
 
 VERSION = "2.0"
 
+# Analysis-behaviour version.  Bumped when a change alters the numeric output of
+# a fresh run (new defaults, fixed sampling, etc.).  Stamped into the saved
+# model pkl, feature_config.json and validation_report.json so any output can be
+# traced to the behaviour that produced it.  cfg["compat_mode"] == "legacy_v2"
+# restores the pre-2.1 numeric defaults/branches for exact reproduction of old
+# runs (see BSoidEngine.DEFAULTS and _apply_compat_mode).
+ANALYSIS_VERSION = "2.1"
+
 PALETTE = [
     "#4E79A7","#F28E2B","#E15759","#76B7B2","#59A14F",
     "#EDC948","#B07AA1","#FF9DA7","#9C755F","#BAB0AC",
@@ -180,15 +188,34 @@ def _normalise_dlc_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load_dlc_file(path, likelihood_thresh: float = 0.3):
+def load_dlc_file(path, likelihood_thresh: float = 0.3,
+                  max_interp_gap_frames: int = None, log_fn=None,
+                  return_quality: bool = False):
     """
     Load a DLC CSV or H5 file.
+
+    Parameters
+    ----------
+    likelihood_thresh     : frames below this confidence are interpolated.
+    max_interp_gap_frames : if set (>0), runs of consecutive low-confidence
+        frames LONGER than this are NOT linearly interpolated across — the
+        nearest good value is held flat instead (zero velocity).  This prevents
+        long occlusions from being filled with a smooth straight-line trajectory
+        that the feature engine would read as real low-velocity behavior.
+        None / 0 = legacy behavior (interpolate across any gap).
+    log_fn                : optional callable(str) for a per-file interpolation
+        summary (worst bodyparts, frames held over long gaps).
+    return_quality        : if True, return a 4th element — dict mapping each
+        bodypart name to the fraction of frames below likelihood_thresh.  Used
+        by BSoidEngine to identify chronically occluded keypoints and exclude
+        them from feature extraction.
 
     Returns
     -------
     xy          : np.ndarray  (N_frames, n_bodyparts * 2)
     bodyparts   : list[str]
     fps_hint    : float | None   - extracted from filename if present
+    ll_fracs    : dict[str, float]  (only when return_quality=True)
     """
     path = str(path)
     ext  = Path(path).suffix.lower()
@@ -237,6 +264,12 @@ def load_dlc_file(path, likelihood_thresh: float = 0.3):
 
     # Interpolate low-likelihood frames
     frames = np.arange(n_frames)
+    _cap = int(max_interp_gap_frames) if max_interp_gap_frames else 0
+    _long_gap_frames = 0   # counted once per bodypart (on the x column)
+    flat_held_frame_mask = np.zeros(n_frames, dtype=bool)
+    # Per-bodypart flat-held masks so the pipeline can exclude only the
+    # bodyparts that survive feature_bad_bp_thresh filtering.
+    _flat_held_per_bp: list = [np.zeros(n_frames, dtype=bool) for _ in range(n_pts)]
     for col in range(xy.shape[1]):
         bp_i = col // 2
         lk   = ll[:, bp_i]
@@ -244,10 +277,52 @@ def load_dlc_file(path, likelihood_thresh: float = 0.3):
         good = ~bad
         if good.sum() > 1:
             xy[bad, col] = np.interp(frames[bad], frames[good], xy[good, col])
+            if _cap > 0:
+                # Replace the linear ramp across over-long gaps with a flat hold
+                # of the nearest good value (split at the gap midpoint).
+                i = 0
+                while i < n_frames:
+                    if bad[i]:
+                        j = i
+                        while j < n_frames and bad[j]:
+                            j += 1
+                        if (j - i) > _cap:
+                            left  = i - 1
+                            right = j if j < n_frames else -1
+                            if left >= 0 and right >= 0:
+                                mid = (i + j) // 2
+                                xy[i:mid, col] = xy[left, col]
+                                xy[mid:j, col] = xy[right, col]
+                            elif left >= 0:
+                                xy[i:j, col] = xy[left, col]
+                            elif right >= 0:
+                                xy[i:j, col] = xy[right, col]
+                            if col % 2 == 0:
+                                _long_gap_frames += (j - i)
+                                flat_held_frame_mask[i:j] = True
+                                _flat_held_per_bp[bp_i][i:j] = True
+                        i = j
+                    else:
+                        i += 1
         elif good.sum() == 1:
             xy[bad, col] = xy[good, col][0]
         else:
             xy[:, col] = 0.0
+
+    # Per-file interpolation summary (worst-tracked bodyparts + long-gap holds)
+    if log_fn is not None and n_pts > 0:
+        fracs = [(bodyparts[i], float((ll[:, i] < likelihood_thresh).mean()))
+                 for i in range(n_pts)]
+        worst = [f"{b}:{f*100:.0f}%" for b, f in
+                 sorted(fracs, key=lambda x: x[1], reverse=True)[:3] if f > 0.05]
+        if worst or _long_gap_frames:
+            msg = "    interp: "
+            if worst:
+                msg += "worst bodyparts below thresh — " + ", ".join(worst)
+            if _long_gap_frames:
+                msg += (f"; {_long_gap_frames} frame(s) across > "
+                        f"{_cap}-frame gaps held flat (not ramped)")
+            log_fn(msg)
 
     # Guess FPS from filename  (e.g. "60Hz" or "30fps")
     fps_hint = None
@@ -255,6 +330,10 @@ def load_dlc_file(path, likelihood_thresh: float = 0.3):
     if m:
         fps_hint = float(m.group(1))
 
+    if return_quality:
+        ll_fracs = {bodyparts[i]: float((ll[:, i] < likelihood_thresh).mean())
+                    for i in range(n_pts)}
+        return xy, bodyparts, fps_hint, ll_fracs, _flat_held_per_bp
     return xy, bodyparts, fps_hint
 
 
@@ -313,11 +392,18 @@ def _spine_norm_factor(xs: np.ndarray, ys: np.ndarray,
 
 
 def _angular_features(xs: np.ndarray, ys: np.ndarray,
-                       bodyparts: list) -> "np.ndarray | None":
+                       bodyparts: list,
+                       allow_fallback: bool = True) -> "np.ndarray | None":
     """
     Angles (radians) at the vertex B for consecutive body-axis triples A-B-C.
-    Spine bodyparts detected by keyword; falls back to evenly-spaced indices.
+    Spine bodyparts detected by keyword.
     Returns (n_bins, n_angles) or None when fewer than 3 spine parts are found.
+
+    allow_fallback : when True (pre-2.1 behaviour) and keyword matching finds
+        < 3 spine parts, fall back to evenly-spaced bodypart indices.  Those
+        triples need not lie on the body axis, so the resulting angles can be
+        biologically meaningless.  When False (v2.1 default) the angular block is
+        skipped entirely if no spine landmarks match by keyword.
     """
     if bodyparts is None or len(bodyparts) < 3:
         return None
@@ -332,6 +418,8 @@ def _angular_features(xs: np.ndarray, ys: np.ndarray,
                 seen.add(i)
                 spine_ids.append(i)
     if len(spine_ids) < 3:
+        if not allow_fallback:
+            return None
         n = len(bodyparts)
         spine_ids = list(range(0, n, max(1, n // 5)))[:6]
     if len(spine_ids) < 3:
@@ -394,7 +482,8 @@ def extract_features(xy: np.ndarray, fps: float) -> np.ndarray:
 
 def extract_features_v2(xy: np.ndarray, fps: float,
                          bodyparts: list = None,
-                         body_normalise: bool = True) -> np.ndarray:
+                         body_normalise: bool = True,
+                         angular_fallback: bool = True) -> np.ndarray:
     """
     V2 multi-scale feature extraction (CUBE — Version 2 Framework).
 
@@ -439,9 +528,20 @@ def extract_features_v2(xy: np.ndarray, fps: float,
         head_idx, tail_idx = None, None
 
     # ── 100 ms bins (reference) ───────────────────────────────────────────────
-    b100  = xy[:n_bins * win100].reshape(n_bins, win100, n_xy).mean(axis=1)
+    _b100_raw = xy[:n_bins * win100].reshape(n_bins, win100, n_xy)
+    b100  = _b100_raw.mean(axis=1)
     xs100 = b100[:, 0::2]
     ys100 = b100[:, 1::2]
+
+    # Within-bin positional variance — captures rapid oscillatory motion that
+    # the .mean() binning erases.  Pain-related tremor (shaking, flinching,
+    # writhing) at 10-15 Hz produces HIGH spread within the win100-frame window
+    # even though consecutive bin means look similar.  Stronger at higher fps
+    # (more raw frames per bin → better variance estimate).
+    # win100 == 1 (fps < 15): variance is identically 0, no info added.
+    _b100_var = _b100_raw.var(axis=1)
+    xs100_var = _b100_var[:, 0::2]   # (n_bins, n_pts)
+    ys100_var = _b100_var[:, 1::2]
 
     if head_idx is not None and tail_idx is not None:
         spine = _spine_norm_factor(xs100, ys100, head_idx, tail_idx)
@@ -451,6 +551,14 @@ def extract_features_v2(xy: np.ndarray, fps: float,
 
     xs100n = _norm(xs100)
     ys100n = _norm(ys100)
+
+    # Normalise within-bin variance by spine_length^2 (variance has units length^2)
+    if head_idx is not None and tail_idx is not None:
+        _spine_sq = np.maximum(spine, 10.0) ** 2
+        f_withinbin = np.hstack([xs100_var / _spine_sq[:, None],
+                                 ys100_var / _spine_sq[:, None]])
+    else:
+        f_withinbin = np.hstack([xs100_var, ys100_var])   # (n_bins, 2*n_pts)
 
     # ── Fine scale (50 ms) — only at 60fps+ ──────────────────────────────────
     if use_fine_scale:
@@ -506,11 +614,35 @@ def extract_features_v2(xy: np.ndarray, fps: float,
     f100    = _block(xs100n,   ys100n,   with_accel=True)
     f_coarse = _block(xs_coarse, ys_coarse, with_accel=False)
 
+    # ── Temporal lag drift (state persistence) ────────────────────────────────
+    # Normalised L2 distance between current 100ms feature vector and the
+    # vector 5 bins (0.5 s) and 10 bins (1.0 s) ago.
+    # LOW  = sustained state (rearing held, guarding, grooming, freeze)
+    # HIGH = state just changed (onset/offset, rapid transitions)
+    # Together with within-bin variance this cleanly tags pain behaviors:
+    #   Shaking:       HIGH within-bin var + LOW  lag drift (stable oscillation)
+    #   Flinch onset:  HIGH within-bin var + HIGH lag drift (sudden displacement)
+    #   Rearing onset: LOW  within-bin var + HIGH lag drift (smooth rise)
+    #   Rearing held:  LOW  within-bin var + LOW  lag drift (held posture)
+    _f_norm    = f100 / (np.linalg.norm(f100, axis=1, keepdims=True) + 1e-9)
+    _lag_parts = []
+    for _lag in (5, 10):
+        _lagged = np.vstack([_f_norm[:_lag], _f_norm[:-_lag]])
+        _lag_parts.append(np.linalg.norm(_f_norm - _lagged, axis=1, keepdims=True))
+    f_persist = np.hstack(_lag_parts)   # (n_bins, 2)
+
     # ── Angular features (body-axis curvature) ────────────────────────────────
-    ang = _angular_features(xs100n, ys100n, bodyparts)
+    ang = _angular_features(xs100n, ys100n, bodyparts,
+                            allow_fallback=angular_fallback)
 
     # ── Concatenate all blocks ────────────────────────────────────────────────
+    # Within-bin variance carries no information when win100 <= 1 (fps < 15):
+    # each bin holds a single frame so the variance is identically 0.  Drop the
+    # all-zero block in that regime instead of feeding dead dimensions to UMAP.
     blocks = [f100]
+    if win100 > 1:
+        blocks.append(f_withinbin)
+    blocks.append(f_persist)
     if use_fine_scale:
         f_fine = _block(xs_fine, ys_fine, with_accel=False)
         blocks.append(f_fine)
@@ -545,13 +677,23 @@ def run_umap(feats_sc_T: np.ndarray, cfg: dict):
     except ImportError:
         raise ImportError("umap-learn is required.  pip install umap-learn")
 
-    reducer = _umap.UMAP(
+    _umap_kwargs = dict(
         n_neighbors  = int(cfg.get("umap_n_neighbors",  60)),
         n_components = int(cfg.get("umap_n_components",  2)),
         min_dist     = float(cfg.get("umap_min_dist",  0.1)),
         random_state = int(cfg.get("umap_random_state", 42)),
         verbose      = False,
     )
+    # Force single-threaded for a reproducible embedding: with random_state set
+    # but n_jobs>1, umap-learn's NN-descent is still non-deterministic.  Older
+    # umap-learn versions don't accept n_jobs, so fall back gracefully.
+    if int(cfg.get("umap_n_jobs", 1)) == 1:
+        try:
+            reducer = _umap.UMAP(n_jobs=1, **_umap_kwargs)
+        except TypeError:
+            reducer = _umap.UMAP(**_umap_kwargs)
+    else:
+        reducer = _umap.UMAP(n_jobs=int(cfg.get("umap_n_jobs", 1)), **_umap_kwargs)
     return reducer, reducer.fit_transform(feats_sc_T)
 
 
@@ -559,7 +701,8 @@ def run_umap(feats_sc_T: np.ndarray, cfg: dict):
 #  HDBSCAN  (auto-sweep min_cluster_size - B-SOiD default strategy)
 #  
 
-def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None):
+def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None,
+                log_fn=None):
     """
     Sweep min_cluster_size across a wide adaptive range and select the best
     solution using a two-mode strategy:
@@ -597,7 +740,17 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None):
         raise ImportError(
             "hdbscan is required.  conda install -c conda-forge hdbscan")
 
-    ref_n = n_total if n_total is not None else embedding.shape[0]
+    # min_cluster_size is sized as a fraction of ref_n.  When UMAP runs on a
+    # subsample, anchoring to the full bin count (n_total) makes the effective
+    # mcs ~1/train_frac too large for the points actually being clustered, so
+    # cluster granularity silently depends on the umap_full_thresh boundary.
+    # "embedding" (default, v2.1) anchors to the clustered point count so the
+    # proportion is honest; "full" reproduces the pre-2.1 behaviour.
+    _anchor = str(cfg.get("hdbscan_mcs_anchor", "embedding")).lower()
+    if _anchor == "full" and n_total is not None:
+        ref_n = n_total
+    else:
+        ref_n = embedding.shape[0]
 
     # ── User preferences ──────────────────────────────────────────────────────
     target_n = int(cfg.get("target_n_clusters", 0))       # 0 = no specific target
@@ -608,9 +761,13 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None):
     # pct values are in units of 0.1 % of ref_n.
     # pct=5  → mcs ≈ 0.5 % of ref_n   (finer clusters, higher counts)
     # pct=80 → mcs ≈ 8.0 % of ref_n   (coarser clusters, lower counts)
-    pct_lo = max(5, int(np.ceil(500.0 / ref_n)))   # ≥ 0.5 % of bins, min 5
-    pct_hi = 80                                     # 8.0 %
-    n_steps = 25
+    # Default floor: 0.2% of bins (min 2), allowing brief-event clusters of ~3 bins
+    # at 1200 bins (2-min, 30fps recording).  User can override via hdbscan_pct_lo.
+    # hdbscan_pct_lo = 0 → auto; >0 → fixed override (units: 0.1%-of-bins steps).
+    _pct_lo_auto = max(2, int(np.ceil(200.0 / ref_n)))
+    pct_lo = int(cfg.get("hdbscan_pct_lo", 0)) or _pct_lo_auto
+    pct_hi = int(cfg.get("hdbscan_pct_hi", 50))
+    n_steps = 40
 
     # ── Extend sweep to finer mcs when user targets more clusters ─────────────
     # The default pct_lo (calibrated to ref_n = total bins) can be too coarse
@@ -631,9 +788,25 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None):
         for i in range(n_steps)
     ))
 
-    methods = [m.strip() for m in
-               str(cfg.get("hdbscan_methods_to_try", "eom,leaf")).split(",")
-               if m.strip()]
+    _method_choice = str(cfg.get("hdbscan_method", "both")).lower().strip()
+    if _method_choice in ("eom", "leaf"):
+        methods = [_method_choice]
+    else:
+        methods = [m.strip() for m in
+                   str(cfg.get("hdbscan_methods_to_try", "eom,leaf")).split(",")
+                   if m.strip()]
+
+    # ── Break exact coordinate ties before HDBSCAN ───────────────────────────
+    # Flat interpolation over long tracking gaps produces identical feature
+    # vectors that collapse to the same UMAP coordinates.  Exact duplicates set
+    # mutual-reachability distances to zero → DBCV divides by zero → NaN for
+    # every candidate.  Jitter at 1e-6 × per-axis std is imperceptible to
+    # cluster geometry but eliminates the degeneracy.
+    _emb_std = embedding.std(axis=0)
+    _emb_std[_emb_std == 0] = 1.0          # guard against zero-variance axes
+    embedding = embedding + np.random.default_rng(42).normal(
+        0, 1e-4 * _emb_std, embedding.shape
+    )
 
     # ── Sweep: collect every viable candidate ─────────────────────────────────
     # tuple: (score, n_clusters, labels, clf)
@@ -645,6 +818,7 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None):
             clf = _hdb.HDBSCAN(
                 prediction_data          = True,
                 min_cluster_size         = mcs,
+                min_samples              = max(5, mcs // 5),
                 metric                   = cfg.get("hdbscan_metric", "euclidean"),
                 cluster_selection_method = method,
             ).fit(embedding)
@@ -662,39 +836,96 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None):
         clf = _hdb.HDBSCAN(
             prediction_data          = True,
             min_cluster_size         = mcs,
+            min_samples              = max(5, mcs // 5),
             metric                   = cfg.get("hdbscan_metric", "euclidean"),
             cluster_selection_method = methods[0],
         ).fit(embedding)
-        return clf, clf.labels_.copy(), getattr(clf, "relative_validity_", float("nan"))
+        return clf, clf.labels_.copy(), getattr(clf, "relative_validity_", float("nan")), "DBCV"
 
     best_dbcv = max(s for s, *_ in candidates)
+    _score_label = "DBCV"
+
+    # ── Degenerate-DBCV fallback ──────────────────────────────────────────────
+    # relative_validity_ (DBCV) is non-finite for every candidate when the
+    # mutual-reachability graph is degenerate — e.g. min_dist=0 packing,
+    # duplicate embedding points, or an impoverished feature space (too few
+    # bodyparts).  DBCV then cannot rank solutions and the selection below would
+    # collapse to an arbitrary tie-break.  Re-score every candidate by
+    # silhouette on the embedding so selection stays meaningful, and flag it.
+    dbcv_degenerate = not np.isfinite(best_dbcv)
+    if dbcv_degenerate:
+        _score_label = "silhouette (DBCV fallback)"
+        if log_fn:
+            log_fn("  [VALID-WARN] DBCV is non-finite for all HDBSCAN candidates "
+                   "(degenerate density graph — often too few bodyparts or "
+                   "min_dist=0). Falling back to silhouette-ranked selection; "
+                   "treat cluster quality for this run with caution.")
+        try:
+            from sklearn.metrics import silhouette_score
+            _rng_sil = np.random.default_rng(42)
+            _rescored = []
+            for (_s, _ncl, _lbls, _clf) in candidates:
+                _m = _lbls >= 0
+                if _m.sum() < 2 or len(set(_lbls[_m])) < 2:
+                    _rescored.append((-1.0, _ncl, _lbls, _clf))
+                    continue
+                _idx = np.flatnonzero(_m)
+                if _idx.size > 5000:
+                    _idx = _rng_sil.choice(_idx, 5000, replace=False)
+                try:
+                    _sil = float(silhouette_score(embedding[_idx], _lbls[_idx]))
+                except Exception:
+                    _sil = -1.0
+                _rescored.append((_sil, _ncl, _lbls, _clf))
+            candidates = _rescored
+            best_dbcv = max(s for s, *_ in candidates)
+        except Exception:
+            pass  # sklearn unavailable; keep -inf scores, selection by diversity
+
+    # Coefficient of variation of cluster sizes.  Solutions where clusters have
+    # heterogeneous temporal footprints (brief events + sustained behaviors) are
+    # biologically more realistic than uniformly-sized clusters.  A small bonus
+    # prevents the DBCV-only criterion from always discarding small brief-event
+    # clusters in favour of solutions where every cluster has the same density.
+    def _cluster_cv(labels):
+        sizes = np.array([(labels == c).sum() for c in set(labels) if c >= 0],
+                         dtype=float)
+        if len(sizes) < 2:
+            return 0.0
+        return np.std(sizes) / (np.mean(sizes) + 1e-9)
+
+    _div_bonus   = float(cfg.get("hdbscan_diversity_bonus", 0.10))
+    _dbcv_thresh = float(cfg.get("hdbscan_dbcv_thresh",    0.65))
 
     # ── Selection strategy ────────────────────────────────────────────────────
     if target_n > 0:
-        # User-guided: pick closest to target with DBCV ≥ 75 % of best.
-        thresh    = best_dbcv * 0.75 if best_dbcv > 0 else best_dbcv - 0.1
+        # User-guided: pick closest to target with DBCV ≥ dbcv_thresh of best.
+        thresh    = best_dbcv * _dbcv_thresh if best_dbcv > 0 else best_dbcv - 0.1
         qualified = [c for c in candidates if c[0] >= thresh] or candidates
         qualified.sort(key=lambda c: (abs(c[1] - target_n), -c[0]))
         chosen = qualified[0]
     else:
         # Auto mode: prefer solutions in [pref_lo, pref_hi].
+        # Tiebreak with a small cluster-size CV bonus so solutions containing
+        # both brief and sustained clusters are not unfairly penalised.
         in_range = [c for c in candidates if pref_lo <= c[1] <= pref_hi]
         if in_range:
-            in_range.sort(key=lambda c: -c[0])
+            in_range.sort(key=lambda c: -(c[0] + _div_bonus * _cluster_cv(c[2])))
             chosen = in_range[0]
         else:
             # No candidate in preferred range — pick closest to range boundary
-            # among solutions with DBCV ≥ 75 % of best.
-            thresh = best_dbcv * 0.75 if best_dbcv > 0 else best_dbcv - 0.1
+            # among solutions with DBCV ≥ dbcv_thresh of best.
+            thresh = best_dbcv * _dbcv_thresh if best_dbcv > 0 else best_dbcv - 0.1
             boundary = sorted(
                 [c for c in candidates if c[0] >= thresh],
-                key=lambda c: min(abs(c[1] - pref_lo), abs(c[1] - pref_hi))
+                key=lambda c: (min(abs(c[1] - pref_lo), abs(c[1] - pref_hi)),
+                               -(c[0] + _div_bonus * _cluster_cv(c[2])))
             )
             chosen = boundary[0] if boundary else \
                      sorted(candidates, key=lambda c: -c[0])[0]
 
     best_score, _, best_labels, best_clf = chosen
-    return best_clf, best_labels, best_score
+    return best_clf, best_labels, best_score, _score_label
 
 
 #  
@@ -741,20 +972,36 @@ def predict_labels(xy_smooth: np.ndarray, _umap_model, mlp_model,
                    scaler, fps: float,
                    bodyparts: list = None,
                    body_normalise: bool = True,
-                   pca_model=None) -> np.ndarray:
+                   pca_model=None,
+                   min_confidence: float = 0.0,
+                   angular_fallback: bool = True) -> np.ndarray:
     """
     Return per-frame integer labels for one session using the V2 feature set.
     _umap_model is kept for API / pkl compatibility; the MLP classifier
     operates directly in feature space (no UMAP transform at inference).
     pca_model, if provided, is applied after the StandardScaler and must match
     the one fitted during training.
+
+    min_confidence : if > 0, bins where the MLP's top class probability is below
+        this threshold are labelled -1 (unclassified) instead of being forced
+        into the nearest cluster.  Important because HDBSCAN noise (often a large
+        fraction of bins) is excluded from training but would otherwise be
+        force-classified at inference.  0 = legacy behavior (always assign).
     """
     feats  = extract_features_v2(xy_smooth, fps, bodyparts,
-                                  body_normalise=body_normalise)   # (n_feat, n_bins)
+                                  body_normalise=body_normalise,
+                                  angular_fallback=angular_fallback)   # (n_feat, n_bins)
     scaled = scaler.transform(feats.T)                        # (n_bins, n_feat)
     if pca_model is not None:
         scaled = pca_model.transform(scaled)                  # (n_bins, n_pca)
     labels = mlp_model.predict(scaled)                        # (n_bins,)
+    if min_confidence and min_confidence > 0 and hasattr(mlp_model, "predict_proba"):
+        try:
+            proba = mlp_model.predict_proba(scaled)
+            labels = np.where(proba.max(axis=1) < float(min_confidence),
+                              -1, labels)
+        except Exception:
+            pass
     win    = max(1, int(round(fps / 10)))
     fl     = np.repeat(labels, win)
     n_orig = xy_smooth.shape[0]
@@ -769,7 +1016,7 @@ def predict_labels(xy_smooth: np.ndarray, _umap_model, mlp_model,
 
 
 def train_hmm(label_sequences: list, n_clusters: int,
-              n_states: int = None, n_iter: int = 100):
+              n_states: int = None, n_iter: int = 100, log_fn=None):
     """Fit a Multinomial (Categorical) HMM to B-SOiD MLP label sequences.
 
     Uses Baum-Welch EM.  n_states defaults to n_clusters (smoothing-only mode).
@@ -835,6 +1082,11 @@ def train_hmm(label_sequences: list, n_clusters: int,
     # Hungarian algorithm to find the bijective assignment of states → clusters
     # that maximises total emission probability on the diagonal, then permute
     # all model parameters so state i ↔ cluster i.
+    # Default alignment flags (pickled with the model so downstream consumers
+    # and the analyser can tell whether state IDs == cluster IDs).
+    model.cube_smoothing_mode = bool(smoothing_mode)
+    model.cube_aligned        = False
+    model.cube_emission_diag  = float("nan")
     if smoothing_mode:
         try:
             from scipy.optimize import linear_sum_assignment
@@ -846,8 +1098,26 @@ def train_hmm(label_sequences: list, n_clusters: int,
             model.startprob_   = model.startprob_[perm]
             model.transmat_    = model.transmat_[np.ix_(perm, perm)]
             model.emissionprob_ = model.emissionprob_[perm]
+            model.cube_aligned = True
+            # Alignment quality: mean diagonal emission after permutation.  A low
+            # value means states do not map cleanly onto clusters (the smoothing
+            # assumption is weak for this data), which downstream cluster→behaviour
+            # mappings rely on — surface it rather than assuming perfect alignment.
+            _diag = float(np.mean(np.diag(model.emissionprob_)))
+            model.cube_emission_diag = _diag
+            if log_fn and _diag < 0.5:
+                log_fn(f"  [VALID-WARN] HMM state↔cluster alignment is weak "
+                       f"(mean diagonal emission {_diag:.2f} < 0.5). Smoothed "
+                       f"state IDs may not correspond cleanly to cluster IDs.")
         except ImportError:
-            pass  # scipy unavailable; states may not align perfectly with clusters
+            # scipy is normally present (hdbscan depends on it).  If it is not,
+            # state IDs are NOT aligned to cluster IDs and the analyser's
+            # cluster→behaviour mapping would silently break — warn loudly.
+            if log_fn:
+                log_fn("  [VALID-WARN] scipy unavailable — HMM states were NOT "
+                       "aligned to cluster IDs (Hungarian assignment skipped). "
+                       "Smoothed _hmm labels may not match cluster IDs; install "
+                       "scipy for deterministic alignment.")
 
     return model
 
@@ -861,7 +1131,12 @@ def decode_hmm(hmm_model, frame_labels: np.ndarray) -> np.ndarray:
 
 def plot_duration_comparison(raw_labels: np.ndarray, hmm_labels: np.ndarray,
                               fps: float, out_path: Path):
-    """Log-scale bout duration histograms — raw B-SOiD vs HMM-smoothed."""
+    """Bout duration distributions — raw B-SOiD vs HMM-smoothed.
+
+    Three panels: the two separate log-log histograms (kept for continuity) and
+    an overlaid panel so the disappearance of the single-frame spike after
+    smoothing is directly visible, with per-condition median markers.
+    """
     def _durations(labels):
         bouts = labels_to_bouts(labels)
         return bouts["Run lengths"].values / fps
@@ -869,7 +1144,7 @@ def plot_duration_comparison(raw_labels: np.ndarray, hmm_labels: np.ndarray,
     raw_dur = _durations(raw_labels)
     hmm_dur = _durations(hmm_labels)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4), facecolor=_BG)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4), facecolor=_BG)
     for ax in axes:
         _dark_ax(ax)
 
@@ -877,22 +1152,39 @@ def plot_duration_comparison(raw_labels: np.ndarray, hmm_labels: np.ndarray,
     lo   = max(1e-3, float(all_dur.min()))
     hi   = float(all_dur.max()) + 0.1
     bins = np.logspace(np.log10(lo), np.log10(hi), 40)
+    one_frame = 1.0 / fps
+    _RAW_C, _HMM_C = "#F28E2B", "#4E79A7"
 
     for ax, durs, title, col in zip(
-            axes,
+            axes[:2],
             [raw_dur, hmm_dur],
             ["Raw B-SOiD  (MLP output)", "HMM-smoothed  (Viterbi)"],
-            ["#F28E2B", "#4E79A7"]):
+            [_RAW_C, _HMM_C]):
         ax.hist(durs, bins=bins, color=col, edgecolor=_BG, alpha=0.85)
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_xlabel("Bout duration (s)")
         ax.set_ylabel("Count (log)")
         ax.set_title(title)
-        one_frame = 1.0 / fps
         ax.axvline(one_frame, color="#ff4081", linestyle="--",
                    linewidth=1.2, label=f"1 frame ({one_frame:.3f} s)")
+        if len(durs):
+            ax.axvline(float(np.median(durs)), color=col, linestyle=":",
+                       linewidth=1.6, label=f"median {np.median(durs):.2f}s")
         ax.legend(fontsize=7, facecolor=_PANEL, labelcolor=_TEXT_COL)
+
+    # Overlaid panel — the headline comparison.
+    axo = axes[2]
+    axo.hist(raw_dur, bins=bins, color=_RAW_C, alpha=0.5,
+             label=f"Raw (median {np.median(raw_dur):.2f}s)" if len(raw_dur) else "Raw")
+    axo.hist(hmm_dur, bins=bins, color=_HMM_C, alpha=0.5,
+             label=f"HMM (median {np.median(hmm_dur):.2f}s)" if len(hmm_dur) else "HMM")
+    axo.set_xscale("log"); axo.set_yscale("log")
+    axo.set_xlabel("Bout duration (s)"); axo.set_ylabel("Count (log)")
+    axo.set_title("Overlay  (raw vs HMM)")
+    axo.axvline(one_frame, color="#ff4081", linestyle="--", linewidth=1.2,
+                label=f"1 frame ({one_frame:.3f} s)")
+    axo.legend(fontsize=7, facecolor=_PANEL, labelcolor=_TEXT_COL)
 
     fig.suptitle("Behavioral bout duration  —  before vs. after HMM smoothing",
                  color=_TEXT_COL, fontsize=12)
@@ -902,47 +1194,108 @@ def plot_duration_comparison(raw_labels: np.ndarray, hmm_labels: np.ndarray,
 
 def plot_hmm_transition_matrix(hmm_model, out_path: Path,
                                 state_names: list = None):
-    """Heatmap of the HMM learned transition matrix (transmat_)."""
+    """Heatmaps of the HMM learned transition matrix (transmat_).
+
+    Left  : full matrix.  The diagonal (self-persistence) is partly imposed by
+            the near-diagonal emission prior + Baum-Welch on the same labels, so
+            it should not be read as a purely data-driven quantity.
+    Right : off-diagonal only (diagonal zeroed, rows renormalised) so the
+            behavioural 'grammar' — which state tends to follow which — is
+            readable without the dominant diagonal saturating the colourmap.
+
+    The chance line (1/(n-1)) is a visualisation reference, NOT a significance
+    test.
+    """
     A = hmm_model.transmat_
     n = A.shape[0]
     names = state_names or [f"S{i}" for i in range(n)]
+    chance_floor = 1.0 / max(1, n - 1)
+    cell_fs = max(5, 9 - n // 4)
+
+    cmap_hmm = plt.cm.Blues.copy()
+    cmap_hmm.set_bad(color=_PANEL)
 
     sz = max(6, n * 0.6 + 2)
-    fig, ax = plt.subplots(figsize=(sz, sz), facecolor=_BG)
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(2 * sz, sz), facecolor=_BG)
+
+    # ── Left: full matrix, below-chance off-diagonal masked ───────────────────
     _dark_ax(ax)
-    im = ax.imshow(A, cmap="Blues", aspect="auto", vmin=0, vmax=1)
-    cb = plt.colorbar(im, ax=ax)
-    cb.ax.tick_params(colors=_TICK_COL)
-    cb.set_label("Transition probability", color=_TICK_COL)
-    ax.set_xticks(range(n))
-    ax.set_xticklabels(names, rotation=45, ha="right",
-                        color=_TICK_COL, fontsize=8)
-    ax.set_yticks(range(n))
-    ax.set_yticklabels(names, color=_TICK_COL, fontsize=8)
-    ax.set_xlabel("State at t+1", color=_TICK_COL)
-    ax.set_ylabel("State at t", color=_TICK_COL)
-    ax.set_title("HMM learned transition matrix  A[i→j]  (diagonal = self-persistence)",
-                 color=_TEXT_COL)
-    cell_fs = max(5, 9 - n // 4)
+    display = A.copy().astype(float)
     for i in range(n):
         for j in range(n):
-            # Use white text on dark cells (high probability), black on light cells
-            ax.text(j, i, f"{A[i, j]:.2f}", ha="center", va="center",
-                    fontsize=cell_fs,
-                    color="white" if A[i, j] > 0.4 else "black")
+            if i != j and display[i, j] <= chance_floor:
+                display[i, j] = np.nan
+    im = ax.imshow(display, cmap=cmap_hmm, aspect="auto",
+                   vmin=chance_floor, vmax=1.0)
+    cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cb.ax.tick_params(colors=_TICK_COL)
+    cb.set_label("Transition probability  (above-chance range)", color=_TICK_COL)
+    for _a in (ax, ax2):
+        _a.set_xticks(range(n))
+        _a.set_xticklabels(names, rotation=45, ha="right",
+                           color=_TICK_COL, fontsize=8)
+        _a.set_yticks(range(n))
+        _a.set_yticklabels(names, color=_TICK_COL, fontsize=8)
+        _a.set_xlabel("State at t+1", color=_TICK_COL)
+        _a.set_ylabel("State at t", color=_TICK_COL)
+    ax.set_title(f"Full A[i→j]  (diagonal = self-persistence, partly prior-driven)\n"
+                 f"off-diagonal ≤ chance ({chance_floor:.3f}) masked",
+                 color=_TEXT_COL, fontsize=9)
+    for i in range(n):
+        for j in range(n):
+            val = A[i, j]
+            if i == j or val > chance_floor:
+                ax.text(j, i, f"{val:.2f}", ha="center", va="center",
+                        fontsize=cell_fs,
+                        color="white" if val > 0.55 else _TICK_COL)
+
+    # ── Right: off-diagonal grammar (diagonal removed, rows renormalised) ──────
+    _dark_ax(ax2)
+    off = A.copy().astype(float)
+    np.fill_diagonal(off, 0.0)
+    rs  = off.sum(axis=1, keepdims=True)
+    rs[rs == 0] = 1.0
+    off_norm = off / rs
+    vmax2 = float(np.nanmax(off_norm)) if np.isfinite(off_norm).any() else 1.0
+    im2 = ax2.imshow(off_norm, cmap=cmap_hmm, aspect="auto",
+                     vmin=0.0, vmax=max(vmax2, 1e-3))
+    cb2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+    cb2.ax.tick_params(colors=_TICK_COL)
+    cb2.set_label("P(next state | a transition occurs)", color=_TICK_COL)
+    ax2.set_title("Off-diagonal grammar  (self-transitions removed,\n"
+                  "rows renormalised to next-state probability)",
+                  color=_TEXT_COL, fontsize=9)
+    for i in range(n):
+        for j in range(n):
+            if i != j and off_norm[i, j] > 0.10:
+                ax2.text(j, i, f"{off_norm[i, j]:.2f}", ha="center", va="center",
+                         fontsize=cell_fs,
+                         color="white" if off_norm[i, j] > 0.55 * max(vmax2, 1e-3)
+                         else _TICK_COL)
+
     plt.tight_layout()
     _savefig(fig, out_path)
 
 
 def plot_dual_ethogram(raw_labels: np.ndarray, hmm_labels: np.ndarray,
-                        fps: float, out_path: Path, tag: str):
-    """Two-row ethogram: row 1 = raw B-SOiD MLP, row 2 = HMM Viterbi."""
+                        fps: float, out_path: Path, tag: str,
+                        cluster_names: dict = None):
+    """Two-row ethogram: row 1 = raw B-SOiD MLP, row 2 = HMM Viterbi.
+
+    cluster_names : optional {cluster_id: name} for the raw row's y-labels;
+        falls back to C<id> when missing (safe to pass or omit).
+    """
     uniq_raw = np.unique(raw_labels)
     uniq_hmm = np.unique(hmm_labels)
     t = np.arange(len(raw_labels)) / fps
 
     n_raw = len(uniq_raw)
     n_hmm = len(uniq_hmm)
+
+    def _rawlabel(l):
+        if cluster_names and int(l) in cluster_names and cluster_names[int(l)]:
+            return f"C{l} {cluster_names[int(l)]}"
+        return f"C{l}"
 
     fig, (ax_raw, ax_hmm) = plt.subplots(
         2, 1,
@@ -956,7 +1309,7 @@ def plot_dual_ethogram(raw_labels: np.ndarray, hmm_labels: np.ndarray,
         ax_raw.scatter(t[sel], np.full(len(sel), idx_u),
                        c=_cmap(int(lbl)), s=8, marker="|", linewidths=3.5)
     ax_raw.set_yticks(range(n_raw))
-    ax_raw.set_yticklabels([f"C{l}" for l in uniq_raw], color=_TEXT_COL, fontsize=7)
+    ax_raw.set_yticklabels([_rawlabel(l) for l in uniq_raw], color=_TEXT_COL, fontsize=7)
     ax_raw.set_title(f"Raw B-SOiD  |  {tag}", color=_TEXT_COL, fontsize=9)
     ax_raw.set_ylabel("Cluster", color=_TICK_COL, fontsize=8)
 
@@ -991,6 +1344,10 @@ def plot_syntax_network(hmm_model, out_path: Path,
     n  = A.shape[0]
     names = state_names or [f"S{i}" for i in range(n)]
 
+    # Only show edges strictly above the chance level for this many states
+    chance_floor  = 1.0 / max(1, n - 1)
+    effective_min = max(min_prob, chance_floor)
+
     # Stationary distribution via power iteration
     pi = np.ones(n) / n
     for _ in range(500):
@@ -1003,7 +1360,7 @@ def plot_syntax_network(hmm_model, out_path: Path,
         G.add_node(names[i], weight=float(pi[i]))
     for i in range(n):
         for j in range(n):
-            if i != j and A[i, j] >= min_prob:
+            if i != j and A[i, j] > effective_min:
                 G.add_edge(names[i], names[j], weight=float(A[i, j]))
 
     if G.number_of_edges() == 0:
@@ -1028,9 +1385,14 @@ def plot_syntax_network(hmm_model, out_path: Path,
     # Draw edges with width & alpha ∝ probability; dark contrasting color
     edges     = list(G.edges(data=True))
     max_wt    = max((d["weight"] for _, _, d in edges), default=1.0)
+    # Normalise over the above-chance range so the weakest shown edge (just
+    # above effective_min) maps to 0 and the strongest maps to 1.
+    wt_range  = max(max_wt - effective_min, 1e-9)
     edge_list = [(u, v) for u, v, _ in edges]
-    e_widths  = [max(1.2, d["weight"] / max_wt * 12) for _, _, d in edges]
-    e_alphas  = [0.55 + d["weight"] / max_wt * 0.45 for _, _, d in edges]
+    e_widths  = [max(1.2, (d["weight"] - effective_min) / wt_range * 12)
+                 for _, _, d in edges]
+    e_alphas  = [0.55 + (d["weight"] - effective_min) / wt_range * 0.45
+                 for _, _, d in edges]
     e_colors  = [_cmap(list(G.nodes).index(u)) for u, _, _ in edges]
 
     # Draw each edge individually so alpha can vary
@@ -1063,7 +1425,7 @@ def plot_syntax_network(hmm_model, out_path: Path,
                              font_size=font_sz,
                              font_weight="bold")
     ax_net.set_title(
-        f"Behavioral Syntax Network  (p > {min_prob:.2f})\n"
+        f"Behavioral Syntax Network  (p > {effective_min:.3f} = above chance)\n"
         "Node size ∝ stationary probability  ·  Arrow width ∝ transition probability",
         color=_TEXT_COL, fontsize=10, fontweight="bold", pad=10)
     ax_net.axis("off")
@@ -1080,9 +1442,9 @@ def plot_syntax_network(hmm_model, out_path: Path,
             if i == j:
                 continue
             p = float(A[i, j])
-            if p < min_prob:
+            if p <= effective_min:
                 continue
-            p_norm = p / max_wt
+            p_norm = (p - effective_min) / wt_range
             lw     = max(0.6, p_norm * 10)
             alpha  = 0.45 + p_norm * 0.55
             rad    = 0.20 if abs(i - j) > n // 3 else 0.12
@@ -1168,11 +1530,9 @@ def plot_dwell_violin(epochs: "pd.DataFrame", out_path: Path, tag: str = ""):
     ax.set_xticklabels([f"S{int(l)}" for l in uniq],
                        color=_TEXT_COL, fontsize=max(6, 10 - n // 6))
     ax.set_ylabel("Dwell time (s)", color=_TICK_COL, fontsize=10)
-    ax.set_yscale("log")
     title = f"Dwell-time distributions per state  –  {tag}" if tag else \
             "Dwell-time distributions per state"
     ax.set_title(title, color=_TEXT_COL, fontsize=11, fontweight="bold")
-    ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
 
     plt.tight_layout()
     _savefig(fig, out_path)
@@ -1408,12 +1768,16 @@ def plot_state_space_trajectory(embedding: np.ndarray,
     t_norm   = idx / max(1, n_frames - 1)   # 0→1 time normalised
 
     # Draw trajectory line with colour mapped to time (purple→yellow)
+    from matplotlib.collections import LineCollection as _LC
     cmap_traj = plt.cm.plasma
-    for k in range(len(idx) - 1):
-        ax_tr.plot(emb[idx[k]:idx[k + 2], 0],
-                   emb[idx[k]:idx[k + 2], 1],
-                   color=cmap_traj(t_norm[k]),
-                   alpha=0.55, linewidth=0.7, solid_capstyle="round")
+    pts   = emb[idx, :2].reshape(-1, 1, 2)
+    segs  = np.concatenate([pts[:-1], pts[1:]], axis=1)
+    lc    = _LC(segs, cmap=cmap_traj, linewidth=0.7,
+                alpha=0.55, capstyle="round")
+    lc.set_array(t_norm[:-1])
+    lc.set_clim(0, 1)
+    ax_tr.add_collection(lc)
+    ax_tr.autoscale_view()
 
     # Scatter state identity (sub-sampled) on top
     for u in uniq:
@@ -1703,6 +2067,66 @@ def epoch_stats(epochs: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def compute_cluster_kinematics(all_xy: list, all_frame_labels: list,
+                                all_fps: list, bodyparts: list,
+                                out_path: Path) -> "pd.DataFrame":
+    """Interpretable per-cluster kinematic signatures from pose.
+
+    Clusters are otherwise named only via example clips; this gives each one a
+    quantitative fingerprint (mean centroid speed, body elongation, angular
+    velocity of the body axis) useful for naming and cross-study comparison.
+    Aggregates per-frame descriptors by cluster id across all sessions and
+    writes cluster_kinematics.csv.  Spine-dependent metrics are NaN when no
+    head/tail landmarks are present.
+    """
+    head_idx, tail_idx = _find_spine_indices(bodyparts or [])
+    agg: dict = {}
+    for xy, fl, fps in zip(all_xy, all_frame_labels, all_fps):
+        n = int(min(len(fl), xy.shape[0]))
+        if n < 2:
+            continue
+        xs = xy[:n, 0::2]; ys = xy[:n, 1::2]
+        cx = xs.mean(axis=1); cy = ys.mean(axis=1)
+        speed = np.hypot(np.diff(cx, prepend=cx[:1]),
+                         np.diff(cy, prepend=cy[:1])) * fps
+        if head_idx is not None and tail_idx is not None:
+            elong = np.hypot(xs[:, head_idx] - xs[:, tail_idx],
+                             ys[:, head_idx] - ys[:, tail_idx])
+            ax_ang = np.arctan2(ys[:, head_idx] - ys[:, tail_idx],
+                                xs[:, head_idx] - xs[:, tail_idx])
+            angvel = np.abs(np.diff(np.unwrap(ax_ang),
+                                    prepend=ax_ang[:1])) * fps
+        else:
+            elong = np.full(n, np.nan); angvel = np.full(n, np.nan)
+        fl2 = np.asarray(fl[:n], dtype=int)
+        for cid in np.unique(fl2[fl2 >= 0]):
+            m = fl2 == cid
+            d = agg.setdefault(int(cid),
+                               {"speed": [], "elong": [], "angvel": [], "n": 0})
+            d["speed"].append(speed[m]); d["elong"].append(elong[m])
+            d["angvel"].append(angvel[m]); d["n"] += int(m.sum())
+    rows = []
+    for cid in sorted(agg):
+        d = agg[cid]
+        sp = np.concatenate(d["speed"]) if d["speed"] else np.array([np.nan])
+        el = np.concatenate(d["elong"]) if d["elong"] else np.array([np.nan])
+        av = np.concatenate(d["angvel"]) if d["angvel"] else np.array([np.nan])
+        rows.append({
+            "cluster_id":                 cid,
+            "n_frames":                   d["n"],
+            "mean_speed_px_s":            round(float(np.nanmean(sp)), 3),
+            "mean_body_elongation_px":    round(float(np.nanmean(el)), 3),
+            "mean_angular_velocity_rad_s": round(float(np.nanmean(av)), 3),
+        })
+    df = pd.DataFrame(rows)
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(str(out_path), index=False)
+    except Exception:
+        pass
+    return df
+
+
 #  
 #  PLOTS  (theme-aware; colours set by _apply_plot_theme() at run start)
 #
@@ -1735,20 +2159,475 @@ def plot_umap(embedding: np.ndarray, labels: np.ndarray,
         return
     valid = labels >= 0
     uniq  = np.unique(labels[valid])
-    fig, ax = plt.subplots(figsize=(9, 8), facecolor=_BG)
-    _dark_ax(ax)
-    for u in uniq:
-        m = valid & (labels == u)
-        ax.scatter(embedding[m, 0], embedding[m, 1],
-                   s=2, alpha=0.5, color=_cmap(u), label=f"C{u}")
-    ax.set_title(f"UMAP embedding  [{tag}]", color=_TEXT_COL, fontsize=13)
-    ax.set_xlabel("UMAP 1"); ax.set_ylabel("UMAP 2")
-    handles = [mpatches.Patch(color=_cmap(u), label=f"C{u}")
-               for u in uniq[:20]]
-    ax.legend(handles=handles, fontsize=7, ncol=4,
-              facecolor=_PANEL, edgecolor=_PANEL,
-              labelcolor=_TEXT_COL, loc="upper right")
+    n_cl  = len(uniq)
+    n_dim = embedding.shape[1]
+    # Per-cluster point counts so the legend exposes tiny clusters honestly.
+    counts = {int(u): int((valid & (labels == u)).sum()) for u in uniq}
+
+    # When UMAP is 3-D, a single 2-D scatter (axes 1-2) hides any structure that
+    # separates clusters along axis 3 — the static PNG would misrepresent the
+    # embedding.  Render all three pairwise projections (1-2, 1-3, 2-3) instead.
+    # The interactive umap_3d.html still carries the full 3-D view.
+    pairs = [(0, 1), (0, 2), (1, 2)] if n_dim >= 3 else [(0, 1)]
+
+    legend_rows = int(np.ceil(n_cl / 4))
+    extra_h     = max(0, (legend_rows - 5) * 0.22)
+    if len(pairs) == 1:
+        fig, axes = plt.subplots(1, 1, figsize=(9, 8 + extra_h), facecolor=_BG)
+        axes = [axes]
+    else:
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6 + extra_h), facecolor=_BG)
+        axes = list(np.ravel(axes))
+
+    for ax, (i, j) in zip(axes, pairs):
+        _dark_ax(ax)
+        for u in uniq:
+            m = valid & (labels == u)
+            ax.scatter(embedding[m, i], embedding[m, j],
+                       s=2, alpha=0.5, color=_cmap(u), label=f"C{u}")
+        ax.set_xlabel(f"UMAP {i + 1}"); ax.set_ylabel(f"UMAP {j + 1}")
+
+    _proj = "3-D embedding — pairwise projections" if n_dim >= 3 else "2-D embedding"
+    fig.suptitle(f"UMAP {_proj}  [{tag}]  —  {n_cl} clusters",
+                 color=_TEXT_COL, fontsize=13)
+
+    # Legend with point counts; placed on the last axes / below for many clusters.
+    handles = [mpatches.Patch(color=_cmap(u), label=f"C{u} (n={counts[int(u)]})")
+               for u in uniq]
+    _leg_ax = axes[-1]
+    if n_cl <= 20:
+        _leg_ax.legend(handles=handles, fontsize=7, ncol=2,
+                       facecolor=_PANEL, edgecolor=_PANEL,
+                       labelcolor=_TEXT_COL, loc="upper right")
+    else:
+        ncol = min(8, max(4, int(np.ceil(n_cl / 5))))
+        _leg_ax.legend(handles=handles, fontsize=6, ncol=ncol,
+                       facecolor=_PANEL, edgecolor=_PANEL,
+                       labelcolor=_TEXT_COL,
+                       loc="upper center",
+                       bbox_to_anchor=(0.5, -0.12),
+                       borderaxespad=0)
     _savefig(fig, out_path)
+
+
+def seed_sweep_stability(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
+                          log_fn=None) -> dict:
+    """Re-run UMAP+HDBSCAN over n_seeds random seeds to gauge partition stability.
+
+    Internal quality gates (silhouette, DBCV, trustworthiness) measure how tight
+    each cluster is, not whether the PARTITION is reproducible.  This sweep
+    answers the latter: it reports the cluster-count distribution and the
+    pairwise Adjusted Rand Index (ARI) between seeds.  High mean ARI (→1) means
+    the clustering is stable; low ARI means cluster identities depend on the
+    seed and should be treated with caution.
+
+    Returns {seeds, counts, ari, mean_ari}.  Empty dict if n_seeds < 2 or the
+    required libraries are missing.
+    """
+    if n_seeds is None or int(n_seeds) < 2:
+        return {}
+    try:
+        from sklearn.metrics import adjusted_rand_score
+    except Exception:
+        return {}
+    base_seed = int(cfg.get("umap_random_state", 42))
+    seeds = [base_seed + i for i in range(int(n_seeds))]
+    all_labels, counts = [], []
+    for s in seeds:
+        try:
+            c2 = dict(cfg); c2["umap_random_state"] = s
+            _, emb = run_umap(feats_sc_T, c2)
+            _, lbls, _, _ = run_hdbscan(emb, c2, n_total=feats_sc_T.shape[0])
+            all_labels.append(np.asarray(lbls))
+            counts.append(len(set(int(x) for x in lbls if x >= 0)))
+            if log_fn:
+                log_fn(f"  [seed-sweep] seed {s}: {counts[-1]} clusters")
+        except Exception:
+            if log_fn:
+                log_fn(f"  [seed-sweep] seed {s} failed; skipped")
+    m = len(all_labels)
+    if m < 2:
+        return {}
+    ari = np.eye(m)
+    for i in range(m):
+        for j in range(i + 1, m):
+            try:
+                a = float(adjusted_rand_score(all_labels[i], all_labels[j]))
+            except Exception:
+                a = np.nan
+            ari[i, j] = ari[j, i] = a
+    triu = ari[np.triu_indices(m, 1)]
+    return dict(seeds=seeds, counts=counts, ari=ari,
+                mean_ari=float(np.nanmean(triu)) if triu.size else 1.0)
+
+
+def plot_cluster_stability(sweep: dict, out_path: Path):
+    """Cluster-count distribution + pairwise ARI heatmap from seed_sweep_stability."""
+    if not sweep or "ari" not in sweep:
+        return
+    counts = sweep.get("counts", [])
+    ari    = np.asarray(sweep["ari"], dtype=float)
+    seeds  = sweep.get("seeds", list(range(len(counts))))
+    mean_ari = sweep.get("mean_ari", float("nan"))
+
+    fig, (axc, axa) = plt.subplots(1, 2, figsize=(13, 5), facecolor=_BG)
+    _dark_ax(axc); _dark_ax(axa)
+
+    # Left: cluster-count distribution across seeds.
+    if counts:
+        _vals, _cnts = np.unique(counts, return_counts=True)
+        axc.bar([str(v) for v in _vals], _cnts, color="#4E79A7", alpha=0.85)
+    axc.set_xlabel("Cluster count"); axc.set_ylabel("Seeds")
+    axc.set_title(f"Cluster-count stability across {len(seeds)} seeds\n"
+                  f"(range {min(counts) if counts else 0}–{max(counts) if counts else 0})",
+                  color=_TEXT_COL, fontsize=10)
+
+    # Right: pairwise ARI heatmap.
+    im = axa.imshow(ari, cmap=plt.cm.viridis, vmin=0.0, vmax=1.0, aspect="auto")
+    cb = plt.colorbar(im, ax=axa, fraction=0.046, pad=0.04)
+    cb.ax.tick_params(colors=_TICK_COL)
+    cb.set_label("Adjusted Rand Index", color=_TICK_COL)
+    axa.set_xticks(range(len(seeds)))
+    axa.set_xticklabels([str(s) for s in seeds], rotation=45, ha="right",
+                        color=_TICK_COL, fontsize=7)
+    axa.set_yticks(range(len(seeds)))
+    axa.set_yticklabels([str(s) for s in seeds], color=_TICK_COL, fontsize=7)
+    axa.set_title(f"Pairwise partition agreement (ARI)\n"
+                  f"mean ARI = {mean_ari:.3f}  "
+                  f"({'stable' if mean_ari >= 0.7 else 'unstable — interpret with caution'})",
+                  color=_TEXT_COL, fontsize=10)
+    plt.tight_layout()
+    _savefig(fig, out_path)
+
+
+def _tmat_from_labels(all_frame_labels: list):
+    """
+    Build a row-stochastic transition matrix from frame-label sequences.
+    Returns (tmat, cluster_ids) — both None if no valid transitions exist.
+    """
+    from collections import Counter
+    counts: Counter = Counter()
+    all_ids: set = set()
+    for fl in all_frame_labels:
+        arr = np.asarray(fl, dtype=int)
+        for a, b in zip(arr[:-1], arr[1:]):
+            if int(a) >= 0 and int(b) >= 0 and a != b:
+                counts[(int(a), int(b))] += 1
+                all_ids.update([int(a), int(b)])
+    if not all_ids:
+        return None, None
+    ids = sorted(all_ids)
+    n   = len(ids)
+    idx = {l: i for i, l in enumerate(ids)}
+    T   = np.zeros((n, n), dtype=float)
+    for (a, b), cnt in counts.items():
+        T[idx[a], idx[b]] = cnt
+    rs = T.sum(axis=1, keepdims=True)
+    rs[rs == 0] = 1.0
+    T /= rs
+    return T, ids
+
+
+def plot_umap_3d_transitions(
+    embedding: np.ndarray,
+    labels: np.ndarray,
+    tmat=None,
+    cluster_ids=None,
+    out_path=None,
+    max_edges: int = 10,
+    min_prob: float = 0.05,
+    tag: str = "",
+) -> None:
+    """
+    Render a 3D UMAP scatter with directional transition arrows.
+
+    Only transitions strictly above chance (1 / (n_clusters − 1)) are drawn;
+    from those, the top max_edges by probability are displayed.
+    Outputs a static 3-viewpoint PNG (matplotlib) and an interactive HTML
+    (plotly, if installed).  Both files share the stem of *out_path*.
+
+    Parameters
+    ----------
+    embedding    : (n_samples, >=3) UMAP embedding
+    labels       : (n_samples,) cluster labels  (-1 = noise)
+    tmat         : (n_clusters, n_clusters) row-stochastic transition matrix
+    cluster_ids  : list of cluster IDs matching tmat rows/cols
+    out_path     : destination for the .html file; .png written alongside
+    max_edges    : top-N above-chance transitions to draw (0 = no cap)
+    min_prob     : minimum transition probability threshold
+    tag          : title tag string
+    """
+    if embedding.shape[1] < 3:
+        return
+    valid = labels >= 0
+    uniq  = sorted(set(labels[valid]))
+    if not uniq:
+        return
+
+    e3 = embedding[:, :3]
+    centroids = {u: e3[valid & (labels == u)].mean(axis=0) for u in uniq}
+
+    # ── Global-ranked edge selection ──────────────────────────────────────────
+    # Transitions at or below chance (1 / (n_clusters − 1)) carry no information
+    # above a uniform random walk and are suppressed regardless of min_prob.
+    chance_floor = 1.0 / max(1, len(uniq) - 1)
+    effective_min = max(min_prob, chance_floor)
+
+    edges = []   # (src, tgt, prob)
+    if tmat is not None and cluster_ids is not None:
+        idx_map   = {c: i for i, c in enumerate(cluster_ids)}
+        all_cands = []
+        for src in uniq:
+            if src not in idx_map:
+                continue
+            si = idx_map[src]
+            for tgt in uniq:
+                if tgt == src or tgt not in idx_map:
+                    continue
+                prob = float(tmat[si, idx_map[tgt]])
+                if prob > effective_min:
+                    all_cands.append((prob, src, tgt))
+        all_cands.sort(reverse=True)
+        _cap = max_edges if max_edges > 0 else len(all_cands)
+        edges = [(src, tgt, prob) for prob, src, tgt in all_cands[:_cap]]
+
+    max_prob  = max((p for _, _, p in edges), default=1.0)
+    # Normalise thickness/opacity over the above-chance range so the weakest
+    # shown edge (just above chance_floor) maps to 0 and the strongest to 1.
+    prob_range = max(max_prob - effective_min, 1e-9)
+    n_labelled = min(5, len(edges))   # prob labels only on top-5 arrows
+
+    title = (f"3D UMAP — {len(uniq)} clusters"
+             + (f"  [{tag}]" if tag else "")
+             + (f"  ·  top {len(edges)} transitions" if edges else ""))
+
+    # Embedding extent drives proportional sizing
+    extent = float(np.max(e3.max(axis=0) - e3.min(axis=0))) if len(uniq) > 1 else 1.0
+
+    # ── Static PNG — matplotlib Axes3D, 3 fixed viewpoints ───────────────────
+    try:
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+        import matplotlib.patches as _mpatches
+
+        views = [(20, 45), (20, 200), (60, 100)]
+        fig_s = plt.figure(figsize=(18, 7), facecolor=_BG)
+        for vi, (elev, azim) in enumerate(views):
+            ax = fig_s.add_subplot(1, 3, vi + 1, projection="3d")
+            ax.set_facecolor(_PANEL)
+            for pane in (ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane):
+                pane.fill = False
+                pane.set_edgecolor("#333344")
+
+            # Point cloud (sub-sampled for large datasets) — larger & more opaque
+            for u in uniq:
+                m   = valid & (labels == u)
+                pts = e3[m]
+                step = max(1, len(pts) // 4000)
+                ax.scatter(pts[::step, 0], pts[::step, 1], pts[::step, 2],
+                           s=4, alpha=0.45, color=_cmap(u), depthshade=False)
+
+            # Centroid markers — prominent, outlined for contrast
+            for u in uniq:
+                c = centroids[u]
+                ax.scatter(*c, s=60, color=_cmap(u),
+                           edgecolors=_TEXT_COL, linewidths=0.8,
+                           zorder=5, depthshade=False)
+                ax.text(c[0], c[1], c[2], f"  C{u}", fontsize=6,
+                        color=_TEXT_COL, fontweight="bold", zorder=7)
+
+            # Transition arrows: thick plot() shaft + quiver arrowhead
+            for ei, (src, tgt, prob) in enumerate(edges):
+                s_c  = centroids[src]
+                t_c  = centroids[tgt]
+                d    = t_c - s_c
+                # Relative weight over the above-chance range: 0 = just above
+                # chance, 1 = strongest transition.  Anchoring at effective_min
+                # (not 0) ensures full thickness contrast among shown arrows.
+                rel  = (prob - effective_min) / prob_range
+                lw   = float(0.8 + rel * 2.2)        # 0.8–3.0 pt (was 1.5–9.0)
+                alph = float(0.30 + rel * 0.35)       # 0.30–0.65 (was 0.45–0.95)
+                col  = _cmap(src)
+
+                # Halo: draw slightly thicker contrasting line behind for visibility
+                ax.plot([s_c[0], t_c[0]], [s_c[1], t_c[1]], [s_c[2], t_c[2]],
+                        color=_TEXT_COL, lw=lw + 0.8, alpha=alph * 0.30,
+                        zorder=3, solid_capstyle="round")
+                # Coloured shaft (80% of length, arrowhead fills the rest)
+                mid = s_c + 0.80 * d
+                ax.plot([s_c[0], mid[0]], [s_c[1], mid[1]], [s_c[2], mid[2]],
+                        color=col, lw=lw, alpha=alph,
+                        zorder=4, solid_capstyle="round")
+                # Quiver arrowhead on the final 20%
+                dx, dy, dz = 0.20 * d
+                ax.quiver(mid[0], mid[1], mid[2], dx, dy, dz,
+                          arrow_length_ratio=0.60,
+                          color=col, alpha=alph, linewidth=lw * 0.5,
+                          normalize=False, zorder=5)
+                # Probability label on top-N arrows (first view only)
+                if vi == 0 and ei < n_labelled:
+                    lp = s_c + 0.50 * d
+                    ax.text(lp[0], lp[1], lp[2], f"{prob:.2f}",
+                            fontsize=5.5, color=_TEXT_COL, fontweight="bold",
+                            ha="center", va="center", zorder=8)
+
+            ax.view_init(elev=elev, azim=azim)
+            ax.set_xlabel("UMAP 1", fontsize=7, color=_TICK_COL, labelpad=1)
+            ax.set_ylabel("UMAP 2", fontsize=7, color=_TICK_COL, labelpad=1)
+            ax.set_zlabel("UMAP 3", fontsize=7, color=_TICK_COL, labelpad=1)
+            ax.tick_params(colors=_TICK_COL, labelsize=5, pad=1)
+            view_labels = ["Front-Left", "Back-Right", "Top-Down"]
+            ax.set_title(view_labels[vi], color=_TICK_COL, fontsize=8, pad=4)
+
+        # Transition-strength legend (line thickness key)
+        if edges:
+            leg_handles = [
+                _mpatches.FancyArrow(0, 0, 1, 0, width=0.3,
+                                     color=_cmap(edges[0][0]),
+                                     label=f"strongest ({edges[0][2]:.2f})"),
+                _mpatches.FancyArrow(0, 0, 1, 0, width=0.15,
+                                     color=_cmap(edges[-1][0]),
+                                     label=f"weakest shown ({edges[-1][2]:.2f})"),
+            ]
+            fig_s.legend(handles=leg_handles, loc="lower center",
+                         ncol=2, fontsize=7, facecolor=_PANEL,
+                         labelcolor=_TEXT_COL, edgecolor="#333355",
+                         framealpha=0.8)
+
+        fig_s.suptitle(title, color=_TEXT_COL, fontsize=12, y=1.01)
+        plt.tight_layout(rect=[0, 0.04, 1, 1])
+        if out_path is not None:
+            _savefig(fig_s, Path(out_path).with_suffix(".png"))
+        plt.close(fig_s)
+    except Exception:
+        pass
+
+    # ── Interactive HTML — plotly ─────────────────────────────────────────────
+    if out_path is None:
+        return
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        return
+
+    fig_p = go.Figure()
+
+    # Translucent point cloud — one trace per cluster for legend
+    for u in uniq:
+        m   = valid & (labels == u)
+        pts = e3[m]
+        step = max(1, len(pts) // 5000)
+        fig_p.add_trace(go.Scatter3d(
+            x=pts[::step, 0], y=pts[::step, 1], z=pts[::step, 2],
+            mode="markers",
+            marker=dict(size=3, color=_cmap(u), opacity=0.45),
+            name=f"C{u}",
+            legendgroup="clusters",
+            legendgrouptitle=dict(text="Clusters") if u == uniq[0] else {},
+            showlegend=True,
+            hovertemplate=f"C{u}<extra></extra>",
+        ))
+
+    # Centroid nodes with labels — larger, always-on-top
+    cxyz = np.array([centroids[u] for u in uniq])
+    fig_p.add_trace(go.Scatter3d(
+        x=cxyz[:, 0], y=cxyz[:, 1], z=cxyz[:, 2],
+        mode="markers+text",
+        marker=dict(size=9, color=[_cmap(u) for u in uniq],
+                    line=dict(color=_TEXT_COL, width=2), opacity=1.0),
+        text=[f"C{u}" for u in uniq],
+        textposition="top center",
+        textfont=dict(size=11, color=_TEXT_COL, family="Arial Black"),
+        name="Centroids",
+        legendgroup="centroids",
+        legendgrouptitle=dict(text="Centroids"),
+        showlegend=True,
+        hovertemplate="<b>%{text}</b><extra></extra>",
+    ))
+
+    # Transition arrows: thick shaft + cone arrowhead, width ∝ probability
+    cone_size = extent * 0.06
+    for ei, (src, tgt, prob) in enumerate(edges):
+        s_c   = centroids[src]
+        t_c   = centroids[tgt]
+        d     = t_c - s_c
+        norm  = float(np.linalg.norm(d))
+        if norm < 1e-8:
+            continue
+        d_hat = d / norm
+        rel   = (prob - effective_min) / prob_range
+        # Width spans 2–8 px; opacity spans 0.35–0.70
+        lw_px = max(2, int(2 + rel * 6))
+        alph  = float(0.35 + rel * 0.35)
+        color = _cmap(src)
+        label = f"C{src}→C{tgt}: {prob:.3f}"
+
+        # Shaft stops 18% short so the cone is fully visible
+        shaft_end = s_c + 0.82 * d
+        fig_p.add_trace(go.Scatter3d(
+            x=[s_c[0], shaft_end[0], None],
+            y=[s_c[1], shaft_end[1], None],
+            z=[s_c[2], shaft_end[2], None],
+            mode="lines",
+            line=dict(color=color, width=lw_px),
+            opacity=alph,
+            showlegend=(ei == 0),
+            legendgroup="transitions",
+            legendgrouptitle=dict(text="Transitions") if ei == 0 else {},
+            name="Transitions" if ei == 0 else "",
+            hovertemplate=f"{label}<extra></extra>",
+        ))
+        # Cone arrowhead — size ∝ above-chance relative weight
+        fig_p.add_trace(go.Cone(
+            x=[t_c[0]], y=[t_c[1]], z=[t_c[2]],
+            u=[d_hat[0]], v=[d_hat[1]], w=[d_hat[2]],
+            sizemode="absolute",
+            sizeref=cone_size * (0.4 + rel * 1.2),
+            anchor="tip",
+            colorscale=[[0, color], [1, color]],
+            showscale=False,
+            opacity=alph,
+            hovertemplate=f"{label}<extra></extra>",
+            showlegend=False,
+        ))
+        # Floating probability label near arrow midpoint
+        mid = s_c + 0.50 * d
+        fig_p.add_trace(go.Scatter3d(
+            x=[mid[0]], y=[mid[1]], z=[mid[2]],
+            mode="text",
+            text=[f"{prob:.2f}"],
+            textfont=dict(size=10, color=_TEXT_COL, family="Arial Black"),
+            showlegend=False,
+            hoverinfo="skip",
+        ))
+
+    fig_p.update_layout(
+        title=dict(text=title, font=dict(color=_TEXT_COL, size=14)),
+        paper_bgcolor=_BG,
+        plot_bgcolor=_BG,
+        scene=dict(
+            xaxis=dict(title="UMAP 1", color=_TICK_COL,
+                       backgroundcolor=_BG, gridcolor="#2a2a44",
+                       showbackground=True),
+            yaxis=dict(title="UMAP 2", color=_TICK_COL,
+                       backgroundcolor=_BG, gridcolor="#2a2a44",
+                       showbackground=True),
+            zaxis=dict(title="UMAP 3", color=_TICK_COL,
+                       backgroundcolor=_BG, gridcolor="#2a2a44",
+                       showbackground=True),
+            bgcolor=_BG,
+        ),
+        legend=dict(font=dict(color=_TEXT_COL, size=9),
+                    bgcolor=_PANEL, bordercolor="#333355",
+                    groupclick="toggleitem"),
+        margin=dict(l=0, r=0, t=50, b=0),
+    )
+
+    html_path = Path(out_path).with_suffix(".html")
+    try:
+        html_path.parent.mkdir(parents=True, exist_ok=True)
+        fig_p.write_html(str(html_path), include_plotlyjs="cdn", full_html=True)
+    except Exception:
+        pass
 
 
 def plot_confusion(mlp_model, feats_sc: np.ndarray,
@@ -1775,9 +2654,21 @@ def plot_confusion(mlp_model, feats_sc: np.ndarray,
 
 
 def plot_ethogram(frame_labels: np.ndarray, fps: float,
-                  out_path: Path, tag: str):
+                  out_path: Path, tag: str, cluster_names: dict = None):
+    """Per-session behavioural raster.
+
+    cluster_names : optional {cluster_id: "behaviour name"} (e.g. from the Video
+        Explorer annotation) used for the y-axis labels.  Falls back to C<id>
+        when a name is missing, so passing it is always safe.
+    """
     uniq = np.unique(frame_labels)
     t    = np.arange(len(frame_labels)) / fps
+
+    def _ylabel(l):
+        if cluster_names and int(l) in cluster_names and cluster_names[int(l)]:
+            return f"C{l} {cluster_names[int(l)]}"
+        return f"C{l}"
+
     fig, ax = plt.subplots(
         figsize=(14, max(3, len(uniq) * 0.55)), facecolor=_BG)
     _dark_ax(ax)
@@ -1786,7 +2677,7 @@ def plot_ethogram(frame_labels: np.ndarray, fps: float,
         ax.scatter(t[sel], np.full(len(sel), idx_u),
                    c=_cmap(lbl), s=8, marker="|", linewidths=3.5)
     ax.set_yticks(range(len(uniq)))
-    ax.set_yticklabels([f"C{l}" for l in uniq], color=_TEXT_COL, fontsize=8)
+    ax.set_yticklabels([_ylabel(l) for l in uniq], color=_TEXT_COL, fontsize=8)
     ax.set_xlabel("Time (s)", color=_TICK_COL)
     ax.set_title(f"Ethogram  –  {tag}", color=_TEXT_COL, fontsize=11)
     _savefig(fig, out_path)
@@ -1840,7 +2731,7 @@ def plot_cluster_stats(epochs: pd.DataFrame, out_path: Path):
         (axes[2], stats["mean"] * stats["count"], "Total duration (s)"),
     ]
     for ax, vals, ylabel in panels:
-        ax.bar(xpos, vals, color=colors, edgecolor=_BG, alpha=0.9)
+        ax.bar(xpos, vals, color=colors, edgecolor="none", alpha=0.9)
         ax.set_xticks(xpos)
         ax.set_xticklabels([f"C{g}" for g in grps],
                            rotation=60, color="#aaaacc", fontsize=8)
@@ -1858,7 +2749,7 @@ def plot_feature_quality(feats_list: list, names: list, out_path: Path):
     _dark_ax(ax)
     ax.bar(range(len(means)), means,
            color=[_cmap(i) for i in range(len(means))],
-           edgecolor=_BG, alpha=0.9)
+           edgecolor="none", alpha=0.9)
     ax.set_xticks(range(len(names)))
     ax.set_xticklabels(names, rotation=35, ha="right",
                        color="#aaaacc", fontsize=8)
@@ -1918,7 +2809,11 @@ def plot_likelihood_qc(dlc_paths: list, out_path: Path):
 
 
 def plot_transition_matrix(all_frame_labels: list, out_path: Path):
-    """Behavioral state transition probability matrix  P(next | current)."""
+    """Behavioral state transition probability matrix  P(next | current).
+    Diagonal (self-transitions) and off-diagonal entries ≤ chance are shown
+    as background.  The colormap is anchored at chance_floor so the weakest
+    visible arrow maps to the lightest colour and the strongest to the darkest.
+    """
     from collections import Counter
     counts: Counter = Counter()
     all_labels: set = set()
@@ -1938,19 +2833,32 @@ def plot_transition_matrix(all_frame_labels: list, out_path: Path):
     row_sums = T.sum(axis=1, keepdims=True)
     row_sums[row_sums == 0] = 1
     T /= row_sums
+    chance_floor = 1.0 / max(1, n - 1)
+    # NaN-mask self-transitions and below-chance entries so set_bad() shows
+    # them as the panel background, leaving the colormap scale to span only
+    # the above-chance range [chance_floor … max_observed_probability].
+    display = T.copy().astype(float)
+    np.fill_diagonal(display, np.nan)
+    display[display <= chance_floor] = np.nan
+    vmax_val = float(np.nanmax(display)) if not np.all(np.isnan(display)) else 1.0
+    cmap_t = plt.cm.YlOrRd.copy()
+    cmap_t.set_bad(color=_PANEL)
     sz = max(6, n * 0.55 + 2)
     fig, ax = plt.subplots(figsize=(sz, sz), facecolor=_BG)
     _dark_ax(ax)
-    im = ax.imshow(T, cmap="YlOrRd", aspect="auto", vmin=0, vmax=1)
+    im = ax.imshow(display, cmap=cmap_t, aspect="auto",
+                   vmin=chance_floor, vmax=vmax_val)
     cb = plt.colorbar(im, ax=ax)
     cb.ax.tick_params(colors="#aaaacc")
-    cb.set_label("Transition probability", color="#aaaacc")
+    cb.set_label("Transition probability  (above-chance range)", color="#aaaacc")
     tick_lbls = [f"C{l}" for l in labs]
     ax.set_xticks(range(n)); ax.set_xticklabels(tick_lbls, rotation=45, ha="right",
                                                   color="#aaaacc", fontsize=8)
     ax.set_yticks(range(n)); ax.set_yticklabels(tick_lbls, color="#aaaacc", fontsize=8)
     ax.set_xlabel("Next cluster"); ax.set_ylabel("Current cluster")
-    ax.set_title("Behavioral state transition probabilities  P(next | current)")
+    ax.set_title(f"Behavioral state transition probabilities  P(next | current)\n"
+                 f"(above-chance only, p > {chance_floor:.3f}  |  "
+                 f"colourmap: {chance_floor:.3f} → {vmax_val:.3f})")
     plt.tight_layout()
     _savefig(fig, out_path)
 
@@ -1987,7 +2895,7 @@ def plot_validation_summary(validation: dict, out_path: Path):
             if n_bad:
                 colors = [SC_MAP["block"] if b > 0 else SC_MAP["pass"]
                           for b in n_bad]
-                ax.bar(range(len(n_bad)), n_bad, color=colors, edgecolor=_BG)
+                ax.bar(range(len(n_bad)), n_bad, color=colors, edgecolor="none")
                 ax.set_xticks([])
                 ax.set_ylabel("# bad bodyparts", fontsize=8)
             else:
@@ -2052,7 +2960,7 @@ def plot_cv_scores(cv_scores: np.ndarray, out_path: Path):
     for ax in (ax1, ax2):
         _dark_ax(ax)
     colors = [_cmap(i) for i in range(k)]
-    ax1.bar(range(k), cv_scores, color=colors, edgecolor=_BG, alpha=0.9)
+    ax1.bar(range(k), cv_scores, color=colors, edgecolor="none", alpha=0.9)
     ax1.axhline(cv_scores.mean(), color="#ffd60a", linestyle="--",
                 linewidth=1.5, label=f"Mean = {cv_scores.mean():.3f}")
     ax1.set_xticks(range(k))
@@ -2185,7 +3093,8 @@ def create_example_clips(video_path, epochs: pd.DataFrame,
                           animal_id: str = "",
                           max_clip_dur_sec: float = 8.0,
                           max_total_clips: int = 120,
-                          clips_per_cluster: "dict | None" = None):
+                          clips_per_cluster: "dict | None" = None,
+                          max_per_call: "int | None" = None):
     """Write up to max_clips short example videos per cluster.
 
     Files are saved to out_dir/example_clips/cluster_NN/cluster_NN_<animal>_example_MM.mp4
@@ -2220,12 +3129,15 @@ def create_example_clips(video_path, epochs: pd.DataFrame,
         total          = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         w              = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h              = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        step           = max(1, int(round(source_fps / output_fps)))
+        # Write every source frame encoded at output_fps — this produces slow-motion
+        # playback so short behaviours remain watchable.  Do NOT subsample here:
+        # subsampling would preserve real-time speed while discarding frames, making
+        # clips indistinguishable from the original and defeating the purpose.
         max_out_frames = max(1, int(max_clip_dur_sec * output_fps))
-        max_src_frames = max_out_frames * step
+        max_src_frames = max_out_frames   # one source frame per output frame
         # For gaps narrower than this many source frames, read-and-discard is
         # cheaper than a keyframe seek (tune: ~2 s at source fps).
-        skip_threshold = max(step, int(source_fps * 2))
+        skip_threshold = int(source_fps * 2)
         clips_root     = out_dir / "example_clips"
         animal_part    = f"_{animal_id}" if animal_id else ""
 
@@ -2239,6 +3151,8 @@ def create_example_clips(video_path, epochs: pd.DataFrame,
             already = (clips_per_cluster.get(int(grp), 0)
                        if clips_per_cluster is not None else 0)
             slots = max_clips - already
+            if max_per_call is not None:
+                slots = min(slots, max_per_call)
             if slots <= 0:
                 continue
             grp_epochs = epochs[epochs.label == grp].copy()
@@ -2256,8 +3170,11 @@ def create_example_clips(video_path, epochs: pd.DataFrame,
                 if len(pending) >= max_total_clips:
                     break
                 sf = max(0, int(row.start_frame))
-                ef = min(total - 1, int(row.end_frame))
+                ef = (min(total - 1, int(row.end_frame)) if total > 0
+                      else int(row.end_frame))
                 ef = min(ef, sf + max_src_frames - 1)
+                if ef < sf:
+                    continue   # start frame beyond video end (truncated file)
                 label_text = (f"t={row.start_sec:.1f}s  "
                               f"dur={row.duration_sec:.2f}s")
                 out_p = (cluster_dir /
@@ -2293,27 +3210,25 @@ def create_example_clips(video_path, epochs: pd.DataFrame,
                 continue
             try:
                 out_frames = 0
-                src_idx    = 0   # frames read since clip start
                 while cap_pos <= ef and out_frames < max_out_frames:
                     ret, frame = cap.read()
                     if not ret:
                         cap_pos = -1
                         break
                     cap_pos += 1
-                    if src_idx % step == 0:
-                        cv2.rectangle(frame, (0, 0), (230, 46), (0, 0, 0), -1)
-                        cv2.putText(frame, f"Cluster {grp}",
-                                    (8, 20), cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.7, col_bgr, 2, cv2.LINE_AA)
-                        cv2.putText(frame, label_text,
-                                    (8, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.5, (200, 200, 200), 1)
-                        writer.write(frame)
-                        out_frames += 1
-                    src_idx += 1
+                    cv2.rectangle(frame, (0, 0), (230, 46), (0, 0, 0), -1)
+                    cv2.putText(frame, f"Cluster {grp}",
+                                (8, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7, col_bgr, 2, cv2.LINE_AA)
+                    cv2.putText(frame, label_text,
+                                (8, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5, (200, 200, 200), 1)
+                    writer.write(frame)
+                    out_frames += 1
             finally:
                 writer.release()
-            written_per_grp[grp] = written_per_grp.get(grp, 0) + 1
+            if out_frames > 0:
+                written_per_grp[grp] = written_per_grp.get(grp, 0) + 1
 
         # Update the shared state so the next animal's call knows what's done
         if clips_per_cluster is not None:
@@ -2369,9 +3284,323 @@ def create_labeled_video(video_path, frame_labels: np.ndarray,
         cap.release()
 
 
-#  
+def create_umap_evolution_video(
+    video_path,
+    embedding: "np.ndarray",
+    umap_labels: "np.ndarray",
+    frame_labels: "np.ndarray",
+    source_fps: float,
+    out_path: "Path",
+    output_fps: float = 15.0,
+    umap_panel_width: int = 640,
+    elev: float = 20.0,
+    azim: float = -60.0,
+    palette: "list | None" = None,
+    progress_cb=None,
+) -> "Path | None":
+    """Side-by-side video: original recording left, 3-D UMAP buildup right.
+
+    The UMAP panel grows from 0 points to the full session cloud as the video
+    plays.  Cumulative centroid-to-centroid arrows thicken with each observed
+    transition (only above-chance transitions are ever drawn).
+
+    Parameters
+    ----------
+    video_path        : source video file
+    embedding         : (n_session_bins, 3) UMAP coords pre-sliced to this session
+    umap_labels       : (n_session_bins,) cluster IDs
+    frame_labels      : (n_video_frames,) per-frame cluster IDs
+    source_fps        : frames-per-second of the source video
+    out_path          : destination path for the output video (stem is kept)
+    output_fps        : frames per second of the exported video
+    umap_panel_width  : pixel width of the UMAP panel
+    elev / azim       : initial 3-D viewpoint
+    palette           : optional colour list (falls back to module PALETTE)
+    progress_cb       : optional callable(phase_str, pct_float) for progress
+
+    Returns the resolved output path, or None on failure.
+    """
+    try:
+        import cv2
+    except ImportError:
+        return None
+    try:
+        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+    except ImportError:
+        return None
+
+    _pal = palette or PALETTE
+
+    def _col(c: int) -> str:
+        return _pal[int(c) % len(_pal)]
+
+    def _hex_bgr(h: str) -> tuple:
+        h = h.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return (b, g, r)
+
+    embedding  = np.asarray(embedding, dtype=float)
+    umap_labels = np.asarray(umap_labels, dtype=int)
+    frame_labels = np.asarray(frame_labels, dtype=int)
+    n_bins     = embedding.shape[0]
+    if n_bins == 0:
+        return None
+
+    # 100 ms bin stride
+    bin_stride = max(1, int(round(source_fps / 10.0)))
+
+    valid = umap_labels >= 0
+    uniq  = sorted(set(umap_labels[valid]))
+    if not uniq:
+        return None
+
+    centroids = {u: embedding[valid & (umap_labels == u)].mean(axis=0)
+                 for u in uniq}
+    n_clusters = len(uniq)
+
+    # Fixed axis limits (5 % padding)
+    lo = embedding.min(axis=0)
+    hi = embedding.max(axis=0)
+    pad = (hi - lo) * 0.05 + 1e-6
+    ax_lo, ax_hi = lo - pad, hi + pad
+
+    # Chance floor for transition arrows
+    chance_floor = 1.0 / max(1, n_clusters - 1)
+
+    # Build sorted transition event list: (bin_idx, from_c, to_c)
+    trans_events: list = []
+    for fi in range(1, len(frame_labels)):
+        fc, pc = int(frame_labels[fi]), int(frame_labels[fi - 1])
+        if fc != pc and fc >= 0 and pc >= 0:
+            trans_events.append((fi // bin_stride, pc, fc))
+
+    # Cumulative transition counts array indexed by (from_c, to_c) as dict
+    T_cum: dict = {}   # (from_c, to_c) → count
+
+    # ── Phase 1: pre-render UMAP panel frames ────────────────────────────────
+    if progress_cb:
+        progress_cb("Pre-rendering UMAP frames", 0.0)
+
+    fig_w_in = umap_panel_width / 100.0
+    fig_h_in = fig_w_in          # square figure fills the panel better
+    fig = plt.figure(figsize=(fig_w_in, fig_h_in), facecolor=_BG, dpi=100)
+    fig.subplots_adjust(left=0.01, right=0.99, bottom=0.04, top=0.94)
+    canvas = FigureCanvasAgg(fig)
+
+    umap_frames: dict = {}   # bin_idx → numpy (H, W, 3)
+    trans_cursor = 0         # index into trans_events
+
+    for b in range(n_bins):
+        # Advance cumulative transition counts up to bin b
+        while trans_cursor < len(trans_events) and trans_events[trans_cursor][0] <= b:
+            _, fc, tc = trans_events[trans_cursor]
+            T_cum[(fc, tc)] = T_cum.get((fc, tc), 0) + 1
+            trans_cursor += 1
+
+        fig.clf()
+        fig.patch.set_facecolor(_BG)
+        ax = fig.add_subplot(111, projection="3d")
+        ax.set_facecolor(_BG)
+        for pane in (ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane):
+            pane.fill = False
+            pane.set_edgecolor("#333344")
+
+        # Scatter points up to current bin — primary visual: opaque cloud.
+        pts_so_far = embedding[:b + 1]
+        lbl_so_far = umap_labels[:b + 1]
+        for u in uniq:
+            m = (lbl_so_far == u)
+            if m.any():
+                step = max(1, m.sum() // 8000)
+                px = pts_so_far[m][::step]
+                ax.scatter(px[:, 0], px[:, 1], px[:, 2],
+                           s=14, alpha=0.82, color=_col(u),
+                           depthshade=False, zorder=4)
+
+        # Highlight current bin's point
+        cur_lbl = int(umap_labels[b])
+        if cur_lbl >= 0:
+            cp = embedding[b]
+            ax.scatter(*cp, s=70, color=_col(cur_lbl),
+                       edgecolors=_TEXT_COL, linewidths=1.4,
+                       zorder=8, depthshade=False)
+
+        # Cumulative transition arrows (only above-chance).
+        # Normalise thickness and opacity over the above-chance range so the
+        # weakest visible arrow (just above chance_floor) maps to minimum
+        # weight and the strongest to maximum — consistent with all other
+        # transition plots in the pipeline.
+        if T_cum:
+            # Pre-compute per-source row sums for probability estimation
+            src_totals = {}
+            for (s, _t), v in T_cum.items():
+                src_totals[s] = src_totals.get(s, 0) + v
+            # Gather all above-chance probabilities to anchor normalisation
+            above_probs = {}
+            for (src, tgt), cnt in T_cum.items():
+                if src not in centroids or tgt not in centroids:
+                    continue
+                p = cnt / max(1, src_totals.get(src, 1))
+                if p > chance_floor:
+                    above_probs[(src, tgt)] = p
+            if above_probs:
+                max_prob_ev   = max(above_probs.values())
+                prob_range_ev = max(max_prob_ev - chance_floor, 1e-9)
+                # Show only the top-10 above-chance transitions so arrows
+                # stay secondary and don't crowd the cluster cloud.
+                top_edges = sorted(above_probs.items(),
+                                   key=lambda kv: kv[1], reverse=True)[:10]
+                for (src, tgt), prob_approx in top_edges:
+                    rel  = (prob_approx - chance_floor) / prob_range_ev
+                    lw   = float(0.6 + rel * 1.4)     # 0.6–2.0 px
+                    alph = float(0.18 + rel * 0.22)   # 0.18–0.40
+                    s_c  = centroids[src]
+                    t_c  = centroids[tgt]
+                    d    = t_c - s_c
+                    mid  = s_c + 0.80 * d
+                    ax.plot([s_c[0], mid[0]], [s_c[1], mid[1]], [s_c[2], mid[2]],
+                            color=_col(src), lw=lw, alpha=alph,
+                            zorder=2, solid_capstyle="round")
+                    dx, dy, dz = 0.20 * d
+                    ax.quiver(mid[0], mid[1], mid[2], dx, dy, dz,
+                              arrow_length_ratio=0.6, color=_col(src),
+                              alpha=alph, linewidth=lw * 0.4,
+                              normalize=False, zorder=3)
+
+        ax.set_xlim(ax_lo[0], ax_hi[0])
+        ax.set_ylim(ax_lo[1], ax_hi[1])
+        ax.set_zlim(ax_lo[2], ax_hi[2])
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_xlabel("UMAP 1", fontsize=6, color=_TICK_COL, labelpad=1)
+        ax.set_ylabel("UMAP 2", fontsize=6, color=_TICK_COL, labelpad=1)
+        ax.set_zlabel("UMAP 3", fontsize=6, color=_TICK_COL, labelpad=1)
+        ax.tick_params(colors=_TICK_COL, labelsize=5, pad=0)
+        ax.set_title(f"UMAP  bin {b + 1}/{n_bins}", color=_TICK_COL,
+                     fontsize=7, pad=2)
+
+        canvas.draw()
+        # buffer_rgba() works across matplotlib versions; tostring_rgb() was
+        # deprecated in 3.8 and removed in 3.10 (would raise AttributeError here).
+        buf = np.asarray(canvas.buffer_rgba())   # (H, W, 4)
+        umap_frames[b] = buf[..., :3].copy()     # drop alpha → RGB
+
+        if progress_cb and b % max(1, n_bins // 50) == 0:
+            progress_cb("Pre-rendering UMAP frames", b / n_bins)
+
+    plt.close(fig)
+    if progress_cb:
+        progress_cb("Pre-rendering UMAP frames", 1.0)
+
+    # ── Phase 2: assemble output video ───────────────────────────────────────
+    if progress_cb:
+        progress_cb("Assembling video", 0.0)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return None
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # Cap source height at 720 px to keep the output manageable
+        target_h = min(src_h, 720)
+        scale    = target_h / src_h
+        vid_w    = int(src_w * scale)
+
+        out_w = vid_w + umap_panel_width
+        out_h = target_h
+
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        writer, resolved = _open_writer(out_path, output_fps, out_w, out_h)
+        if writer is None:
+            return None
+
+        step = max(1, int(round(source_fps / output_fps)))
+
+        try:
+            src_fi = 0
+            while src_fi < total_frames:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if src_fi % step == 0:
+                    bin_idx = min(src_fi // bin_stride, n_bins - 1)
+
+                    # Left panel: original video (resized)
+                    if scale != 1.0:
+                        vid_panel = cv2.resize(frame, (vid_w, target_h))
+                    else:
+                        vid_panel = frame
+
+                    # Right panel: pre-rendered UMAP frame (resized to panel)
+                    umap_img = umap_frames[bin_idx]
+                    umap_bgr = cv2.cvtColor(umap_img, cv2.COLOR_RGB2BGR)
+                    umap_panel = cv2.resize(umap_bgr, (umap_panel_width, target_h))
+
+                    combined = np.concatenate([vid_panel, umap_panel], axis=1)
+
+                    # Overlay: cluster label and timestamp
+                    t_sec   = src_fi / source_fps
+                    mins    = int(t_sec // 60)
+                    secs    = int(t_sec % 60)
+                    lbl     = int(frame_labels[min(src_fi, len(frame_labels) - 1)])
+                    col_bgr = _hex_bgr(_col(lbl))
+
+                    # ── Large cluster label centred at the top of the left panel ──
+                    label_text = f"Cluster {lbl}"
+                    _font      = cv2.FONT_HERSHEY_DUPLEX
+                    _fscale    = max(1.2, target_h / 500.0)
+                    _thick     = max(2, int(_fscale * 2))
+                    (tw, th_t), _bl = cv2.getTextSize(
+                        label_text, _font, _fscale, _thick)
+                    tx = max(0, (vid_w - tw) // 2)
+                    ty = th_t + 16
+                    # Dark semi-transparent backing strip
+                    overlay = combined.copy()
+                    cv2.rectangle(overlay,
+                                  (0, 0), (vid_w, ty + _bl + 12),
+                                  (0, 0, 0), -1)
+                    cv2.addWeighted(overlay, 0.55, combined, 0.45, 0, combined)
+                    # White outline for contrast on any background
+                    cv2.putText(combined, label_text, (tx, ty),
+                                _font, _fscale, (30, 30, 30), _thick + 3,
+                                cv2.LINE_AA)
+                    # Coloured fill
+                    cv2.putText(combined, label_text, (tx, ty),
+                                _font, _fscale, col_bgr, _thick, cv2.LINE_AA)
+
+                    # ── Small timestamp at bottom-left ──
+                    cv2.rectangle(combined, (0, target_h - 28),
+                                  (200, target_h), (0, 0, 0), -1)
+                    cv2.putText(combined,
+                                f"t={mins:02d}:{secs:02d}",
+                                (8, target_h - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                                (200, 200, 200), 1, cv2.LINE_AA)
+                    writer.write(combined)
+
+                    if progress_cb and src_fi % max(1, total_frames // 50) == 0:
+                        progress_cb("Assembling video", src_fi / total_frames)
+                src_fi += 1
+        finally:
+            writer.release()
+    finally:
+        cap.release()
+
+    if progress_cb:
+        progress_cb("Assembling video", 1.0)
+    return resolved
+
+
+#
 #  FILE DISCOVERY UTILITIES
-#  
+#
 
 def _is_bsoid_ready_h5(p: Path) -> bool:
     """True for *_filtered.h5 DLC outputs that haven't been BSOID-processed."""
@@ -2583,10 +3812,24 @@ def cleanup_dlc_byproducts(root_path: Path, log_fn=print):
 
 
 def run_bsoid_prep(source_folder, log_fn=print,
-                   min_confidence: float = MIN_BODYPART_CONFIDENCE) -> Path | None:
+                   min_confidence: float = MIN_BODYPART_CONFIDENCE,
+                   conf_metric: str = "median",
+                   min_session_frac: float = 0.6,
+                   min_keep: int = 6) -> Path | None:
     """
     Scan source_folder for *_filtered.h5 files, filter to conserved bodyparts,
     export BSOID_Project_Ready/ structure.
+
+    Bodypart conservation policy (single-view-camera friendly)
+    ----------------------------------------------------------
+    A bodypart is conserved if its per-session confidence (``conf_metric``,
+    "median" or "mean") is >= ``min_confidence`` in at least ``min_session_frac``
+    of the folder's sessions — NOT in every session.  This prevents one
+    poorly-tracked recording from deleting a keypoint for the whole group, which
+    is common with single-view setups where occlusion transiently tanks the mean.
+    If fewer than ``min_keep`` bodyparts pass, the top-N keypoints by confidence
+    are kept instead (with a warning) so the feature space never silently
+    collapses to a handful of points.
 
     Returns path to BSOID_Project_Ready or None on failure.
     """
@@ -2639,14 +3882,43 @@ def run_bsoid_prep(source_folder, log_fn=print,
         log_fn("  ERROR: All H5 files failed to parse.")
         return None
 
-    # Determine conserved bodyparts
-    first_bps = list(list(all_stats.values())[0][1].keys())
-    conserved = [
-        bp for bp in first_bps
-        if all(bp in ss and ss[bp]["mean"] >= min_confidence
-               for _, ss in all_stats.values())
-    ]
-    log_fn(f"  Conserved bodyparts ({len(conserved)}/{len(first_bps)}): {conserved}")
+    # ── Determine conserved bodyparts ─────────────────────────────────────────
+    # Universe of bodyparts = union across sessions, preserving first-session
+    # order then appending any extras, so a stable column order is kept.
+    all_bps_seen: list = []
+    for _, ss in all_stats.values():
+        for bp in ss.keys():
+            if bp not in all_bps_seen:
+                all_bps_seen.append(bp)
+    n_sessions = len(all_stats)
+    _metric = "median" if str(conf_metric).lower().startswith("med") else "mean"
+
+    def _pass_frac(bp: str) -> float:
+        n_pass = sum(1 for _, ss in all_stats.values()
+                     if bp in ss and ss[bp][_metric] >= min_confidence)
+        return n_pass / max(1, n_sessions)
+
+    conserved = [bp for bp in all_bps_seen
+                 if _pass_frac(bp) >= float(min_session_frac)]
+
+    # Floor: never collapse below min_keep usable keypoints.  If the threshold
+    # rule leaves too few, fall back to the top-N bodyparts ranked by mean
+    # per-session confidence so the analysis keeps a workable feature set.
+    if len(conserved) < int(min_keep) and all_bps_seen:
+        def _mean_conf(bp: str) -> float:
+            vals = [ss[bp][_metric] for _, ss in all_stats.values() if bp in ss]
+            return float(np.mean(vals)) if vals else 0.0
+        ranked = sorted(all_bps_seen, key=_mean_conf, reverse=True)
+        target_n = max(int(min_keep), len(conserved))
+        conserved = ranked[:target_n]
+        log_fn(f"  [VALID-WARN] Only {sum(1 for bp in all_bps_seen if _pass_frac(bp) >= float(min_session_frac))} "
+               f"bodypart(s) passed {_metric} >= {min_confidence} in "
+               f">= {float(min_session_frac):.0%} of sessions; falling back to "
+               f"top-{len(conserved)} by confidence to keep a usable feature set.")
+
+    log_fn(f"  Conserved bodyparts ({len(conserved)}/{len(all_bps_seen)}; "
+           f"metric={_metric}, thresh={min_confidence}, "
+           f"min_sess_frac={float(min_session_frac):.0%}): {conserved}")
 
     if not conserved:
         log_fn(f"  ERROR: No bodyparts passed threshold {min_confidence}.")
@@ -2759,31 +4031,92 @@ class BSoidEngine:
     cfg          : dict of hyperparameter overrides
     """
 
-    # ── Publication-faithful defaults ─────────────────────────────────────────
-    # Parameters match Hsu & Bhatt et al. (2021) PLOS Comput. Biol. exactly.
-    # Only min_epoch_dur_s / max_epoch_dur_s are intended as user inputs.
+    # ── Defaults ───────────────────────────────────────────────────────────────
+    # Where CUBE follows B-SOiD (Hsu A.I. & Yttri E.A., 2021, Nat. Commun.
+    # 12:5188) the reference value is used (likelihood_thresh, umap_n_neighbors,
+    # umap_n_components, mlp_hidden, train_frac).  CUBE-specific parameters
+    # (V2 multi-scale/angular features, umap_min_dist, the HDBSCAN sweep, the
+    # post-hoc HMM) are intentional extensions — see the run() [AUDIT] block,
+    # which reports them separately rather than claiming exact faithfulness.
+    # Only min_epoch_dur_s / max_epoch_dur_s are intended as primary user inputs.
+    # This is the canonical default set; the GUI (cube.py) derives from it.
     DEFAULTS = dict(
         likelihood_thresh     = 0.3,    # DLC confidence threshold (pub. default)
+        max_interp_gap_sec    = 0.5,    # occlusions longer than this are held
+                                        # flat, not ramped (0 = legacy interp)
+        feature_bad_bp_thresh = 0.40,   # drop bodyparts whose mean bad-frame
+                                        # fraction (< likelihood_thresh) across
+                                        # all sessions meets or exceeds this
+                                        # value.  0 = disabled.  Single-camera
+                                        # rigs typically occlude back limbs 40-
+                                        # 70% of the time; excluding those keeps
+                                        # the feature space clean and prevents
+                                        # HDBSCAN noise inflation.
+        feature_dedup_jitter  = 1e-4,   # tiny Gaussian noise added to the UMAP
+                                        # training subsample (raw feature units)
+                                        # BEFORE standardisation.  Breaks any
+                                        # exact-duplicate feature vectors so
+                                        # HDBSCAN's mutual-reachability graph
+                                        # stays non-degenerate.
+                                        # 1e-4 raw units → ~2e-6 post-scaling
+                                        # for typical distance features — fully
+                                        # imperceptible to cluster geometry.
+        flat_held_bp_frac_thresh = 0.5, # fraction of kept bodyparts that must be
+                                        # simultaneously flat-held in a 100 ms bin
+                                        # before that bin is excluded from UMAP /
+                                        # HDBSCAN training.  0.5 = majority occlusion
+                                        # (whole-animal dropout).  Set to 0.0 to
+                                        # disable exclusion entirely.  Single-camera
+                                        # recordings with natural individual-bodypart
+                                        # occlusion rarely exceed 0.15–0.25, so the
+                                        # 0.5 default leaves those bins in training.
+                                        # 0 = disabled.
         boxcar_win_sec        = 0.07,   # 70 ms boxcar smoothing (pub. default)
         train_frac            = 0.3,    # fraction of bins for UMAP when N > threshold
         umap_full_thresh      = 10_000, # use full data for UMAP when N <= this
-        umap_n_neighbors      = 60,     # UMAP k-nearest neighbours (pub. default)
+        umap_n_neighbors      = 0,      # 0 = auto (scales with recording length); >0 = fixed
         umap_n_components     = 3,      # 3-D UMAP embedding (pub. default)
-        umap_min_dist         = 0.1,    # UMAP min_dist (pub. default)
+        umap_min_dist         = 0.1,    # UMAP/B-SOiD convention. (<0.05 packs points so
+                                        # tightly that HDBSCAN's DBCV becomes non-finite —
+                                        # see the degenerate-DBCV fallback in run_hdbscan.
+                                        # compat_mode="legacy_v2" restores the old 0.0.)
         umap_random_state     = 42,     # reproducibility seed
         hdbscan_metric        = "euclidean",  # (pub. default)
         hdbscan_method        = "eom",        # excess-of-mass (pub. default)
         mlp_hidden            = "100,50",     # 2-layer MLP (pub. default)
         mlp_max_iter          = 1000,
+        mlp_confidence_thresh = 0.0,    # 0 = always assign; >0 = low-confidence
+                                        # bins become -1 (unclassified) at inference
         cv_folds              = 5,
         # ── HDBSCAN options ───────────────────────────────────────────────────
         hdbscan_methods_to_try = "eom,leaf",  # both tried; selection logic picks best
         # ── Cluster count guidance ────────────────────────────────────────────
         target_n_clusters     = 0,    # 0 = auto; >0 = user-requested cluster count
-        preferred_clusters_lo = 8,    # auto-mode: prefer cluster count ≥ this
+        preferred_clusters_lo = 12,   # auto-mode: prefer cluster count ≥ this
         preferred_clusters_hi = 30,   # auto-mode: prefer cluster count ≤ this
+        # ── Rare-cluster pruning ──────────────────────────────────────────────
+        # Clusters whose share of total analysis time is below this threshold
+        # are merged into noise before MLP training.  Prevents fragment clusters
+        # driven by a handful of frames from polluting the behaviour space.
+        # Expressed as a percentage of total bins (0.2 = 0.2 %).  Set to 0 to disable.
+        min_cluster_freq      = 0.2,
+        # ── HDBSCAN sweep tuning ──────────────────────────────────────────────
+        # hdbscan_pct_lo : lower bound for the min_cluster_size sweep, in units
+        #   of 0.1%-of-bins.  0 = auto (≥ 0.2% of bins).  Increase to 5 to restore
+        #   the original 0.5%-of-bins floor if too many noise-clusters appear.
+        # hdbscan_pct_hi : upper bound (5.0% of bins).  Rarely needs adjustment.
+        # hdbscan_dbcv_thresh : candidates must have DBCV ≥ this fraction of the
+        #   best observed DBCV.  Lower = more cluster-diversity tolerated (0.65),
+        #   higher = stricter quality gate (0.75 was the original hardcoded value).
+        # hdbscan_diversity_bonus : weight added to DBCV when ranking solutions that
+        #   have heterogeneous cluster sizes.  0.10 gives a 10% bonus per unit of
+        #   size CV, rewarding solutions that include both brief and sustained clusters.
+        hdbscan_pct_lo          = 0,    # 0 = auto; >0 overrides (0.1%-of-bins units)
+        hdbscan_pct_hi          = 50,   # 5.0% of bins
+        hdbscan_dbcv_thresh     = 0.65, # DBCV fraction — was hardcoded 0.75
+        hdbscan_diversity_bonus = 0.10, # cluster-size CV reward weight
         # ── Feature options ───────────────────────────────────────────────────
-        body_normalise        = True,   # normalise by nose-to-tailbase length
+        body_normalise        = False,  # normalise by nose-to-tailbase length
         pca_pre_reduce        = "auto", # auto/on/off — reduce dims before UMAP
         # ── Primary user inputs (bout duration filter) ────────────────────────
         min_epoch_dur_s       = 0.0,    # minimum cluster bout duration (seconds)
@@ -2791,6 +4124,8 @@ class BSoidEngine:
         # ── Output options ────────────────────────────────────────────────────
         output_fps            = 15,
         max_clips_per_cluster = 3,
+        umap_evolution_n      = 1,      # side-by-side UMAP-evolution videos to
+                                        # auto-export after clustering (0 = off)
         save_plots            = True,
         save_videos           = True,
         save_example_clips    = True,
@@ -2800,9 +4135,36 @@ class BSoidEngine:
         plot_theme            = "dark",   # "dark" or "light"
         # ── HMM post-hoc smoothing ────────────────────────────────────────────
         hmm_enabled           = True,    # wrap MLP output with Multinomial HMM
-        hmm_n_states          = None,    # None → n_clusters (smoothing-only mode)
+        hmm_n_states          = 0,       # 0/None → n_clusters (smoothing-only mode)
         hmm_n_iter            = 100,     # Baum-Welch EM iterations
         hmm_min_prob          = 0.05,    # min edge probability in syntax network plot
+        # ── Reproducibility / methodology (v2.1) ──────────────────────────────
+        # compat_mode: "current" uses the v2.1 corrected behaviour; "legacy_v2"
+        #   restores pre-2.1 numeric defaults (see _LEGACY_V2_DEFAULTS) so an old
+        #   run can be reproduced exactly.  Only keys the user did NOT pass
+        #   explicitly are reverted.
+        compat_mode           = "current",
+        # hdbscan_mcs_anchor: "embedding" sizes min_cluster_size against the
+        #   points actually clustered (correct when UMAP runs on a subsample);
+        #   "full" anchors against the full bin count (pre-2.1 behaviour).
+        hdbscan_mcs_anchor    = "embedding",
+        # angular_fallback: when no spine landmarks match by keyword, True uses
+        #   evenly-spaced bodypart indices (pre-2.1; can yield meaningless angles),
+        #   False skips the angular block entirely (v2.1 default).
+        angular_fallback      = False,
+        # seed_sweep_n: if >0, re-run UMAP+HDBSCAN over this many random seeds to
+        #   assess cluster-count / partition stability (plots cluster_stability.png).
+        #   0 = off (no extra runtime).
+        seed_sweep_n          = 0,
+    )
+
+    # Pre-2.1 numeric defaults, restored when cfg["compat_mode"] == "legacy_v2"
+    # for keys the caller did not set explicitly.  Keep in sync with the
+    # corrected DEFAULTS above.
+    _LEGACY_V2_DEFAULTS = dict(
+        umap_min_dist         = 0.0,
+        hdbscan_mcs_anchor    = "full",
+        angular_fallback      = True,
     )
 
     def __init__(self, csv_folder, video_folder=None,
@@ -2832,6 +4194,13 @@ class BSoidEngine:
         self._prog        = progress_cb or (lambda c, t: None)
         self._stage       = stage_cb   or (lambda s, d="": None)
         self._cfg         = {**self.DEFAULTS, **(cfg or {})}
+        # Reproducibility: in legacy mode, revert v2.1 numeric changes for any
+        # key the caller did not pass explicitly (explicit overrides win).
+        if self._cfg.get("compat_mode") == "legacy_v2":
+            _user_keys = set((cfg or {}).keys())
+            for _k, _v in self._LEGACY_V2_DEFAULTS.items():
+                if _k not in _user_keys:
+                    self._cfg[_k] = _v
 
         # sub-dirs
         self._out_bouts  = self.output_dir / "bout_lengths"
@@ -2853,25 +4222,61 @@ class BSoidEngine:
         self._log(f"  CUBE Engine  v{VERSION}")
         self._log("=" * 64)
 
-        # ── Faithfulness audit: log publication-matched parameters ────────────
-        self._log("\n[AUDIT] Publication parameter verification"
-                  " (Hsu & Bhatt et al., 2021 PLOS Comput. Biol.)")
-        self._log(f"  likelihood_thresh : {self._cfg['likelihood_thresh']}  "
-                  "(pub: 0.3)")
-        self._log(f"  boxcar_win_sec    : {self._cfg['boxcar_win_sec']}  "
-                  "(pub: 0.07 s)")
-        self._log(f"  umap_n_neighbors  : {self._cfg['umap_n_neighbors']}  "
-                  "(pub: 60)")
-        self._log(f"  umap_n_components : {self._cfg['umap_n_components']}  "
-                  "(pub: 3)")
-        self._log(f"  umap_min_dist     : {self._cfg['umap_min_dist']}  "
-                  "(pub: 0.1)")
-        self._log(f"  hdbscan_sweep     : 0.6 %–2.0 % of N  (pub: sweep)")
-        self._log(f"  mlp_hidden        : {self._cfg['mlp_hidden']}  "
-                  "(pub: 100,50)")
-        self._log(f"  train_frac        : {self._cfg['train_frac']}  "
-                  "(pub: 0.3)")
-        _bn  = self._cfg.get("body_normalise", True)
+        # ── Faithfulness audit: VERIFY against published reference values ──────
+        # Each entry: cfg_key -> (published_value, comparator).  The audit
+        # actively compares the live cfg to the reference and flags any
+        # deviation, instead of printing a hardcoded "(pub: …)" string that
+        # could assert faithfulness that isn't there.
+        self._log("\n[AUDIT] B-SOiD reference parameter verification"
+                  " (Hsu A.I. & Yttri E.A., 2021, Nat. Commun. 12:5188)")
+        # B-SOiD reference values for the parameters CUBE keeps faithful to the
+        # original pipeline.  CUBE-specific parameters (V2 multi-scale features,
+        # adaptive n_neighbors, umap_min_dist, the HDBSCAN sweep strategy, the
+        # post-hoc HMM) are intentional extensions and are NOT audited here —
+        # they are reported separately below so faithfulness is never overstated.
+        _PUB_REF = {
+            "likelihood_thresh": 0.3,
+            "umap_n_neighbors":  60,
+            "umap_n_components": 3,
+            "mlp_hidden":        "100,50",
+            "train_frac":        0.3,
+        }
+        _n_mismatch = 0
+        for _k, _pub in _PUB_REF.items():
+            _val = self._cfg.get(_k)
+            # n_neighbors == 0 means "auto" (resolved later from recording length)
+            if _k == "umap_n_neighbors" and int(_val or 0) <= 0:
+                self._log(f"  {_k:18s}: auto  (pub: {_pub}; resolved from "
+                          f"recording length below)")
+                continue
+            try:
+                _match = (abs(float(_val) - float(_pub)) < 1e-9
+                          if isinstance(_pub, (int, float))
+                          else str(_val) == str(_pub))
+            except (TypeError, ValueError):
+                _match = str(_val) == str(_pub)
+            _flag = "OK " if _match else "!! "
+            if not _match:
+                _n_mismatch += 1
+            self._log(f"  {_flag}{_k:18s}: {_val}  (pub: {_pub})")
+        if _n_mismatch:
+            self._log(f"  [AUDIT] {_n_mismatch} reference parameter(s) DEVIATE "
+                      f"(marked !! above) — intentional overrides are fine but "
+                      f"should be reported in methods.")
+        else:
+            self._log("  [AUDIT] All audited B-SOiD reference parameters match.")
+        # CUBE-specific parameters — reported, not audited against B-SOiD.
+        self._log("  [AUDIT] CUBE-specific (not in the B-SOiD reference): "
+                  "V2 multi-scale features, angular features, post-hoc HMM.")
+        self._log(f"    umap_min_dist     : {self._cfg.get('umap_min_dist')}  "
+                  f"(CUBE-tuned; <0.05 can make HDBSCAN DBCV non-finite)")
+        self._log(f"    hdbscan_mcs_anchor: {self._cfg.get('hdbscan_mcs_anchor')}"
+                  f"  |  sweep {self._cfg.get('hdbscan_pct_lo') or 'auto'}–"
+                  f"{self._cfg.get('hdbscan_pct_hi')} (0.1%-of-N units), "
+                  f"min_samples=max(5, mcs//5)")
+        self._log(f"    analysis_version  : {ANALYSIS_VERSION}  "
+                  f"(compat_mode={self._cfg.get('compat_mode', 'current')})")
+        _bn  = self._cfg.get("body_normalise", False)
         self._log(f"  Feature engine    : V2  (fps-adaptive scales, "
                   f"body_normalise={_bn}, angular)")
 
@@ -2922,19 +4327,46 @@ class BSoidEngine:
         # 2. Load & smooth
         self._log("\n[2/7]  Loading & smoothing...")
         self._stage("2/7 — Loading DLC files", f"0/{len(pairs)}")
-        all_xy, all_names, all_fps_list, all_bps = [], [], [], []
-        for i, (fp, _) in enumerate(pairs):
+        all_xy, all_names, all_fps_list, all_bps, all_vpaths = [], [], [], [], []
+        all_groups: list = []   # input folder each session came from (for export coverage)
+        all_bp_bad_fracs: dict = {}  # bodypart -> list of per-session bad-frame fracs
+        all_flat_held: list = []     # per-session per-bodypart flat-held masks (list[list[np.ndarray]])
+
+        def _group_key(_fp: Path) -> str:
+            # Which uploaded csv folder does this DLC file belong to?  Used so the
+            # UMAP-evolution export can guarantee at least one video per folder.
+            try:
+                _fpr = _fp.resolve()
+                for _cd in self._csv_folders:
+                    _cdr = Path(_cd).resolve()
+                    if _cdr == _fpr or _cdr in _fpr.parents:
+                        return str(_cdr)
+            except Exception:
+                pass
+            return str(_fp.parent)
+
+        for i, (fp, _vp) in enumerate(pairs):
             self._log(f"  [{i+1}/{len(pairs)}]  {fp.name}")
             self._stage("2/7 — Loading DLC files", f"{i+1}/{len(pairs)}: {fp.name}")
             try:
-                xy, bps, fps_hint = load_dlc_file(
-                    fp, self._cfg["likelihood_thresh"])
+                _gap_fps = float(self._fps_arg or 30.0)
+                _max_gap = int(round(_gap_fps * float(
+                    self._cfg.get("max_interp_gap_sec", 0.5))))
+                xy, bps, fps_hint, ll_fracs, _flat_held = load_dlc_file(
+                    fp, self._cfg["likelihood_thresh"],
+                    max_interp_gap_frames=_max_gap, log_fn=self._log,
+                    return_quality=True)
+                for _bp, _frac in ll_fracs.items():
+                    all_bp_bad_fracs.setdefault(_bp, []).append(_frac)
                 fps = fps_hint or self._fps_arg or 30.0
                 xy  = smooth_boxcar(xy, fps, self._cfg["boxcar_win_sec"])
                 all_xy.append(xy)
                 all_names.append(fp.stem)
                 all_fps_list.append(float(fps))
                 all_bps.append(bps)
+                all_vpaths.append(str(_vp) if _vp else None)
+                all_groups.append(_group_key(fp))
+                all_flat_held.append(_flat_held)
             except Exception:
                 self._log(f"  [WARN] Skipping {fp.name}:\n"
                           f"  {traceback.format_exc()}")
@@ -2954,6 +4386,30 @@ class BSoidEngine:
             self._log(f"  [INFO] Bodypart intersection: {len(bps_ref)} common "
                       f"bodyparts across all files ({n_dropped} dropped from "
                       f"reference set that were absent in some files).")
+            # Identify which file(s) caused the largest drop so the user knows
+            # which group's tracking limited the shared feature space.
+            _worst_n = -1
+            _worst_nm = None
+            for _nm_k, _bps_k in zip(all_names, all_bps):
+                _lost = sum(1 for bp in all_bps[0] if bp not in set(_bps_k))
+                if _lost > _worst_n:
+                    _worst_n, _worst_nm = _lost, _nm_k
+            if _worst_nm is not None and _worst_n > 0:
+                self._log(f"  [INFO] Smallest-keypoint session: '{_worst_nm}' "
+                          f"(missing {_worst_n} of the reference bodyparts).")
+        # Quality gate: a tiny shared keypoint set produces an impoverished
+        # feature space (few pairwise distances) and unreliable clustering.
+        _min_keep = int(self._cfg.get("bodypart_min_keep", 6))
+        if len(bps_ref) < _min_keep:
+            self._log(f"  [VALID-WARN] Only {len(bps_ref)} bodyparts shared "
+                      f"across all sessions (< {_min_keep}). Feature space is "
+                      f"impoverished; clustering/DBCV may be unreliable. Improve "
+                      f"DLC tracking or relax the conservation policy (median "
+                      f"metric, lower min-session-fraction) in DLC & Prep "
+                      f"settings.")
+            self._stage("VALIDATION WARN",
+                        f"only {len(bps_ref)} shared bodyparts — "
+                        f"impoverished feature space")
         # Filter every xy array to the common bodypart columns
         for k, (bps_k, xy_k) in enumerate(zip(all_bps, all_xy)):
             if bps_k != bps_ref:
@@ -2964,8 +4420,37 @@ class BSoidEngine:
                         col_idx.extend([2 * j, 2 * j + 1])
                 all_xy[k] = xy_k[:, col_idx]
 
+        # Drop chronically occluded bodyparts from the feature space.
+        # At this point all_xy[k] columns are ordered by bps_ref, so we can
+        # index directly.  Bodyparts whose mean bad-frame fraction across
+        # sessions meets or exceeds feature_bad_bp_thresh are removed; they
+        # contribute flat-interpolated artefacts (identical feature vectors)
+        # that inflate HDBSCAN noise and cause DBCV to become non-finite.
+        _feat_thresh = float(self._cfg.get("feature_bad_bp_thresh", 0.40))
+        if _feat_thresh > 0 and all_bp_bad_fracs:
+            _agg = {bp: float(np.mean(all_bp_bad_fracs.get(bp, [0.0])))
+                    for bp in bps_ref}
+            _drop = [bp for bp in bps_ref if _agg.get(bp, 0.0) >= _feat_thresh]
+            if _drop:
+                self._log(
+                    f"  [FEAT-DROP] {len(_drop)} bodypart(s) excluded from "
+                    f"feature extraction (mean bad-frame frac >= "
+                    f"{_feat_thresh*100:.0f}% across sessions): {_drop}")
+                _keep_pos = [i for i, bp in enumerate(bps_ref)
+                             if bp not in set(_drop)]
+                bps_ref = [bps_ref[i] for i in _keep_pos]
+                _col_idx = []
+                for i in _keep_pos:
+                    _col_idx.extend([2 * i, 2 * i + 1])
+                for k in range(len(all_xy)):
+                    all_xy[k] = all_xy[k][:, _col_idx]
+
         fps = float(pd.Series(all_fps_list).mode()[0])
         self._log(f"  FPS = {fps}  |  bodyparts = {len(bps_ref)}")
+
+        # all_flat_held stays as per-bp lists (one bool array per bodypart per
+        # session) — the bin-mask block below uses them directly with the
+        # fraction threshold so dropped bodyparts cannot inflate exclusion counts.
 
         if self._cfg["save_plots"]:
             try:
@@ -2976,7 +4461,19 @@ class BSoidEngine:
                           f"{traceback.format_exc()}")
 
         # 3. Features (V2 — multi-scale, body-normalised, angular)
-        _body_norm = bool(self._cfg.get("body_normalise", True))
+        _body_norm = bool(self._cfg.get("body_normalise", False))
+        # v2.1: skip the angular block when no spine landmarks match by keyword
+        # (legacy mode keeps the evenly-spaced fallback).  Used for every feature
+        # call in this run so training and inference stay dimensionally aligned.
+        _ang_fb = bool(self._cfg.get("angular_fallback", True))
+        # If body normalisation is requested but no nose/tail spine landmarks are
+        # present, extract_features_v2 silently skips it — warn so the user knows
+        # spatial features stay in raw pixels (scale-variant across sessions).
+        if _body_norm and _find_spine_indices(bps_ref) == (None, None):
+            self._log("  [VALID-WARN] body_normalise is ON but no head/tail spine "
+                      "landmarks were found among the shared bodyparts — "
+                      "normalisation will be skipped and spatial features remain "
+                      "in raw pixels (sensitive to camera distance / body size).")
         _scale_desc = ("50/100/200 ms" if fps >= 60 else "100/200 ms")
         self._log(f"\n[3/7]  Extracting V2 features  "
                   f"({_scale_desc} + angular, body_normalise={_body_norm})...")
@@ -2985,7 +4482,8 @@ class BSoidEngine:
         for i, (xy, name) in enumerate(zip(all_xy, all_names)):
             self._stage("3/7 — Extracting V2 features",
                         f"{i+1}/{len(all_xy)}: {name}")
-            f = extract_features_v2(xy, fps, bps_ref, body_normalise=_body_norm)
+            f = extract_features_v2(xy, fps, bps_ref, body_normalise=_body_norm,
+                                    angular_fallback=_ang_fb)
             all_feats.append(f)
             self._log(f"  {name}: {f.shape[0]} features x {f.shape[1]} bins")
             self._prog(i + 1, len(all_xy))
@@ -3010,24 +4508,95 @@ class BSoidEngine:
         n_bins    = feats_cat.shape[1]
         rng       = np.random.default_rng(int(self._cfg["umap_random_state"]))
 
+        # Build a per-bin boolean mask for bins where a MAJORITY of kept bodyparts
+        # are simultaneously flat-held — indicating whole-animal dropout rather than
+        # normal single-camera occlusion of individual limbs.  Only those bins are
+        # excluded from UMAP/HDBSCAN training; the MLP still infers labels for them
+        # at Step 7.  Natural single-camera occlusion (1–4 of 21 bodyparts, ~15–20%
+        # fraction) falls well below the 0.5 default threshold and is left in training.
+        _win100 = max(1, int(round(fps / 10)))
+        _flat_held_bp_frac = float(self._cfg.get("flat_held_bp_frac_thresh", 0.5))
+        _n_bps_ref = max(1, len(bps_ref))
+        _flat_bin_masks: list = []
+        for _k, _per_bp in enumerate(all_flat_held):
+            _bps_k = all_bps[_k]
+            _nb_k  = all_feats[_k].shape[1]
+            if _nb_k == 0:
+                _flat_bin_masks.append(np.array([], dtype=bool))
+                continue
+            _need = _nb_k * _win100
+            _flat_count = np.zeros(_nb_k, dtype=float)
+            for _bp in bps_ref:
+                try:
+                    _bp_idx = _bps_k.index(_bp)
+                    if _bp_idx < len(_per_bp):
+                        _bp_mask = _per_bp[_bp_idx]
+                        _bp_arr  = (_bp_mask[:_need] if len(_bp_mask) >= _need
+                                    else np.pad(_bp_mask, (0, _need - len(_bp_mask))))
+                        _flat_count += _bp_arr.reshape(_nb_k, _win100).any(axis=1).astype(float)
+                except ValueError:
+                    pass
+            _flat_bin_masks.append((_flat_count / _n_bps_ref) >= _flat_held_bp_frac)
+        flat_held_bin_mask = (np.concatenate(_flat_bin_masks)
+                              if _flat_bin_masks else np.zeros(n_bins, dtype=bool))
+        n_flat = int(flat_held_bin_mask.sum())
+        n_good = n_bins - n_flat
+        if n_flat > 0 and n_good < 10:
+            self._log(f"  [WARN] Only {n_good} good bins after flat-held exclusion "
+                      f"— disabling exclusion for this run.")
+            flat_held_bin_mask = np.zeros(n_bins, dtype=bool)
+            n_flat, n_good = 0, n_bins
+        feats_good = feats_cat[:, ~flat_held_bin_mask] if n_flat > 0 else feats_cat
+        if n_flat > 0:
+            self._log(f"  [OCCLUSION] {n_flat}/{n_bins} bins "
+                      f"({100 * n_flat / n_bins:.1f}%) with ≥{100*_flat_held_bp_frac:.0f}% "
+                      f"bodyparts simultaneously flat-held — excluded from UMAP/"
+                      f"HDBSCAN training; MLP infers labels for these at Step 7.")
+
+        # Record which contiguous slice of the full feature matrix belongs to
+        # each session so the UMAP evolution video export can slice the saved
+        # umap_embedding.npy to get session-specific 3-D coordinates.
+        # Format: { "session_name": [start, end, "/path/to/video_or_null"], ... }
+        try:
+            _sbr: dict = {}
+            _off = 0
+            for _name, _feat, _vpath in zip(all_names, all_feats, all_vpaths):
+                _nb = _feat.shape[1]
+                _sbr[_name] = [_off, _off + _nb, _vpath]
+                _off += _nb
+            _sbr["_total_bins"] = n_bins
+            (self._out_model / "session_bin_ranges.json").write_text(
+                json.dumps(_sbr, indent=2))
+        except Exception:
+            pass
+
         # Use the full dataset when it is small enough (avoids UMAP over-smoothing
         # caused by a large n_neighbors/N_sample ratio); subsample only for large
         # recordings where UMAP runtime becomes a bottleneck.
         umap_full_thresh = int(self._cfg.get("umap_full_thresh", 10_000))
-        if n_bins <= umap_full_thresh:
-            n_samp    = n_bins
-            feats_sub = feats_cat
+        if n_good <= umap_full_thresh:
+            n_samp    = n_good
+            feats_sub = feats_good
         else:
-            n_samp    = max(1000, int(n_bins * float(self._cfg["train_frac"])))
-            idx       = rng.choice(n_bins, n_samp, replace=False)
-            feats_sub = feats_cat[:, idx]
+            n_samp    = max(1000, int(n_good * float(self._cfg["train_frac"])))
+            idx       = rng.choice(n_good, n_samp, replace=False)
+            feats_sub = feats_good[:, idx]
 
         self._log(f"  Total bins: {n_bins}  -> UMAP sample: {n_samp} "
                   f"({100 * n_samp / n_bins:.0f} %)")
 
+        # Tiny per-sample jitter before standardisation breaks any remaining
+        # exact-duplicate feature vectors among the good (non-flat-held) bins.
+        _feat_jitter = float(self._cfg.get("feature_dedup_jitter", 1e-4))
+        if _feat_jitter > 0:
+            feats_sub = feats_sub + rng.normal(0, _feat_jitter, feats_sub.shape)
+
         from sklearn.preprocessing import StandardScaler
         scaler   = StandardScaler()
         feats_sc = scaler.fit_transform(feats_sub.T).T   # (n_feat, n_samp)
+        # Keep the pre-PCA standardised features so UMAP trustworthiness is
+        # measured against the actual feature space, not the PCA-reduced one.
+        feats_sc_prepca = feats_sc
 
         # Optional PCA pre-reduction.  Auto-triggers when n_features >= n_samples/5
         # to keep the nearest-neighbour graph reliable for UMAP.
@@ -3056,6 +4625,27 @@ class BSoidEngine:
                             "sample/feature ratio < 2 — recording may be too short")
 
         # 4. UMAP
+        # Adaptive n_neighbors: publication default 60 is calibrated to ~1200-bin
+        # (2-min) sessions. n_bins is fps-independent (both 30fps and 60fps 2-min
+        # videos give ~1200 bins because win100 = fps/10).
+        # Formula: clip(avg_session_bins / 20, 15, 90)
+        #   ~600 bins/sess  (1 min) → 30   fine-grained local structure
+        #   ~1200 bins/sess (2 min) → 60   matches publication default
+        #   ~1800 bins/sess (3 min) → 90   smoother manifold for longer recordings
+        #   >1800 bins/sess         → 90   capped; higher values give diminishing returns
+        # Using per-session average rather than total bins means the value stays
+        # calibrated to recording length regardless of how many sessions are pooled.
+        # User can override by setting umap_n_neighbors > 0 in cfg.
+        _nn_cfg = int(self._cfg.get("umap_n_neighbors", 0))
+        if _nn_cfg <= 0:
+            _n_sessions  = max(1, len(all_feats))
+            _avg_bins    = n_samp // _n_sessions   # use training sample, not total bins
+            _nn_adaptive = max(15, min(90, _avg_bins // 20))
+            self._cfg["umap_n_neighbors"] = _nn_adaptive
+            self._log(f"  [UMAP] n_neighbors auto-set to {_nn_adaptive} "
+                      f"(avg_training_bins={_avg_bins}, {_n_sessions} session(s), "
+                      f"formula=clip(avg_bins/20, 15, 90); "
+                      f"set umap_n_neighbors>0 to override)")
         self._log("\n[4/7]  Running UMAP  "
                   f"(n_components={self._cfg['umap_n_components']}, "
                   f"n_neighbors={self._cfg['umap_n_neighbors']})...")
@@ -3067,10 +4657,37 @@ class BSoidEngine:
         self._log(f"  Embedding: {embedding.shape}")
         self._stage("4/7 — UMAP done", f"embedding shape {embedding.shape}")
 
+        # Build the full-size embedding (n_bins rows) for umap_embedding.npy so
+        # that session_bin_ranges.json slice indices remain valid.  Flat-held bins
+        # are embedded via umap_model.transform() — they were excluded from UMAP
+        # training but can still be projected for visualisation.
+        try:
+            if n_flat > 0:
+                _feats_flat_sc = scaler.transform(feats_cat[:, flat_held_bin_mask].T)
+                if pca_model is not None:
+                    _feats_flat_sc = pca_model.transform(_feats_flat_sc)
+                _emb_flat = umap_model.transform(_feats_flat_sc)
+                embedding_save = np.empty((n_bins, embedding.shape[1]), dtype=float)
+                if n_samp == n_good:
+                    embedding_save[~flat_held_bin_mask] = embedding
+                else:
+                    _feats_good_sc = scaler.transform(feats_good.T)
+                    if pca_model is not None:
+                        _feats_good_sc = pca_model.transform(_feats_good_sc)
+                    embedding_save[~flat_held_bin_mask] = umap_model.transform(
+                        _feats_good_sc)
+                embedding_save[flat_held_bin_mask] = _emb_flat
+            else:
+                embedding_save = embedding
+        except Exception:
+            self._log(f"  [WARN] Could not build full embedding for save: "
+                      f"{traceback.format_exc()}")
+            embedding_save = embedding
+
         # Validation gate 3: UMAP trustworthiness
         try:
             _validation["umap_trustworthiness"] = validate_umap_trustworthiness(
-                feats_sc.T, embedding)
+                feats_sc_prepca.T, embedding)
             for w in _validation["umap_trustworthiness"]["warnings"]:
                 self._log(f"  [VALID-WARN] {w}")
         except Exception as e:
@@ -3080,17 +4697,61 @@ class BSoidEngine:
         self._log("\n[5/7]  HDBSCAN clustering  "
                   "(adaptive sweep, DBCV criterion)...")
         self._stage("5/7 — HDBSCAN clustering",
-                    f"sweeping min_cluster_size over {n_bins} bins…")
-        hdb_clf, hdb_labels, hdb_score = run_hdbscan(
-            embedding, self._cfg, n_total=n_bins)
+                    f"sweeping min_cluster_size over {n_samp} bins…")
+        hdb_clf, hdb_labels, hdb_score, hdb_score_label = run_hdbscan(
+            embedding, self._cfg, n_total=n_samp, log_fn=self._log)
         n_cl      = len(set(hdb_labels[hdb_labels >= 0]))
         noise     = (hdb_labels < 0).sum()
         noise_pct = 100 * noise / max(1, len(hdb_labels))
         self._log(f"  {n_cl} clusters, {noise} noise points "
                   f"({noise_pct:.1f} %), "
-                  f"DBCV={hdb_score:.3f}")
+                  f"{hdb_score_label}={hdb_score:.3f}")
         self._stage("5/7 — HDBSCAN done",
-                    f"{n_cl} clusters · {noise_pct:.0f}% noise · DBCV={hdb_score:.3f}")
+                    f"{n_cl} clusters · {noise_pct:.0f}% noise · {hdb_score_label}={hdb_score:.3f}")
+
+        # ── Rare-cluster pruning ──────────────────────────────────────────────
+        # Drop any cluster whose fraction of total bins is below min_cluster_freq.
+        # Such clusters represent behaviours so infrequent relative to the whole
+        # recording session that they are likely noise fragments, not true states.
+        # Pruned labels are reassigned to noise (-1) and the remaining cluster IDs
+        # are renumbered contiguously before MLP training.
+        # min_cluster_freq is stored as a percentage (e.g. 0.5 means 0.5 %)
+        _min_freq_pct = float(self._cfg.get("min_cluster_freq", 0.5))
+        _min_freq     = _min_freq_pct / 100.0
+        # _hdb_remap: maps original HDBSCAN cluster IDs → renumbered IDs used in
+        # hdb_labels (and therefore in the trained MLP).  Needed to keep the
+        # fallback approximate_predict path in sync when pruning has occurred.
+        _hdb_remap: dict = {}   # {orig_id: new_id}
+        if _min_freq > 0 and n_cl >= 2:
+            _pruned_ids = []
+            _unique_ids = sorted(set(hdb_labels[hdb_labels >= 0]))
+            for _cid in _unique_ids:
+                _frac = (hdb_labels == _cid).sum() / max(1, n_samp)
+                if _frac < _min_freq:
+                    _pruned_ids.append(_cid)
+            if _pruned_ids:
+                for _cid in _pruned_ids:
+                    hdb_labels[hdb_labels == _cid] = -1
+                # Renumber remaining clusters 0, 1, 2, …
+                _remaining = sorted(set(hdb_labels[hdb_labels >= 0]))
+                _remap = {old: new for new, old in enumerate(_remaining)}
+                _new_labels = hdb_labels.copy()
+                for old, new in _remap.items():
+                    _new_labels[hdb_labels == old] = new
+                hdb_labels = _new_labels
+                n_cl = len(_remaining)
+                noise = (hdb_labels < 0).sum()
+                noise_pct = 100 * noise / max(1, len(hdb_labels))
+                self._log(
+                    f"  [rare-cluster prune] Removed {len(_pruned_ids)} cluster(s) "
+                    f"below {_min_freq_pct:.2f}% of total bins "
+                    f"({', '.join(f'#{i}' for i in _pruned_ids)}) → "
+                    f"{n_cl} clusters remain, {noise_pct:.1f}% noise"
+                )
+                self._stage("5/7 — HDBSCAN done",
+                            f"{n_cl} clusters (after rare-cluster prune) · "
+                            f"{noise_pct:.0f}% noise")
+                _hdb_remap = dict(_remap)
 
         # Validation gate 4: clustering quality (silhouette)
         try:
@@ -3110,18 +4771,62 @@ class BSoidEngine:
         except Exception as e:
             self._log(f"  [VALID] Clustering validation failed: {e}")
 
-        if self._cfg["save_plots"]:
+        # ── Cluster-stability seed sweep (optional) ───────────────────────────
+        # Re-run UMAP+HDBSCAN over several seeds to measure how reproducible the
+        # PARTITION is (the internal gates only measure cluster tightness).
+        _n_sweep = int(self._cfg.get("seed_sweep_n", 0) or 0)
+        if _n_sweep >= 2:
             try:
-                plot_umap(embedding, hdb_labels,
-                          self._out_plots / "umap_embedding.png")
+                self._log(f"\n[STABILITY]  Seed sweep ({_n_sweep} seeds) — "
+                          f"assessing cluster-count / partition stability...")
+                self._stage("Cluster-stability seed sweep",
+                            f"{_n_sweep} seeds — re-running UMAP+HDBSCAN")
+                _sweep = seed_sweep_stability(
+                    feats_sc.T, self._cfg, _n_sweep, log_fn=self._log)
+                if _sweep:
+                    _validation["cluster_stability"] = {
+                        "stage": "cluster_stability", "status":
+                            "pass" if _sweep["mean_ari"] >= 0.7 else "warn",
+                        "mean_ari": round(_sweep["mean_ari"], 4),
+                        "cluster_counts": _sweep["counts"],
+                        "warnings": ([] if _sweep["mean_ari"] >= 0.7 else
+                                     [f"Mean ARI {_sweep['mean_ari']:.3f} < 0.7: "
+                                      "cluster partition is seed-sensitive."]),
+                    }
+                    self._log(f"  Mean pairwise ARI = {_sweep['mean_ari']:.3f} "
+                              f"(cluster counts {min(_sweep['counts'])}–"
+                              f"{max(_sweep['counts'])})")
+                    if self._cfg["save_plots"]:
+                        plot_cluster_stability(
+                            _sweep, self._out_plots / "cluster_stability.png")
             except Exception:
-                pass
+                self._log(f"  [WARN] seed sweep: {traceback.format_exc()}")
+
+        # 2D and 3D UMAP plots are generated after inference (below) so that
+        # they can be filtered to show only clusters actually predicted by the
+        # MLP on these sessions — keeping the cluster count consistent across
+        # umap_embedding.png, umap_3d.*, and dwell_time_distributions.png.
 
         # Save UMAP embedding + cluster labels as numpy arrays so cube_analyser
         # can display before/after UMAP views when the user recombines clusters.
+        # embedding_save is full-size (n_bins rows); flat-held bins projected via
+        # transform() so session_bin_ranges.json slice indices remain valid.
+        # hdb_labels_all expands hdb_labels to n_bins with -1 for flat-held bins.
+        if n_flat > 0:
+            hdb_labels_all = np.full(n_bins, -1, dtype=int)
+            if n_samp == n_good:
+                # All good bins were used for UMAP/HDBSCAN training.
+                hdb_labels_all[~flat_held_bin_mask] = hdb_labels
+            else:
+                # Subsampling occurred: map each label back to its original bin position
+                # so umap_labels.npy stays the same length as umap_embedding.npy (n_bins).
+                _good_positions = np.where(~flat_held_bin_mask)[0]
+                hdb_labels_all[_good_positions[idx]] = hdb_labels
+        else:
+            hdb_labels_all = hdb_labels
         try:
-            np.save(str(self._out_model / "umap_embedding.npy"), embedding)
-            np.save(str(self._out_model / "umap_labels.npy"),    hdb_labels)
+            np.save(str(self._out_model / "umap_embedding.npy"), embedding_save)
+            np.save(str(self._out_model / "umap_labels.npy"),    hdb_labels_all)
         except Exception:
             pass
 
@@ -3134,6 +4839,11 @@ class BSoidEngine:
         if mlp_clf is not None:
             self._log(f"  CV accuracy: {cv_scores.mean():.3f} "
                       f"+/- {cv_scores.std():.3f}")
+            self._log("  [NOTE] CV accuracy measures how separable the HDBSCAN "
+                      "clusters are in feature space (classifier self-consistency), "
+                      "NOT behavioral validity. It is computed on non-noise bins "
+                      "only; it does not validate the noise fraction or the "
+                      "biological meaning of clusters.")
             self._stage("6/7 — MLP done",
                         f"CV accuracy {cv_scores.mean():.3f} "
                         f"± {cv_scores.std():.3f}")
@@ -3179,6 +4889,8 @@ class BSoidEngine:
                 bodyparts   = bps_ref,
                 n_clusters  = int(n_cl),
                 feature_ver = "v2",
+                analysis_version = ANALYSIS_VERSION,
+                compat_mode = self._cfg.get("compat_mode", "current"),
                 created     = datetime.now().isoformat(),
             ), fh)
         self._log(f"  Model saved -> {model_path}")
@@ -3188,6 +4900,8 @@ class BSoidEngine:
                             boxcar_win_sec=self._cfg["boxcar_win_sec"],
                             n_features=int(feats_cat.shape[0]),
                             feature_version="v2",
+                            analysis_version=ANALYSIS_VERSION,
+                            compat_mode=self._cfg.get("compat_mode", "current"),
                             pca_n_components=(int(pca_model.n_components_)
                                               if pca_model is not None else None)),
                        indent=2))
@@ -3211,18 +4925,30 @@ class BSoidEngine:
                 frame_labels = predict_labels(
                     xy, umap_model, mlp_clf, scaler, file_fps,
                     bodyparts=bps_ref, body_normalise=_body_norm,
-                    pca_model=pca_model)
+                    pca_model=pca_model,
+                    min_confidence=float(self._cfg.get("mlp_confidence_thresh", 0.0)),
+                    angular_fallback=_ang_fb)
             else:
                 # Fallback: no MLP → use HDBSCAN approximate_predict on V2 feats
                 try:
                     import hdbscan as _hdb
                     f    = extract_features_v2(xy, file_fps, bps_ref,
-                                              body_normalise=_body_norm)
+                                              body_normalise=_body_norm,
+                                              angular_fallback=_ang_fb)
                     sc   = scaler.transform(f.T)
                     if pca_model is not None:
                         sc = pca_model.transform(sc)
                     emb  = umap_model.transform(sc)
                     soft, _ = _hdb.approximate_predict(hdb_clf, emb)
+                    # approximate_predict returns the original HDBSCAN cluster IDs
+                    # (before rare-cluster pruning and renumbering).  Apply the
+                    # same remap that was applied to hdb_labels so that the
+                    # fallback cluster IDs match those used in the plots.
+                    if _hdb_remap:
+                        _remapped = np.full_like(soft, -1, dtype=int)
+                        for _orig, _new in _hdb_remap.items():
+                            _remapped[soft == _orig] = _new
+                        soft = _remapped
                     win  = max(1, int(round(file_fps / 10)))
                     fl   = np.repeat(soft.astype(int), win)
                     n_f  = xy.shape[0]
@@ -3308,6 +5034,7 @@ class BSoidEngine:
                     n_clusters=int(n_cl),
                     n_states=_hmm_n_states,
                     n_iter=int(self._cfg.get("hmm_n_iter", 100)),
+                    log_fn=self._log,
                 )
                 self._log(f"  HMM trained in {time.perf_counter() - _t0:.2f} s  "
                           f"({hmm_model.n_components} states, Baum-Welch)")
@@ -3351,14 +5078,20 @@ class BSoidEngine:
             import random as _random
             _random.shuffle(_clip_tasks)
             _clips_per_cluster: dict = {}
+            _max_clips = int(self._cfg["max_clips_per_cluster"])
+            # Limit each animal to ceil(max_clips / n_animals) clips per cluster
+            # so the quota is spread across animals rather than filled by whichever
+            # animal happens to appear first in the shuffled order.
+            _max_per_call = -(_max_clips // -len(_clip_tasks))  # ceiling division
             for _vp, _ep, _fps, _aid in _clip_tasks:
                 try:
                     create_example_clips(
                         _vp, _ep, self._out_videos, _fps,
                         output_fps=int(self._cfg["output_fps"]),
-                        max_clips=int(self._cfg["max_clips_per_cluster"]),
+                        max_clips=_max_clips,
                         animal_id=_aid,
-                        clips_per_cluster=_clips_per_cluster)
+                        clips_per_cluster=_clips_per_cluster,
+                        max_per_call=_max_per_call)
                 except Exception:
                     self._log(f"  [WARN] Clips: {traceback.format_exc()}")
 
@@ -3370,6 +5103,40 @@ class BSoidEngine:
             combined.to_csv(
                 str(self.output_dir / "all_epochs_combined.csv"), index=False)
 
+        # Per-cluster kinematic signatures (interpretable descriptors for naming).
+        if all_frame_labels and all_xy:
+            try:
+                compute_cluster_kinematics(
+                    all_xy, all_frame_labels, all_fps_list, bps_ref,
+                    self.output_dir / "cluster_kinematics.csv")
+                self._log("  [PLOT] cluster_kinematics.csv saved")
+            except Exception:
+                self._log(f"  [WARN] cluster_kinematics: "
+                          f"{traceback.format_exc()}")
+
+        # ── Consistent cluster set for all downstream plots ───────────────────
+        # clusters_seen: cluster IDs actually predicted by the MLP across all
+        # sessions that also have at least one epoch surviving the duration
+        # filter.  Using this shared set for the 2-D UMAP, 3-D UMAP, and
+        # dwell-time violin ensures all three plots show the same number of
+        # clusters.
+        clusters_seen = sorted(set(
+            int(l)
+            for ep, _ in all_epochs if not ep.empty
+            for l in ep.label.unique()))
+        # hdb_labels filtered to clusters_seen — bins whose cluster was not
+        # observed in inference (or was entirely filtered by bout duration) are
+        # treated as noise so the UMAP reflects the same active cluster set as
+        # the dwell-time plot.  Fall back to all valid clusters when
+        # clusters_seen is empty (e.g. duration filter rejects every bout).
+        if clusters_seen:
+            _active_set = set(clusters_seen)
+            _hdb_labels_active = hdb_labels.copy()
+            _hdb_labels_active[~np.isin(_hdb_labels_active,
+                                        sorted(_active_set))] = -1
+        else:
+            _hdb_labels_active = hdb_labels.copy()
+
         if self._cfg["save_plots"] and all_frame_labels:
             try:
                 plot_transition_matrix(
@@ -3378,6 +5145,22 @@ class BSoidEngine:
             except Exception:
                 self._log(f"  [WARN] transition_matrix: "
                           f"{traceback.format_exc()}")
+            try:
+                plot_umap(embedding, _hdb_labels_active,
+                          self._out_plots / "umap_embedding.png")
+            except Exception:
+                self._log(f"  [WARN] umap_embedding: "
+                          f"{traceback.format_exc()}")
+            try:
+                _tmat, _cids = _tmat_from_labels(all_frame_labels)
+                plot_umap_3d_transitions(
+                    embedding, _hdb_labels_active,
+                    tmat=_tmat, cluster_ids=_cids,
+                    out_path=self._out_plots / "umap_3d.html",
+                    tag="clustering",
+                )
+            except Exception:
+                self._log(f"  [WARN] umap_3d: {traceback.format_exc()}")
 
         # ── HMM diagnostic plots ──────────────────────────────────────────────
         if self._cfg["save_plots"] and all_hmm_labels:
@@ -3450,7 +5233,7 @@ class BSoidEngine:
                 _tag0 = all_names[0] if all_names else ""
                 plot_state_space_trajectory(
                     embedding,
-                    hdb_labels,
+                    _hdb_labels_active,
                     fps,
                     self._out_plots / "state_space_projection.png",
                     _tag0)
@@ -3459,11 +5242,92 @@ class BSoidEngine:
                 self._log(f"  [WARN] state_space_projection: "
                           f"{traceback.format_exc()}")
 
-        # Auto-groups
-        clusters_seen = sorted(set(
-            int(l)
-            for ep, _ in all_epochs if not ep.empty
-            for l in ep.label.unique()))
+        # ── Auto-generate UMAP evolution videos ──────────────────────────────
+        _n_ev = int(self._cfg.get("umap_evolution_n", 1))
+        if _n_ev > 0:
+            try:
+                import random as _rnd_ev
+                import pandas as _pd_ev
+                # Group candidates by their input folder so EVERY uploaded folder
+                # gets at least one evolution video (umap_evolution_n is applied
+                # per folder, floored at 1).  Without this, a single random draw
+                # could leave some folders with no video.
+                _cand_by_group: dict = {}
+                for _ei, (_nm, _vp) in enumerate(zip(all_names, all_vpaths)):
+                    if not (_vp and Path(_vp).is_file()):
+                        continue
+                    if _ei >= len(frame_paths):
+                        continue
+                    _sbr_e = _sbr.get(_nm)
+                    if not _sbr_e:
+                        continue
+                    _sb, _se = int(_sbr_e[0]), int(_sbr_e[1])
+                    if _se > len(embedding):
+                        continue
+                    _grp = (all_groups[_ei] if _ei < len(all_groups) else "all")
+                    _cand_by_group.setdefault(_grp, []).append(
+                        (_nm, _ei, _sb, _se, Path(_vp)))
+                if _cand_by_group:
+                    _per_group = max(1, _n_ev)
+                    _ev_chosen = []
+                    for _grp, _cands in _cand_by_group.items():
+                        _ev_chosen.extend(
+                            _rnd_ev.sample(_cands, min(_per_group, len(_cands))))
+                    self._log(
+                        f"  [UMAP-EV] Exporting {len(_ev_chosen)} evolution "
+                        f"video(s) across {len(_cand_by_group)} folder(s) "
+                        f"({_per_group} per folder)...")
+                    _ev_out = self.output_dir / "videos" / "umap_evolution"
+                    _ev_out.mkdir(parents=True, exist_ok=True)
+                    for _ev_nm, _ev_idx, _ev_sb, _ev_se, _ev_vp in _ev_chosen:
+                        try:
+                            # Prefer HMM-smoothed frame labels when available
+                            _hmm_fl_p = (self._out_bouts /
+                                         f"{_ev_nm}_frame_labels_hmm.csv")
+                            _raw_fl_p = frame_paths[_ev_idx]
+                            _fl_p = _hmm_fl_p if _hmm_fl_p.is_file() else _raw_fl_p
+                            # These CSVs have a header (frame,time_s,label); read
+                            # the 'label' column, not iloc[:,0] (the frame index,
+                            # whose header row 'frame' breaks int conversion).
+                            _fl_df  = _pd_ev.read_csv(str(_fl_p))
+                            _fl_col = ("label" if "label" in _fl_df.columns
+                                       else _fl_df.columns[-1])
+                            _fl = (_pd_ev.to_numeric(_fl_df[_fl_col],
+                                                     errors="coerce")
+                                   .dropna().to_numpy(dtype=int))
+                            self._log(
+                                f"  [UMAP-EV] Rendering '{_ev_nm}' "
+                                f"(side-by-side video — this can take 1-2 min)...")
+                            _ev_result = create_umap_evolution_video(
+                                video_path=_ev_vp,
+                                embedding=embedding[_ev_sb:_ev_se],
+                                umap_labels=hdb_labels[_ev_sb:_ev_se],
+                                frame_labels=_fl,
+                                source_fps=fps,
+                                out_path=_ev_out / f"{_ev_nm}_umap_evolution.mp4",
+                                output_fps=float(self._cfg.get("output_fps", 15)),
+                            )
+                            if _ev_result:
+                                self._log(
+                                    f"  [UMAP-EV] Saved -> {_ev_result}")
+                            else:
+                                self._log(
+                                    f"  [WARN] UMAP evolution video failed: "
+                                    f"'{_ev_nm}'")
+                        except Exception:
+                            self._log(
+                                f"  [WARN] UMAP evolution ({_ev_nm}): "
+                                f"{traceback.format_exc()}")
+                else:
+                    self._log(
+                        "  [UMAP-EV] Skipped: no sessions have associated "
+                        "video files.")
+            except Exception:
+                self._log(
+                    f"  [WARN] UMAP evolution video block: "
+                    f"{traceback.format_exc()}")
+
+        # Auto-groups (clusters_seen already computed above)
         groups = {f"C{c}": {"labels": [c], "color": _cmap(c)}
                   for c in clusters_seen}
 
@@ -3474,6 +5338,8 @@ class BSoidEngine:
                           for r in _validation.values())
         val_report   = dict(
             cube_version   = VERSION,
+            analysis_version = ANALYSIS_VERSION,
+            compat_mode    = self._cfg.get("compat_mode", "current"),
             created        = datetime.now().isoformat(),
             overall_status = "block" if any_block else
                              ("warn" if all_warnings else "pass"),
@@ -3582,7 +5448,17 @@ class BSoidEngine:
             except Exception:
                 log(f"  [WARN] Skip {fp.name}: {traceback.format_exc()}")
                 continue
-            fl    = predict_labels(xy, umap_m, mlp_m, scaler, fps)
+            # Pass the saved feature-construction settings so inference features
+            # match those the model was trained on.  Older pkls may lack some
+            # keys; .get() defaults reproduce their original behaviour.
+            _mcfg = m.get("cfg", {}) or {}
+            fl    = predict_labels(
+                xy, umap_m, mlp_m, scaler, fps,
+                bodyparts=m.get("bodyparts"),
+                body_normalise=bool(_mcfg.get("body_normalise", False)),
+                pca_model=m.get("pca_model"),
+                min_confidence=float(_mcfg.get("mlp_confidence_thresh", 0.0)),
+                angular_fallback=bool(_mcfg.get("angular_fallback", True)))
             bd    = labels_to_bouts(fl)
             bp    = engine._out_bouts / f"{fp.stem}_bout_lengths.csv"
             bd.to_csv(str(bp), index=False)
