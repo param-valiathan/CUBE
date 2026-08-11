@@ -2,7 +2,7 @@
 """
 CUBE: Comprehensive Unsupervised Behavioral Explorer
 ====================================================
-v3.0  —  DeepLabCut  ▸  CUBE engine  ▸  Annotator  ▸  Analyser
+v5.0  —  DeepLabCut  ▸  CUBE engine  ▸  Annotator  ▸  Analyser
 
 New in v3
 ---------
@@ -17,13 +17,13 @@ dlc.analyze_videos on all remaining videos with adaptive OOM recovery.
 Enable via the "Smart Adapt (v3)" checkbox in DLC & Prep Settings.
 
 Single-file launcher.  Place in the same folder as:
-    cube_core.py           (required — V2 analysis engine)
+    cube_core.py           (required — V5 analysis engine)
     cube_analyser.py       (required for Step 5)
     cube_video_explorer.py (required for Step 4)
 
 Step 1 — Run DLC inference       (DeepLabCut SuperAnimal)
 Step 2 — CUBE pre-processing     (bodypart filtering, H5/CSV export)
-Step 3 — CUBE clustering engine  (V2 features · UMAP · HDBSCAN · MLP)
+Step 3 — CUBE clustering engine  (V5 features · UMAP · HDBSCAN · MLP)
 Step 4 — Video annotation        (label clusters via example clips)
 Step 5 — Behaviour analysis      (metrics, ethograms, statistics)
 
@@ -43,6 +43,15 @@ import os as _os_env
 for _k_env in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
                "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     _os_env.environ[_k_env] = "1"
+# Intel's MKL loads libiomp5md.dll while scikit-learn's compiled extensions
+# load VCOMP140.DLL (MSVC OpenMP) into the same process. When both runtimes
+# initialise, Intel's OpenMP detects the "duplicate runtime" condition and
+# calls abort() (OMP Error #15), which Windows surfaces as an unrecoverable
+# native crash (ucrtbase.dll, exception 0xc0000409) with no Python traceback
+# - typically during the HDBSCAN sweep, where MKL-heavy and sklearn-heavy
+# code run concurrently across threads. Single-threading above does not
+# prevent this; only disabling the duplicate-runtime abort does.
+_os_env.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 del _os_env, _k_env
 
 #  " "  stdlib  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
@@ -69,11 +78,33 @@ from tkinter import filedialog, messagebox, ttk
 # Deferred to _deferred_imports() so the loading splash renders first.
 CORE_OK      = False
 _CORE_ERR    = ""
-PipelineLogger = BSoidEngine = run_bsoid_prep = None
+PipelineLogger = BSoidEngine = run_bsoid_prep = run_bsoid_prep_batch = None
 filter_dlc_h5 = cleanup_video_byproducts = create_umap_evolution_video = None
+find_dlc_files = peek_dlc_bodyparts = group_bodyparts_by_region = None
 
 #  " "   optional companion scripts  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
 HERE = Path(__file__).resolve().parent
+
+# Global (cross-project) sidecar for the last-applied Body-Region Weights, so
+# a brand-new project starts from the user's last customisation instead of
+# uniform every time -- same write-on-change/read-on-next-use pattern as
+# theme.txt, just JSON instead of a single value. Per-project SessionState
+# (bodypart_weights in the .pipeline_session.json) always wins over this when
+# a project already has its own explicit weights set; this is only the
+# fallback initial value for an otherwise-uniform/new project.
+_BODY_REGION_WEIGHTS_FILE = HERE / "body_region_weights.json"
+
+def _load_saved_body_region_weights() -> dict:
+    try:
+        return json.loads(_BODY_REGION_WEIGHTS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _save_body_region_weights(weights: dict):
+    try:
+        _BODY_REGION_WEIGHTS_FILE.write_text(json.dumps(weights, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 def _load_script(names: list):
     for name in names:
@@ -120,25 +151,26 @@ C = dict(
 # Button-specific colour slots (allow light mode to make flat buttons visible)
 C["btn"]    = C["card2"]   # button background
 C["btn_fg"] = C["subtext"] # text on secondary/muted buttons
+C["cube_title"] = C["accent"]  # CUBE header text — overridden to teal in light mode
 
 try:
     with open(HERE / "theme.txt", "r", encoding="utf-8") as _f:
         if _f.read().strip() == "light":
             C["bg"] = "#f0f2f5"
             C["panel"] = "#ffffff"
-            C["card"] = "#f8f9fa"
+            C["card"] = "#ffffff"  # pure white — clear contrast against #f0f2f5 bg
             C["card2"] = "#e9ecef"
             C["border"] = "#dee2e6"
             C["text"] = "#222222"
             C["subtext"] = "#666666"
             C["log_bg"] = "#ffffff"
             C["log_fg"] = "#333333"
-            # Light-mode button overrides: flat buttons need a mid-gray bg to
-            # be visible against the near-white page; dark amber replaces the
-            # bright yellow that is invisible on light backgrounds.
-            C["btn"]    = "#8892a0"  # mid-gray — clearly distinct from #f0f2f5
-            C["btn_fg"] = "#1c1c30"  # near-black — readable on mid-gray
+            # Light-mode button overrides: flat buttons need a visible bg;
+            # dark amber replaces the bright yellow that is invisible on light backgrounds.
+            C["btn"]    = "#c5ccd6"  # soft blue-gray — visible but not heavy
+            C["btn_fg"] = "#1c1c30"  # near-black — readable on soft blue-gray
             C["yellow"] = "#7a4e00"  # dark amber — replaces #ffd60a in light mode
+            C["cube_title"] = "#0077a8"  # teal-blue for CUBE header text (not red)
 except Exception:
     pass
 
@@ -146,23 +178,28 @@ except Exception:
 # read it without re-parsing theme.txt.
 _DARK_THEME: bool = C["bg"] == "#09090f"
 
-# Per-step colours
+# Per-step colours — bg switches between dark/light tints
+_sbg = lambda dark, light: dark if _DARK_THEME else light
 STEP_META = [
     dict(num=1, key="dlc",        icon=" ", title="DLC Inference",
          subtitle="DeepLabCut SuperAnimal on raw videos",
-         bg="#1a3a1a", accent="#4caf50"),
-    dict(num=2, key="bsoid_prep", icon="", title="CUBE Pre-processing",
+         bg=_sbg("#1a3a1a", "#edf7ed"), accent="#4caf50"),
+    dict(num=2, key="dlc_3d",     icon="⬡", title="3D DLC + Anipose",
+         subtitle="Per-camera Zoo adapt · triangulate · fuse 4 cams",
+         note="Only for 3D multi-camera recordings",
+         bg=_sbg("#102030", "#e8f4fd"), accent="#4fc3f7"),
+    dict(num=3, key="bsoid_prep", icon="", title="CUBE Pre-processing",
          subtitle="Filter bodyparts · export H5/CSV",
-         bg="#1a1a3a", accent="#00b4d8"),
-    dict(num=3, key="bsoid_run",  icon=" ",  title="CUBE Clustering",
+         bg=_sbg("#1a1a3a", "#e0f7fa"), accent="#00b4d8"),
+    dict(num=4, key="bsoid_run",  icon=" ",  title="CUBE Clustering",
          subtitle="V2 features · UMAP · HDBSCAN · MLP",
-         bg="#2a1a4a", accent="#9c27b0"),
-    dict(num=4, key="annotate",   icon=" ", title="Video Annotation",
+         bg=_sbg("#2a1a4a", "#f3e5f5"), accent="#9c27b0"),
+    dict(num=5, key="annotate",   icon=" ", title="Video Annotation",
          subtitle="Label clusters via example clips",
-         bg="#4a2a1a", accent="#ff9800"),
-    dict(num=5, key="analyse",    icon=" ", title="Behaviour Analysis",
+         bg=_sbg("#4a2a1a", "#fff3e0"), accent="#ff9800"),
+    dict(num=6, key="analyse",    icon=" ", title="Behaviour Analysis",
          subtitle="Metrics, ethograms, statistics",
-         bg="#1a1a4a", accent="#e94560"),
+         bg=_sbg("#1a1a4a", "#fce4ec"), accent="#e94560"),
 ]
 
 # DLC settings
@@ -216,7 +253,7 @@ class SessionState:
         # BSOID prep
         bsoid_min_conf  = 0.30,
         bsoid_conf_metric    = "median",
-        bsoid_min_sess_frac  = 0.6,
+        bsoid_min_sess_frac  = 0.85,
         bsoid_min_keep       = 6,
         # BSOID engine
         engine_cfg      = {},
@@ -228,6 +265,24 @@ class SessionState:
         mapping_file    = "",
         bout_lengths_paths = [],
         ntfy_topic      = "",
+        # 3D DLC + Anipose
+        dlc_3d_enabled          = False,
+        dlc_3d_calib_folder     = "",
+        dlc_3d_input_folder     = "",
+        dlc_3d_output_folder    = "",
+        dlc_3d_cam_labels       = ["cam0", "cam1", "cam2", "cam3"],
+        dlc_3d_models           = {},
+        dlc_3d_ll_agg           = "min",
+        dlc_3d_delete_orig_videos = False,
+        dlc_3d_delete_cam_h5s        = False,
+        dlc_3d_export_skeleton_video = False,
+        dlc_3d_use_ransac            = True,
+        dlc_3d_ransac_threshold      = 0.5,
+        dlc_3d_ll_threshold          = 0.0,
+        dlc_3d_ll_gate               = 0.6,
+        dlc_3d_median_window         = 3,
+        dlc_3d_source_folders        = [],  # saved before video_folders is replaced by session dirs
+        pca_n_components             = "auto",
     )
 
     def __init__(self):
@@ -434,12 +489,12 @@ class DualProgressBar(tk.Frame):
 #  
 
 _BADGE_STATES = {
-    "idle":    ("#555566", " -   Waiting"),
-    "ready":   ("#00b4d8", " -   Ready"),
-    "running": ("#ffd60a", "   Running "),
-    "done":    ("#4caf50", "v  Complete"),
-    "error":   ("#f44336", " -  Error"),
-    "skipped": ("#888899", "   Skipped"),
+    "idle":    ("#555566",    " -   Waiting"),
+    "ready":   ("#00b4d8",    " -   Ready"),
+    "running": (C["yellow"],  "   Running "),
+    "done":    ("#4caf50",    "v  Complete"),
+    "error":   ("#f44336",    " -  Error"),
+    "skipped": ("#888899",    "   Skipped"),
 }
 
 class StepCard(tk.Frame):
@@ -472,7 +527,16 @@ class StepCard(tk.Frame):
                  font=("Segoe UI", 8),
                  bg=bg, fg=C["subtext"],
                  wraplength=195, justify="left").pack(
-            anchor="w", padx=10, pady=(0, 8))
+            anchor="w", padx=10, pady=(0, 2))
+
+        if meta.get("note"):
+            tk.Label(self, text=f"⚠  {meta['note']}",
+                     font=("Segoe UI", 7, "italic"),
+                     bg=bg, fg=meta["accent"],
+                     wraplength=195, justify="left").pack(
+                anchor="w", padx=10, pady=(0, 6))
+        else:
+            tk.Frame(self, bg=bg, height=6).pack()
 
         self._btn = tk.Button(
             self, text=f"   Step {meta['num']}",
@@ -521,9 +585,9 @@ class SettingsPanel(tk.Frame):
         ("dlc_delete_orig",  "Delete original",     "bool", None, False,
          "   Irreversible — deletes source video"),
         ("dlc_run_prep",     "Run CUBE prep",       "bool", None, True,
-         "Auto-run Step 2 after DLC"),
-        ("auto_bsoid",       "Auto-run Steps 2+3",  "bool", None, True,
-         "Run pre-processing + clustering after DLC completes"),
+         "Run Step 3 pre-processing inline within DLC (Step 1)"),
+        ("auto_bsoid",       "Auto-run analysis",   "bool", None, True,
+         "After DLC: auto-launch Step 3 (pre-processing) then Step 4 (BSoid analysis)"),
         ("dlc_cooldown",     "Cooldown",            "combo",
          list(COOLDOWN_OPTIONS.keys()), "15 s",
          "GPU cooldown between videos"),
@@ -534,41 +598,24 @@ class SettingsPanel(tk.Frame):
         ("bsoid_conf_metric","BP conf metric",      "combo",
          ["median","mean"], "median",
          "median resists brief occlusion dropouts (single-view cameras)"),
-        ("bsoid_min_sess_frac","BP keep if passes ≥","float",(0.1,1.0,0.1),0.6,
-         "Keep a bodypart if it passes in >= this fraction of sessions (not all)"),
+        ("bsoid_min_sess_frac","BP keep if passes ≥","float",(0.1,1.0,0.1),0.85,
+         "Keep a bodypart if it passes in >= this fraction of sessions (not all). "
+         "Raised 0.6->0.85 (Aug 2026): with the pooled cross-group conservation "
+         "fix, 0.6 let in bodyparts bad enough (up to 71% bad frames in some "
+         "sessions) to measurably hurt DBCV/stability on real data -- 0.85 "
+         "excluded exactly those and recovered DBCV 0.164->0.370."),
         ("bsoid_min_keep",   "Min bodyparts kept",  "int",  (2,40,1), 6,
          "Floor: fall back to top-N by confidence if fewer pass"),
         ("ntfy_topic",       "Notification Topic",  "str",  None, "",
          "ntfy.sh topic name for push alerts"),
     ]
-    _ENGINE_ROWS = [
-        ("body_normalise",       "Body normalisation",   "bool", None, False,
-         "Divide distances by nose-to-tailbase length"),
-        ("likelihood_thresh",    "Likelihood threshold", "float",(0.1,0.9,0.05),0.30,""),
-        ("max_interp_gap_sec",   "Max interp gap (s)",   "float",(0.0,5.0,0.1),0.50,
-         "Occlusions longer than this are held flat, not ramped (0 = legacy)"),
-        ("boxcar_win_sec",       "Boxcar smooth (s)",    "float",(0.0,0.5,0.01),0.07,""),
-        ("train_frac",           "UMAP train fraction",  "float",(0.05,1.0,0.05),0.30,""),
-        ("umap_n_neighbors",     "UMAP n_neighbors",     "int",  (5,200,5),   60,""),
-        ("umap_n_components",    "UMAP n_components",    "int",  (2,8,1),      3,""),
-        ("umap_min_dist",        "UMAP min_dist",        "float",(0.0,1.0,0.05),0.1,""),
-        ("umap_random_state",    "UMAP random seed",     "int",  (0,9999,1),  42,""),
-        ("hdbscan_metric",       "HDBSCAN metric",       "combo",
-         ["euclidean","manhattan","cosine"],"euclidean",""),
-        ("hdbscan_method",       "HDBSCAN method",       "combo",
-         ["both","eom","leaf"],"both","both=DBCV picks best; eom=larger; leaf=finer"),
-        ("mlp_hidden",           "MLP layers",           "str",  None, "100,50",""),
-        ("mlp_max_iter",         "MLP max iter",         "int",  (100,5000,100),1000,""),
-        ("mlp_confidence_thresh","MLP conf threshold",   "float",(0.0,1.0,0.05),0.0,
-         "Bins below this top-class probability become unclassified (0 = off)"),
-        ("cv_folds",             "CV folds",             "int",  (2,10,1),     5,""),
-        ("min_epoch_dur_s",      "Min epoch dur (s)",    "float",(0.0,60.0,0.1),0.0,""),
-        ("max_epoch_dur_s",      "Max epoch dur (s)",    "float",(0.0,9999.0,1.0),300.0,""),
-        ("output_fps",           "Output video FPS",     "int",  (1,60,1),    15,""),
-        ("max_clips_per_cluster","Max clips/cluster",    "int",  (1,10,1),     3,""),
-        ("save_plots",           "Save plots",           "bool", None, True,""),
-        ("save_videos",          "Save videos",          "bool", None, True,""),
-    ]
+    # NOTE: engine-level analysis parameters (body_normalise, train_frac,
+    # UMAP/HDBSCAN/MLP settings, long_lag_drift, long_scale_bins,
+    # pca_n_components, etc.) are configured via AdvancedCUBEWindow, which
+    # writes directly to session["engine_cfg"] -- NOT via this panel. A
+    # previous _ENGINE_ROWS list duplicating those same keys here was dead
+    # code (never rendered into widgets, get_engine_cfg() always returned
+    # {}) and has been removed; see AdvancedCUBEWindow for the real controls.
 
     def __init__(self, parent, **kw):
         super().__init__(parent, bg=C["card"], **kw)
@@ -682,26 +729,18 @@ class SettingsPanel(tk.Frame):
         except Exception:
             pass
 
-    def get_engine_cfg(self) -> dict:
-        return {}   # engine cfg is now stored in session["engine_cfg"] via AdvancedCUBEWindow
-
     def apply_session(self, session: SessionState):
         for key in self._vars:
             val = session[key] if key in session._d else None
             if val is not None:
                 self.set_val(key, val)
-        # engine cfg nested dict
-        ec = session.get("engine_cfg", {})
-        for k, v in ec.items():
-            self.set_val(k, v)
 
     def export_to_session(self, session: SessionState):
         dlc_keys = [r[0] for r in self._DLC_ROWS]
         for k in dlc_keys:
             session[k] = self.get(k)
-        ec = self.get_engine_cfg()
-        if ec:  # Don't overwrite engine_cfg set by AdvancedCUBEWindow with {}
-            session["engine_cfg"] = ec
+        # engine_cfg is written directly by AdvancedCUBEWindow._apply() --
+        # this panel never touches it, so it's left untouched here too.
 
 
 #  
@@ -1409,18 +1448,20 @@ def _run_dlc_step(session: SessionState, settings: SettingsPanel,
         after_fn(lambda cur=idx: pb.step_tick(cur, total))
 
     if run_prep:
-        logger.step("Running CUBE pre-processing (Step 2)...")
-        bsoid_roots = []
-        for folder in folders:
-            root = run_bsoid_prep(
-                folder, log_fn=logger,
-                min_confidence=float(session["bsoid_min_conf"]),
-                conf_metric=str(session.get("bsoid_conf_metric", "median")),
-                min_session_frac=float(session.get("bsoid_min_sess_frac", 0.6)),
-                min_keep=int(session.get("bsoid_min_keep", 6)))
-            if root:
-                bsoid_roots.append(str(root))
-        session["bsoid_ready_dirs"] = bsoid_roots
+        logger.step("Running CUBE pre-processing (Step 3)...")
+        # run_bsoid_prep_batch() (Aug 2026): pools the conserved-bodyparts
+        # decision once across every folder's sessions instead of each
+        # folder choosing its own conserved set independently -- see
+        # _run_bsoid_prep_step's docstring for why this matters (avoids
+        # compounding several independently-conservative cuts into one
+        # overly aggressive one).
+        bsoid_roots = run_bsoid_prep_batch(
+            folders, log_fn=logger,
+            min_confidence=float(session["bsoid_min_conf"]),
+            conf_metric=str(session.get("bsoid_conf_metric", "median")),
+            min_session_frac=float(session.get("bsoid_min_sess_frac", 0.85)),
+            min_keep=int(session.get("bsoid_min_keep", 6)))
+        session["bsoid_ready_dirs"] = [str(r) for r in bsoid_roots]
 
     if errors:
         logger.warn(f"DLC finished with {len(errors)} error(s): {errors}")
@@ -1951,7 +1992,7 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
         try:
             # Legacy TF path: create a named project skeleton based on the input folder name
             new_cfg_path = dlc.create_new_project(
-                project          = f"{base_folder_name}_CUBE_v3",
+                project          = f"{base_folder_name}_CUBE_v5",
                 experimenter     = "CUBE",
                 videos           = [rep_video_path],
                 working_directory= str(adapt_work),
@@ -2197,18 +2238,18 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
 
     # ── Optional auto-run Step 2 ──────────────────────────────────────────────
     if run_prep:
-        logger.step("Running CUBE pre-processing (Step 2) …")
-        bsoid_roots = []
-        for folder in folders:
-            root = run_bsoid_prep(
-                folder, log_fn=logger,
-                min_confidence=float(session.get("bsoid_min_conf", 0.30)),
-                conf_metric=str(session.get("bsoid_conf_metric", "median")),
-                min_session_frac=float(session.get("bsoid_min_sess_frac", 0.6)),
-                min_keep=int(session.get("bsoid_min_keep", 6)))
-            if root:
-                bsoid_roots.append(str(root))
-        session["bsoid_ready_dirs"] = bsoid_roots
+        logger.step("Running CUBE pre-processing (Step 3) …")
+        # run_bsoid_prep_batch() (Aug 2026): pools the conserved-bodyparts
+        # decision once across every folder's sessions instead of each
+        # folder choosing its own conserved set independently -- see
+        # _run_bsoid_prep_step's docstring for why this matters.
+        bsoid_roots = run_bsoid_prep_batch(
+            folders, log_fn=logger,
+            min_confidence=float(session.get("bsoid_min_conf", 0.30)),
+            conf_metric=str(session.get("bsoid_conf_metric", "median")),
+            min_session_frac=float(session.get("bsoid_min_sess_frac", 0.85)),
+            min_keep=int(session.get("bsoid_min_keep", 6)))
+        session["bsoid_ready_dirs"] = [str(r) for r in bsoid_roots]
 
     if errors:
         logger.warn(
@@ -2337,17 +2378,17 @@ def _run_dlc_zoo_per_video(dlc, cv2, gc, valid_entries, session, settings,
         after_fn(lambda cur=idx: pb.step_tick(cur, total))
 
     if run_prep:
-        bsoid_roots = []
-        for folder in folders:
-            root = run_bsoid_prep(
-                folder, log_fn=logger,
-                min_confidence=float(session.get("bsoid_min_conf", 0.30)),
-                conf_metric=str(session.get("bsoid_conf_metric", "median")),
-                min_session_frac=float(session.get("bsoid_min_sess_frac", 0.6)),
-                min_keep=int(session.get("bsoid_min_keep", 6)))
-            if root:
-                bsoid_roots.append(str(root))
-        session["bsoid_ready_dirs"] = bsoid_roots
+        # run_bsoid_prep_batch() (Aug 2026): pools the conserved-bodyparts
+        # decision once across every folder's sessions instead of each
+        # folder choosing its own conserved set independently -- see
+        # _run_bsoid_prep_step's docstring for why this matters.
+        bsoid_roots = run_bsoid_prep_batch(
+            folders, log_fn=logger,
+            min_confidence=float(session.get("bsoid_min_conf", 0.30)),
+            conf_metric=str(session.get("bsoid_conf_metric", "median")),
+            min_session_frac=float(session.get("bsoid_min_sess_frac", 0.85)),
+            min_keep=int(session.get("bsoid_min_keep", 6)))
+        session["bsoid_ready_dirs"] = [str(r) for r in bsoid_roots]
 
     if errors:
         logger.warn(f"DLC fallback finished with {len(errors)} error(s).")
@@ -2367,24 +2408,32 @@ def _run_dlc_zoo_per_video(dlc, cv2, gc, valid_entries, session, settings,
 def _run_bsoid_prep_step(session: SessionState, settings: SettingsPanel,
                           logger: PipelineLogger, pb: DualProgressBar,
                           after_fn):
-    """Run CUBE pre-processing on all selected video folders."""
+    """Run CUBE pre-processing on all selected video folders.
+
+    Uses run_bsoid_prep_batch() (Aug 2026) rather than one run_bsoid_prep()
+    call per folder: when 2+ folders are selected (e.g. one per experimental
+    group), the conserved-bodyparts decision is made ONCE, pooled across every
+    session in every folder, instead of each folder choosing its own
+    conserved set independently and relying on BSoidEngine's later cross-group
+    intersection to reconcile them. Both approaches guarantee every group ends
+    up sharing the exact same bodypart set (comparability is unaffected) --
+    pooling just avoids compounding several independently-conservative cuts
+    into one overly aggressive one, so more real tracking signal survives.
+    """
     folders = session["video_folders"]
     if not folders:
         raise ValueError("No video folders selected.")
     pb.step_start("CUBE pre-processing", len(folders))
-    roots = []
-    for i, folder in enumerate(folders, 1):
-        logger(f"  Pre-processing folder {i}/{len(folders)}: "
-               f"{Path(folder).name}")
-        root = run_bsoid_prep(
-            folder, log_fn=logger,
-            min_confidence=float(settings.get("bsoid_min_conf", 0.30)),
-            conf_metric=str(settings.get("bsoid_conf_metric", "median")),
-            min_session_frac=float(settings.get("bsoid_min_sess_frac", 0.6)),
-            min_keep=int(settings.get("bsoid_min_keep", 6)))
-        if root:
-            roots.append(str(root))
-        after_fn(lambda cur=i: pb.step_tick(cur, len(folders)))
+    logger(f"  Pre-processing {len(folders)} folder(s) "
+           f"(pooled bodypart conservation across all of them):")
+    bsoid_roots = run_bsoid_prep_batch(
+        folders, log_fn=logger,
+        min_confidence=float(settings.get("bsoid_min_conf", 0.30)),
+        conf_metric=str(settings.get("bsoid_conf_metric", "median")),
+        min_session_frac=float(settings.get("bsoid_min_sess_frac", 0.85)),
+        min_keep=int(settings.get("bsoid_min_keep", 6)))
+    roots = [str(r) for r in bsoid_roots]
+    after_fn(lambda: pb.step_tick(len(folders), len(folders)))
     session["bsoid_ready_dirs"] = roots
     if not roots:
         raise RuntimeError("No BSOID_Project_Ready directories were created.")
@@ -2581,9 +2630,19 @@ def _run_engine_step(session: SessionState, settings: SettingsPanel,
 
     session["bsoid_ready_dirs"] = bsoid_roots
 
-    # Merge publication defaults with any user overrides from Advanced CUBE window
-    cfg = dict(BSoidEngine.DEFAULTS)
-    cfg.update(session.get("engine_cfg", {}))
+    # User overrides from the Advanced CUBE window ONLY -- do NOT pre-merge
+    # BSoidEngine.DEFAULTS here (Aug 2026 fix). BSoidEngine.__init__ already
+    # merges cfg over its own DEFAULTS internally, so the merged VALUES are
+    # identical either way -- but it also records self._explicit_cfg_keys =
+    # set(cfg.keys()) to distinguish "user deliberately set this" from "just
+    # inherited the default", used by e.g. the consensus-clustering
+    # auto-trigger's opt-out check. Pre-merging the full DEFAULTS dict here
+    # made every single key look "explicitly set", which silently defeated
+    # that check for every GUI-driven run (confirmed: a real run with mean
+    # ARI=0.427, well under the 0.6 auto-trigger threshold, never triggered
+    # consensus because consensus_clustering_enabled=False looked deliberate
+    # even though the user never touched it).
+    cfg = dict(session.get("engine_cfg", {}))
     # Bout duration always comes from the prominent front-panel widget
     cfg["min_epoch_dur_s"]       = float(bd_min)
     cfg["max_epoch_dur_s"]       = float(bd_max)
@@ -2908,10 +2967,19 @@ class DLCPrepSettingsWindow(tk.Toplevel):
                   bg=C["btn"], fg=C["cyan"], relief="flat",
                   padx=14, pady=5, cursor="hand2",
                   command=_test_notification).pack(side="left", padx=6)
+        def _on_close():
+            topic = settings_panel._vars["ntfy_topic"].get().strip()
+            try:
+                (HERE / "ntfy_topic.txt").write_text(topic, encoding="utf-8")
+            except Exception:
+                pass
+            self.destroy()
+
+        self.protocol("WM_DELETE_WINDOW", _on_close)
         tk.Button(btn_row, text="Close", font=("Segoe UI", 9, "bold"),
                   bg=C["btn"], fg=C["text"], relief="flat",
                   padx=20, pady=5, cursor="hand2",
-                  command=self.destroy).pack(side="left", padx=6)
+                  command=_on_close).pack(side="left", padx=6)
 
         self.update_idletasks()
         pw = parent.winfo_width()
@@ -3314,6 +3382,10 @@ class AdvancedCUBEWindow(tk.Toplevel):
         target_n_clusters     = 0,
         preferred_clusters_lo = 5,
         preferred_clusters_hi = 30,
+        hdbscan_selection_mode    = "floor_soft_cap",
+        hdbscan_overshoot_penalty = 0.01,
+        cluster_hierarchy_enabled = True,
+        cluster_hierarchy_linkage = "ward",
         min_cluster_freq      = 0.2,   # percentage of total bins; 0 = disabled
         mlp_hidden            = "100,50",
         mlp_max_iter          = 1000,
@@ -3329,7 +3401,21 @@ class AdvancedCUBEWindow(tk.Toplevel):
         hmm_n_iter            = 100,
         hmm_min_prob          = 0.05,
         compat_mode           = "current",  # "current" or "legacy_v2"
-        seed_sweep_n          = 0,     # >0 = run cluster-stability seed sweep
+        seed_sweep_n          = 6,     # >0 = run cluster-stability seed sweep
+        seed_sweep_n_jobs     = 1,     # T1.P: 1 = sequential; >1/-1 = parallel
+        # Body-region weighting (issue 1b) / adaptive visibility (issue 2) /
+        # iterative split+merge refinement (issue 4).  Engine DEFAULTS below
+        # win when the core import succeeds; these are only the offline
+        # fallback (see DEFAULTS overlay just below).
+        visibility_features_enabled = True,
+        visibility_adaptive_pct     = 10,
+        hdbscan_merge_thresh         = 0.08,
+        hdbscan_leaf_bonus           = 0.03,
+        hdbscan_fine_bias            = 0.05,
+        hdbscan_split_silhouette_thresh = 0.2,
+        hdbscan_split_max_subclusters = 3,
+        hdbscan_split_min_points     = 250,
+        recluster_max_iterations     = 2,
     )
     try:
         # Engine defaults win for every shared key; GUI-only keys persist.
@@ -3347,6 +3433,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
         self.grab_set()
         self._session = session
         self._vars: dict = {}
+        self._bodypart_weights: dict = {}
 
         # ── Bottom buttons ────────────────────────────────────────────────────
         btn_f = tk.Frame(self, bg=C["bg"])
@@ -3459,10 +3546,78 @@ class AdvancedCUBEWindow(tk.Toplevel):
                       "    Reduces dimensionality before UMAP when features ≈ samples.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s, "PCA pre-UMAP (inner)",
+                 lambda r: _combo(r, "pca_n_components",
+                                  ["auto", "off", "30", "50", "100"], "auto"))
+        tk.Label(s,
+                 text="    Separate, inner PCA gate applied inside run_umap() itself -- also\n"
+                      "    used by the seed-stability sweep and consensus clustering, which\n"
+                      "    call run_umap() directly. auto = triggers when samples/features < 5\n"
+                      "    and features > 50; off = disabled; 30/50/100 = fixed component count.\n"
+                      "    Independent of 'PCA pre-reduction' above (that one runs once, before\n"
+                      "    any of these calls); leave at auto unless you know you need both.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s, "Long lag drift (2-3 s)",
+                 lambda r: _check(r, "long_lag_drift", False))
+        tk.Label(s,
+                 text="    Adds 20- and 30-bin lag-offset features -- primary signal for\n"
+                      "    sustained states (freezing, guarding). Off by default.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s, "Long scale bins (500ms/1s)",
+                 lambda r: _check(r, "long_scale_bins", False))
+        tk.Label(s,
+                 text="    Adds 500-ms and 1000-ms coarse temporal bins for slow sustained\n"
+                      "    behaviours, alongside the standard 100/200-ms bins. Off by default.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s, "Likelihood threshold",
                  lambda r: _spin_f(r, "likelihood_thresh", 0.0, 1.0, 0.05, 0.30))
         _adv_row(s, "Boxcar smooth (s)",
                  lambda r: _spin_f(r, "boxcar_win_sec", 0.0, 0.5, 0.01, 0.07))
+        _adv_row(s, "Adaptive visibility features",
+                 lambda r: _check(r, "visibility_features_enabled", True))
+        tk.Label(s,
+                 text="    ON (default) adds per-bin occlusion/visibility columns so frames\n"
+                      "    where the animal is turned away form their own cluster instead of\n"
+                      "    polluting real behaviours.  OFF reproduces the pre-2.2 feature layout.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s, "Visibility adaptive percentile",
+                 lambda r: _spin_f(r, "visibility_adaptive_pct", 1.0, 50.0, 1.0, 10.0))
+        tk.Label(s,
+                 text="    Per-bodypart/per-session low-confidence percentile floor, layered\n"
+                      "    on top of 'Likelihood threshold'.  Only used when the visibility\n"
+                      "    feature block above is enabled.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s, "Exclude turned-away frames from clustering",
+                 lambda r: _check(r, "exclude_turned_away", True))
+        tk.Label(s,
+                 text="    ON (default) excludes bins where the animal is judged turned away\n"
+                      "    from the camera (Head/Mouth + nose confidence, validated v3) from\n"
+                      "    UMAP/HDBSCAN training, and labels them 'Turned Away' instead of\n"
+                      "    force-classifying into a real behaviour.  OFF falls back to the\n"
+                      "    visibility-feature-only handling above (no forced exclusion/label).",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s, "Turned-away confidence threshold",
+                 lambda r: _spin_f(r, "turned_away_conf_thresh", 0.0, 1.0, 0.05, 0.30))
+        tk.Label(s,
+                 text="    Head/Mouth region low-confidence fraction above which a bin becomes\n"
+                      "    a turned-away candidate (subject to nose-corroboration + debouncing).\n"
+                      "    0.30 is the session-validated default.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        self._bpw_status = tk.Label(s, text="Body-region weighting: disabled (uniform)",
+                                     font=("Segoe UI", 7, "italic"),
+                                     bg=C["card"], fg=C["dim"])
+        tk.Button(s, text="Body-Region Weights (optional)...",
+                  font=("Segoe UI", 9), bg=C["btn"], fg=C["yellow"],
+                  relief="flat", padx=10, pady=4, cursor="hand2",
+                  command=self._open_bodypart_weights).pack(anchor="w", padx=8, pady=(4, 0))
+        self._bpw_status.pack(anchor="w", padx=8, pady=(0, 4))
 
         # ── UMAP ─────────────────────────────────────────────────────────────
         s2 = _adv_section(p, "UMAP EMBEDDING  (Hsu & Yttri 2021 reference)", C["cyan"])
@@ -3531,12 +3686,99 @@ class AdvancedCUBEWindow(tk.Toplevel):
                       "    Ignored when Target cluster count > 0.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s3b, "Selection mode",
+                 lambda r: _combo(r, "hdbscan_selection_mode",
+                                  ["legacy", "floor_soft_cap"], "floor_soft_cap"))
+        tk.Label(s3b,
+                 text="    floor_soft_cap (default, promoted Aug 2026) = never selects below\n"
+                      "    the low bound if avoidable; counts above the high bound are only\n"
+                      "    lightly penalised, not excluded. Real 3-group seed-sweep testing\n"
+                      "    eliminated catastrophic low-cluster-count collapses (5/8 -> 0/8\n"
+                      "    seeds) vs. the old rule.\n"
+                      "    legacy = pre-Aug-2026 rule: prefers the range above, falls back to\n"
+                      "    the closest-to-boundary solution when nothing qualifies (could\n"
+                      "    discontinuously collapse to very few clusters). Ignored when\n"
+                      "    Target cluster count > 0.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s3b, "Overshoot penalty",
+                 lambda r: _spin_f(r, "hdbscan_overshoot_penalty", 0.0, 1.0, 0.01, 0.01))
+        tk.Label(s3b,
+                 text="    Only used when Selection mode = floor_soft_cap. Score penalty\n"
+                      "    per cluster above the high bound. 0 = no ceiling at all.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s3b, "Cluster hierarchy plot",
+                 lambda r: _check(r, "cluster_hierarchy_enabled", True))
+        _adv_row(s3b, "Hierarchy linkage method",
+                 lambda r: _combo(r, "cluster_hierarchy_linkage",
+                                  ["ward", "average", "complete"], "ward"))
+        tk.Label(s3b,
+                 text="    Saves plots/cluster_hierarchy.png -- a dendrogram of the final\n"
+                      "    clusters' feature-space centroids, to guide manual merging.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s3b, "Min cluster frequency (%)",
                  lambda r: _spin_f(r, "min_cluster_freq", 0.0, 10.0, 0.1, 0.5))
         tk.Label(s3b,
                  text="    Clusters whose share of total analysis time is below this\n"
                       "    percentage are removed before MLP training (reassigned to noise).\n"
                       "    0.2 % = default.  Set to 0 to disable pruning.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+
+        # ── Iterative split + merge refinement (issue 4) ────────────────────────
+        s3c = _adv_section(p, "ITERATIVE SPLIT / MERGE REFINEMENT  (advanced, on by default)", C["orange"])
+        _adv_row(s3c, "Merge threshold  (0 = off)",
+                 lambda r: _spin_f(r, "hdbscan_merge_thresh", 0.0, 1.0, 0.01, 0.0))
+        tk.Label(s3c,
+                 text="    Condensed-tree sibling-merge persistence-fraction cutoff.\n"
+                      "    0 = merge pass fully disabled. >0 merges clusters that only just\n"
+                      "    barely separated from a shared parent (classic over-split signature).",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s3c, "Leaf method bonus",
+                 lambda r: _spin_f(r, "hdbscan_leaf_bonus", 0.0, 0.5, 0.01, 0.03))
+        tk.Label(s3c,
+                 text="    Added to leaf-method candidate scores ONLY when merge threshold > 0\n"
+                      "    (leaf's extra fragmentation is then self-corrected by the merge pass).",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s3c, "Fine-partition bias",
+                 lambda r: _spin_f(r, "hdbscan_fine_bias", 0.0, 0.5, 0.01, 0.05))
+        tk.Label(s3c,
+                 text="    Nudges initial cluster-count selection toward the finer end of the\n"
+                      "    preferred range ONLY when merge threshold > 0 -- generates enough\n"
+                      "    clusters to separate behaviours, trusting merge to consolidate.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s3c, "Split silhouette thresh  (0 = off)",
+                 lambda r: _spin_f(r, "hdbscan_split_silhouette_thresh", -1.0, 1.0, 0.05, 0.0))
+        tk.Label(s3c,
+                 text="    Clusters with mean silhouette below this are candidates for local\n"
+                      "    re-clustering (impurity fix).  0 = split pass fully disabled.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s3c, "Max sub-clusters per split",
+                 lambda r: _spin_i(r, "hdbscan_split_max_subclusters", 2, 20, 1, 3))
+        tk.Label(s3c,
+                 text="    Hard cap on how many pieces one impure cluster may split into in a\n"
+                      "    single pass -- a split should resolve a handful of genuinely distinct\n"
+                      "    sub-behaviours, not fragment extensively.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s3c, "Min points to attempt a split",
+                 lambda r: _spin_i(r, "hdbscan_split_min_points", 20, 2000, 10, 250))
+        tk.Label(s3c,
+                 text="    A candidate cluster smaller than this is left untouched -- too few\n"
+                      "    points relative to the feature space to trust a local re-embedding.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s3c, "Max refine iterations",
+                 lambda r: _spin_i(r, "recluster_max_iterations", 0, 10, 1, 2))
+        tk.Label(s3c,
+                 text="    Cap on the split -> merge -> repeat loop.  Ignored unless at least\n"
+                      "    one of the two thresholds above is enabled.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
 
@@ -3589,12 +3831,44 @@ class AdvancedCUBEWindow(tk.Toplevel):
                       "    full-dataset mcs anchor, evenly-spaced angular fallback).",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
-        _adv_row(s_rep, "Cluster-stability seed sweep  (0 = off)",
-                 lambda r: _spin_i(r, "seed_sweep_n", 0, 50, 1, 0))
+        _adv_row(s_rep, "Cluster-stability seed sweep  (0 = off, default 6)",
+                 lambda r: _spin_i(r, "seed_sweep_n", 0, 50, 1, 6))
         tk.Label(s_rep,
                  text="    >0 re-runs UMAP+HDBSCAN over this many seeds to measure\n"
                       "    cluster-count / partition stability (plots cluster_stability.png).\n"
                       "    Adds runtime proportional to the number of seeds.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _cpu_n = os.cpu_count() or 32
+        _adv_row(s_rep, "Seed sweep parallel jobs",
+                 lambda r: _spin_i(r, "seed_sweep_n_jobs", -1, _cpu_n, 1, 1))
+        tk.Label(s_rep,
+                 text=f"    1 = sequential (safest, default).  >1 = dispatch that many seeds'\n"
+                      f"    UMAP+HDBSCAN fits in parallel worker processes (joblib/loky).\n"
+                      f"    -1 = all {_cpu_n} logical cores. Higher values speed up the seed sweep\n"
+                      f"    but increase peak memory and make it harder to diagnose which\n"
+                      f"    seed triggered a crash, if one ever occurred (T1.P, ARI-stability plan).",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s_rep, "Consensus auto-trigger threshold  (0 = off, default 0.55)",
+                 lambda r: _spin_f(r, "consensus_auto_threshold", 0.0, 1.0, 0.01, 0.55))
+        tk.Label(s_rep,
+                 text="    If the seed sweep's mean pairwise ARI falls below this value, the\n"
+                      "    partition is judged seed-unstable and consensus clustering\n"
+                      "    (co-association across consensus_n_seeds seeds, ~Nx runtime) is\n"
+                      "    auto-enabled for this run. Set to 0 to disable auto-triggering\n"
+                      "    entirely (consensus stays available manually below). Ignored if\n"
+                      "    'Enable consensus clustering' is checked or explicitly unchecked --\n"
+                      "    a deliberate manual choice always overrides the auto-trigger.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s_rep, "Enable consensus clustering  (force on)",
+                 lambda r: _check(r, "consensus_clustering_enabled", False))
+        tk.Label(s_rep,
+                 text="    Manual override: always use the consensus partition regardless of\n"
+                      "    the auto-trigger threshold above. Leave unchecked to let the\n"
+                      "    threshold decide (or to always use the primary single-seed fit\n"
+                      "    when the threshold is 0).",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
 
@@ -3637,6 +3911,36 @@ class AdvancedCUBEWindow(tk.Toplevel):
                     self._vars[k].set(val)
                 except Exception:
                     pass
+        self._bodypart_weights = dict(cfg.get("bodypart_weights") or {})
+        self._refresh_bpw_status()
+
+    def _refresh_bpw_status(self):
+        if not hasattr(self, "_bpw_status"):
+            return
+        if self._bodypart_weights:
+            n = len(self._bodypart_weights)
+            self._bpw_status.configure(
+                text=f"Body-region weighting: enabled ({n} bodypart weight(s) set)")
+        else:
+            self._bpw_status.configure(
+                text="Body-region weighting: disabled (uniform)")
+
+    def _open_bodypart_weights(self):
+        try:
+            # Pre-fill from this project's own weights if it has any;
+            # otherwise offer the last weights applied in ANY project as a
+            # starting point (still requires the user to click Apply in the
+            # editor below before it's committed to this project's cfg).
+            _prefill = self._bodypart_weights or _load_saved_body_region_weights()
+            win = BodyPartWeightWindow(self, self._session, _prefill)
+            self.wait_window(win)
+            result = getattr(win, "result", None)
+            if result is not None:      # None = Cancel; keep previous weights
+                self._bodypart_weights = dict(result)
+            self._refresh_bpw_status()
+        except Exception as e:
+            messagebox.showerror("Body-Region Weights",
+                                  f"Could not open the body-region weight editor:\n{e}")
 
     def _restore(self):
         try:
@@ -3657,7 +3961,501 @@ class AdvancedCUBEWindow(tk.Toplevel):
                 cfg[k] = var.get()
             except Exception:
                 pass
+        cfg["bodypart_weights"] = getattr(self, "_bodypart_weights", {}) or {}
         self._session["engine_cfg"] = cfg
+        self.destroy()
+
+
+#
+#  BODY-REGION FEATURE WEIGHTING WINDOW  (issue 1b)
+#
+
+
+class BodyPartWeightWindow(tk.Toplevel):
+    """
+    Optional per-body-region feature weighting editor, opened from
+    AdvancedCUBEWindow.  Peeks bodyparts from the first DLC file found in the
+    session's folders (cube_core.peek_dlc_bodyparts — header-only, no full
+    load), groups them via cube_core.group_bodyparts_by_region, and renders
+    one bordered card per region (plain tk widgets, not ttk.LabelFrame — see
+    __init__) with a single 0.1-3.0 weight slider (default 1.0 = uniform, no
+    separate on/off checkbox).
+
+    A region is "enabled" implicitly: any slider left at 1.0 is treated as
+    not customised, and any slider moved away from 1.0 is treated as an
+    explicit weight for that region's bodyparts. So is the window as a
+    whole -> Apply produces an empty {} weights dict iff every slider is
+    still at 1.0 (uniform weighting = today's exact behaviour).
+
+    On Apply, self.result is set to the expanded per-bodypart dict
+    ({bodypart_name: weight} for every bodypart in a region whose slider
+    was moved off 1.0) and the window closes.  On Cancel, self.result stays
+    None so the caller knows to keep whatever weights it already had.
+    """
+
+    def __init__(self, parent, session: "SessionState", initial_weights: dict = None):
+        super().__init__(parent)
+        self.title("Body-Region Weights (optional)")
+        self.configure(bg=C["bg"])
+        self.geometry("480x600")
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+        self.result = None
+
+        self._session = session
+        self._initial_weights = dict(initial_weights or {})
+        self._region_vars: dict = {}   # region -> {"slider": DoubleVar, "bps": [..]}
+
+        # NOTE: region boxes below are plain tk.Frame/tk.Label, not
+        # ttk.LabelFrame — Windows' default "vista" ttk theme ignores
+        # ttk.Style background/foreground configuration for TLabelframe, so a
+        # ttk-based box would silently keep rendering with native (non-theme)
+        # colours regardless of C[] here.  Classic tk widgets always honour
+        # explicit bg/fg, so they're used instead to guarantee both dark and
+        # light themes render correctly.
+
+        # ── Header ───────────────────────────────────────────────────────────
+        tk.Label(self, text="  Body-Region Feature Weights",
+                 font=("Segoe UI", 12, "bold"),
+                 bg=C["bg"], fg=C["cyan"]).pack(anchor="w", padx=10, pady=(10, 2))
+        tk.Label(self,
+                 text="  Up-weight or down-weight anatomical regions in the pairwise-distance /\n"
+                      "  velocity / acceleration features before UMAP.  Move a slider off 1.0 to\n"
+                      "  customise that region; leave it at 1.0 for uniform (default) weighting.",
+                 font=("Segoe UI", 8), bg=C["bg"], fg=C["subtext"],
+                 justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+
+        # ── Scrollable region list ──────────────────────────────────────────
+        canvas = tk.Canvas(self, bg=C["bg"], highlightthickness=0)
+        sb = tk.Scrollbar(self, orient="vertical", command=canvas.yview,
+                          bg=C["card"], troughcolor=C["bg"])
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(fill="both", expand=True, padx=(10, 0))
+        inner = tk.Frame(canvas, bg=C["bg"])
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(win_id, width=e.width))
+
+        self._status_lbl = tk.Label(inner, text="Loading bodyparts...",
+                                     font=("Segoe UI", 9), bg=C["bg"], fg=C["dim"])
+        self._status_lbl.pack(anchor="w", padx=4, pady=8)
+
+        # ── Bottom buttons ───────────────────────────────────────────────────
+        btn_f = tk.Frame(self, bg=C["bg"])
+        btn_f.pack(side="bottom", fill="x", pady=8, padx=12)
+        tk.Button(btn_f, text="Cancel", font=("Segoe UI", 9),
+                  bg=C["btn"], fg=C["btn_fg"], relief="flat",
+                  padx=10, pady=5, cursor="hand2",
+                  command=self.destroy).pack(side="left")
+        self._apply_btn = tk.Button(btn_f, text="Apply", font=("Segoe UI", 10, "bold"),
+                                    bg=C["purple"], fg="white", relief="flat",
+                                    padx=16, pady=5, cursor="hand2",
+                                    command=self._apply)
+        self._apply_btn.pack(side="right")
+
+        self._build_regions(inner)
+
+    # -- bodypart discovery ---------------------------------------------------
+    def _find_first_dlc_file(self):
+        """Look in bsoid_ready_dirs first (post-prep DLC output), then the raw
+        video_folders, mirroring the pipeline's own preference order."""
+        candidates = []
+        try:
+            candidates.extend(self._session.get("bsoid_ready_dirs") or [])
+        except Exception:
+            pass
+        try:
+            candidates.extend(self._session.get("video_folders") or [])
+        except Exception:
+            pass
+        for folder in candidates:
+            try:
+                if not folder or not Path(folder).is_dir():
+                    continue
+                files = find_dlc_files(folder) if find_dlc_files else []
+                if files:
+                    return files[0]
+            except Exception:
+                continue
+        return None
+
+    def _build_regions(self, parent):
+        if find_dlc_files is None or peek_dlc_bodyparts is None or group_bodyparts_by_region is None:
+            self._status_lbl.configure(
+                text="Body-region weighting requires cube_core (not loaded).")
+            self._apply_btn.configure(state="disabled")
+            return
+
+        dlc_path = self._find_first_dlc_file()
+        if dlc_path is None:
+            self._status_lbl.configure(
+                text="No DLC file found in this session's folders yet.\n"
+                     "Run Step 1/2 first, then reopen this window to customise weights.")
+            self._apply_btn.configure(state="disabled")
+            return
+
+        try:
+            bodyparts = peek_dlc_bodyparts(dlc_path)
+        except Exception as e:
+            bodyparts = []
+            self._status_lbl.configure(text=f"Could not read bodyparts from:\n{dlc_path}\n({e})")
+
+        if not bodyparts:
+            self._status_lbl.configure(
+                text=f"Could not read any bodyparts from:\n{dlc_path}")
+            self._apply_btn.configure(state="disabled")
+            return
+
+        self._status_lbl.configure(
+            text=f"Bodyparts detected from:\n{Path(dlc_path).name}  ({len(bodyparts)} bodyparts)",
+            justify="left")
+
+        try:
+            regions = group_bodyparts_by_region(bodyparts)
+        except Exception as e:
+            self._status_lbl.configure(text=f"group_bodyparts_by_region failed: {e}")
+            self._apply_btn.configure(state="disabled")
+            return
+
+        for region, bps in regions.items():
+            if not bps:
+                continue
+            # Bordered "card" via highlightthickness rather than ttk.LabelFrame
+            # (see note in __init__ re: the vista ttk theme).
+            frame = tk.Frame(parent, bg=C["card"], highlightthickness=1,
+                             highlightbackground=C["border"],
+                             highlightcolor=C["border"])
+            frame.pack(fill="x", padx=4, pady=4)
+            tk.Label(frame, text=region, font=("Segoe UI", 9, "bold"),
+                    bg=C["card"], fg=C["cyan"]).pack(anchor="w", padx=4, pady=(4, 0))
+
+            # Pre-fill from initial_weights if any bodypart in this region was
+            # previously customised (average of its set weights).
+            prior_vals = [self._initial_weights[bp] for bp in bps
+                          if bp in self._initial_weights]
+            init_val = float(sum(prior_vals) / len(prior_vals)) if prior_vals else 1.0
+
+            slider_var = tk.DoubleVar(value=round(init_val, 1))
+
+            slider = tk.Scale(frame, from_=0.1, to=3.0, resolution=0.1,
+                              orient="horizontal", variable=slider_var,
+                              bg=C["card"], fg=C["text"],
+                              troughcolor=C["card2"], highlightthickness=0,
+                              activebackground=C["cyan"],
+                              font=("Segoe UI", 8))
+            slider.pack(fill="x", padx=4, pady=(2, 2))
+
+            bp_text = ", ".join(bps)
+            if len(bp_text) > 90:
+                bp_text = bp_text[:87] + "..."
+            tk.Label(frame, text=bp_text, font=("Segoe UI", 7),
+                    bg=C["card"], fg=C["subtext"], wraplength=420,
+                    justify="left").pack(anchor="w", padx=4, pady=(0, 4))
+
+            self._region_vars[region] = {"slider": slider_var, "bps": bps}
+
+    def _apply(self):
+        weights = {}
+        for info in self._region_vars.values():
+            w = float(info["slider"].get())
+            if abs(w - 1.0) < 1e-9:
+                continue
+            for bp in info["bps"]:
+                weights[bp] = w
+        self.result = weights
+        _save_body_region_weights(weights)
+        self.destroy()
+
+
+#
+#  3D DLC SETTINGS WINDOW
+
+
+class ThreeDSettingsWindow(tk.Toplevel):
+    """
+    Modal popup for 3D DLC + Anipose settings.
+    Mirrors the AdvancedDLCWindow / AdvancedCUBEWindow pattern.
+    """
+
+    def __init__(self, parent, session):
+        super().__init__(parent)
+        self._session = session
+        self.title("3D DLC + Anipose Settings")
+        self.resizable(False, False)
+        self.configure(bg=C["bg"])
+        self.grab_set()
+
+        pad = dict(padx=10, pady=4)
+
+        def _hdr(text, color=C["cyan"]):
+            tk.Label(self, text=text, font=("Segoe UI", 9, "bold"),
+                     bg=C["bg"], fg=color).pack(anchor="w", padx=10, pady=(8, 2))
+
+        def _row(label_text):
+            row = tk.Frame(self, bg=C["bg"])
+            row.pack(fill="x", **pad)
+            tk.Label(row, text=label_text, width=28, anchor="w",
+                     font=("Segoe UI", 9), bg=C["bg"],
+                     fg=C["text"]).pack(side="left")
+            return row
+
+        # ── Enable 3D mode ────────────────────────────────────────────────────
+        _hdr("3D Mode")
+        self._enabled = tk.BooleanVar(
+            value=bool(session.get("dlc_3d_enabled", False)))
+        row = _row("Enable 3D DLC + Anipose:")
+        tk.Checkbutton(row, variable=self._enabled, bg=C["bg"],
+                       fg=C["text"], selectcolor=C["card"],
+                       activebackground=C["bg"]).pack(side="left")
+
+        # ── Calibration folder ───────────────────────────────────────────────
+        _hdr("Folders")
+        self._calib = tk.StringVar(
+            value=str(session.get("dlc_3d_calib_folder", "")))
+        row = _row("Calibration folder (→ calibration.toml):")
+        tk.Entry(row, textvariable=self._calib, width=38,
+                 bg=C["card2"], fg=C["text"],
+                 insertbackground=C["text"],
+                 relief="flat", font=("Segoe UI", 9)).pack(side="left")
+        tk.Button(row, text="Browse…", bg=C["btn"], fg=C["subtext"],
+                  relief="flat", font=("Segoe UI", 8), cursor="hand2",
+                  command=lambda: self._browse_dir(self._calib)
+                  ).pack(side="left", padx=(4, 0))
+
+        # Resolved TOML label
+        self._toml_lbl = tk.Label(self, text="", font=("Segoe UI", 7),
+                                   bg=C["bg"], fg=C["dim"])
+        self._toml_lbl.pack(anchor="w", padx=36, pady=(0, 2))
+        self._calib.trace_add("write",
+                               lambda *_: self._refresh_toml_label())
+        self._refresh_toml_label()
+
+        # ── Output folder ─────────────────────────────────────────────────────
+        self._output = tk.StringVar(
+            value=str(session.get("dlc_3d_output_folder", "")))
+        row = _row("Output folder (blank = source folder):")
+        tk.Entry(row, textvariable=self._output, width=38,
+                 bg=C["card2"], fg=C["text"],
+                 insertbackground=C["text"],
+                 relief="flat", font=("Segoe UI", 9)).pack(side="left")
+        tk.Button(row, text="Browse…", bg=C["btn"], fg=C["subtext"],
+                  relief="flat", font=("Segoe UI", 8), cursor="hand2",
+                  command=lambda: self._browse_dir(self._output)
+                  ).pack(side="left", padx=(4, 0))
+
+        # ── Camera labels ─────────────────────────────────────────────────────
+        _hdr("Camera Configuration")
+        labels_raw = session.get("dlc_3d_cam_labels", ["cam0","cam1","cam2","cam3"])
+        if isinstance(labels_raw, list):
+            labels_raw = ",".join(labels_raw)
+        self._cam_labels = tk.StringVar(value=str(labels_raw))
+        row = _row("Camera labels (comma-separated):")
+        tk.Entry(row, textvariable=self._cam_labels, width=28,
+                 bg=C["card2"], fg=C["text"],
+                 insertbackground=C["text"],
+                 relief="flat", font=("Segoe UI", 9)).pack(side="left")
+
+        # ── Likelihood aggregation ────────────────────────────────────────────
+        _hdr("Triangulation Options")
+        self._ll_agg = tk.StringVar(
+            value=str(session.get("dlc_3d_ll_agg", "min")))
+        row = _row("Confidence aggregation across cams:")
+        for val, lbl in [("min","min (safest)"), ("mean","mean"),
+                          ("max","max (most permissive)")]:
+            tk.Radiobutton(row, text=lbl, variable=self._ll_agg, value=val,
+                           bg=C["bg"], fg=C["text"],
+                           selectcolor=C["card"],
+                           activebackground=C["bg"],
+                           font=("Segoe UI", 9)).pack(side="left", padx=4)
+
+        self._use_ransac = tk.BooleanVar(
+            value=bool(session.get("dlc_3d_use_ransac", True)))
+        row = _row("RANSAC triangulation (robust for occlusions):")
+        tk.Checkbutton(row, variable=self._use_ransac, bg=C["bg"],
+                       fg=C["text"], selectcolor=C["card"],
+                       activebackground=C["bg"]).pack(side="left")
+
+        self._ransac_thr = tk.StringVar(
+            value=str(session.get("dlc_3d_ransac_threshold", 0.5)))
+        row = _row("RANSAC reprojection threshold (px):")
+        tk.Entry(row, textvariable=self._ransac_thr, width=8,
+                 bg=C["card2"], fg=C["text"],
+                 insertbackground=C["text"],
+                 relief="flat", font=("Segoe UI", 9)).pack(side="left")
+
+        self._ll_thr = tk.StringVar(
+            value=str(session.get("dlc_3d_ll_threshold", 0.0)))
+        row = _row("Point confidence threshold (0 = off, e.g. 0.3):")
+        tk.Entry(row, textvariable=self._ll_thr, width=8,
+                 bg=C["card2"], fg=C["text"],
+                 insertbackground=C["text"],
+                 relief="flat", font=("Segoe UI", 9)).pack(side="left")
+
+        self._ll_gate = tk.StringVar(
+            value=str(session.get("dlc_3d_ll_gate", 0.6)))
+        row = _row("Pre-triangulation likelihood gate (0 = off, default 0.6):")
+        tk.Entry(row, textvariable=self._ll_gate, width=8,
+                 bg=C["card2"], fg=C["text"],
+                 insertbackground=C["text"],
+                 relief="flat", font=("Segoe UI", 9)).pack(side="left")
+
+        self._median_win = tk.StringVar(
+            value=str(session.get("dlc_3d_median_window", 3)))
+        row = _row("Temporal median filter — frames (0 = off, default 3):")
+        tk.Entry(row, textvariable=self._median_win, width=8,
+                 bg=C["card2"], fg=C["text"],
+                 insertbackground=C["text"],
+                 relief="flat", font=("Segoe UI", 9)).pack(side="left")
+
+        # ── Post-processing options ───────────────────────────────────────────
+        _hdr("Post-processing")
+        self._del_orig = tk.BooleanVar(
+            value=bool(session.get("dlc_3d_delete_orig_videos", False)))
+        row = _row("Delete camera videos after quad composite:")
+        tk.Checkbutton(row, variable=self._del_orig, bg=C["bg"],
+                       fg=C["text"], selectcolor=C["card"],
+                       activebackground=C["bg"]).pack(side="left")
+
+        self._del_h5s = tk.BooleanVar(
+            value=bool(session.get("dlc_3d_delete_cam_h5s", False)))
+        row = _row("Delete per-camera H5s after 3D H5 is created:")
+        tk.Checkbutton(row, variable=self._del_h5s, bg=C["bg"],
+                       fg=C["text"], selectcolor=C["card"],
+                       activebackground=C["bg"]).pack(side="left")
+
+        self._skel_vid = tk.BooleanVar(
+            value=bool(session.get("dlc_3d_export_skeleton_video", False)))
+        row = _row("Export 3D skeleton visualization video:")
+        tk.Checkbutton(row, variable=self._skel_vid, bg=C["bg"],
+                       fg=C["text"], selectcolor=C["card"],
+                       activebackground=C["bg"]).pack(side="left")
+
+        # ── Session scan ──────────────────────────────────────────────────────
+        _hdr("Session Discovery")
+        scan_row = tk.Frame(self, bg=C["bg"])
+        scan_row.pack(fill="x", padx=10, pady=(2, 4))
+        tk.Button(scan_row, text="Scan video source folders for sessions",
+                  font=("Segoe UI", 9, "bold"), bg=C["btn"], fg=C["cyan"],
+                  relief="flat", padx=8, pady=4, cursor="hand2",
+                  command=self._scan_sessions).pack(side="left")
+        self._scan_lbl = tk.Label(scan_row, text="", font=("Segoe UI", 8),
+                                   bg=C["bg"], fg=C["subtext"])
+        self._scan_lbl.pack(side="left", padx=8)
+
+        self._sess_text = tk.Text(self, height=6, width=72,
+                                   bg=C["card2"], fg=C["text"],
+                                   font=("Consolas", 8),
+                                   state="disabled", relief="flat")
+        self._sess_text.pack(fill="x", padx=10, pady=(0, 4))
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btn_row = tk.Frame(self, bg=C["bg"])
+        btn_row.pack(fill="x", padx=10, pady=(6, 10))
+        tk.Button(btn_row, text="Apply & Close",
+                  font=("Segoe UI", 9, "bold"), bg=C["cyan"], fg="white",
+                  relief="flat", padx=12, pady=5, cursor="hand2",
+                  command=self._apply).pack(side="right")
+        tk.Button(btn_row, text="Cancel",
+                  font=("Segoe UI", 9), bg=C["btn"], fg=C["subtext"],
+                  relief="flat", padx=10, pady=5, cursor="hand2",
+                  command=self.destroy).pack(side="right", padx=(0, 6))
+
+        self.update_idletasks()
+        self.geometry(
+            f"+{parent.winfo_rootx() + 60}+{parent.winfo_rooty() + 60}")
+
+    def _browse_dir(self, var: tk.StringVar):
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Select folder")
+        if d:
+            var.set(d)
+
+    def _refresh_toml_label(self):
+        calib = self._calib.get().strip()
+        if not calib:
+            self._toml_lbl.configure(text="")
+            return
+        toml = Path(calib) / "calibration.toml"
+        if toml.exists():
+            self._toml_lbl.configure(
+                text=f"✓  {toml}", fg=C["green"])
+        else:
+            self._toml_lbl.configure(
+                text=f"✗  calibration.toml not found in that folder", fg=C["red"])
+
+    def _scan_sessions(self):
+        from cube_3d_dlc import find_step0_sessions
+        _raw = (self._session.get("dlc_3d_source_folders") or
+                self._session.get("video_folders", []))
+        source_folders = [Path(f) for f in _raw if Path(f).is_dir()]
+        if not source_folders:
+            self._scan_lbl.configure(
+                text="Add video source folders in the main panel first.")
+            return
+        try:
+            all_sessions: list = []
+            seen: set = set()
+            for vf in source_folders:
+                for s in find_step0_sessions(vf):
+                    if s["session_id"] not in seen:
+                        seen.add(s["session_id"])
+                        all_sessions.append(s)
+        except Exception as e:
+            self._scan_lbl.configure(text=f"Error: {e}")
+            return
+        self._scan_lbl.configure(
+            text=f"{len(all_sessions)} session(s) across {len(source_folders)} folder(s)")
+        lines = []
+        for s in all_sessions:
+            cams = ", ".join(sorted(s["cameras"].keys()))
+            n_frames = ""
+            if s["report"] and "cameras" in s["report"]:
+                counts = [c.get("n_output_frames", 0)
+                          for c in s["report"]["cameras"]]
+                if counts:
+                    n_frames = f"  {counts[0]} frames"
+            lines.append(f"{s['session_id']}  [{cams}]{n_frames}")
+        self._sess_text.configure(state="normal")
+        self._sess_text.delete("1.0", "end")
+        self._sess_text.insert("end", "\n".join(lines))
+        self._sess_text.configure(state="disabled")
+
+    def _apply(self):
+        s = self._session
+        s["dlc_3d_enabled"]          = bool(self._enabled.get())
+        s["dlc_3d_calib_folder"]     = self._calib.get().strip()
+        s["dlc_3d_output_folder"]    = self._output.get().strip()
+        raw = self._cam_labels.get().strip()
+        s["dlc_3d_cam_labels"]       = [c.strip() for c in raw.split(",")
+                                         if c.strip()]
+        s["dlc_3d_ll_agg"]             = self._ll_agg.get()
+        s["dlc_3d_use_ransac"]         = bool(self._use_ransac.get())
+        try:
+            s["dlc_3d_ransac_threshold"] = float(self._ransac_thr.get())
+        except ValueError:
+            s["dlc_3d_ransac_threshold"] = 0.5
+        try:
+            s["dlc_3d_ll_threshold"]     = float(self._ll_thr.get())
+        except ValueError:
+            s["dlc_3d_ll_threshold"]     = 0.0
+        try:
+            s["dlc_3d_ll_gate"]          = float(self._ll_gate.get())
+        except ValueError:
+            s["dlc_3d_ll_gate"]          = 0.6
+        try:
+            _mw = int(self._median_win.get())
+            if _mw > 1 and _mw % 2 == 0:
+                _mw += 1  # enforce odd kernel silently
+            s["dlc_3d_median_window"]    = _mw
+        except ValueError:
+            s["dlc_3d_median_window"]    = 3
+        s["dlc_3d_delete_orig_videos"] = bool(self._del_orig.get())
+        s["dlc_3d_delete_cam_h5s"]   = bool(self._del_h5s.get())
+        s["dlc_3d_export_skeleton_video"] = bool(self._skel_vid.get())
         self.destroy()
 
 
@@ -4172,8 +4970,8 @@ class CubeSplash(tk.Toplevel):
         super().__init__(parent)
         self._on_done = on_done
 
-        bg  = "#09090f" if is_dark else "#f0f2f5"
-        sub = "#4a4a6a" if is_dark else "#aaaaaa"
+        bg  = "#09090f" if is_dark else "#ffffff"
+        sub = "#4a4a6a" if is_dark else "#888888"
         bdr = "#2a2a4a" if is_dark else "#dee2e6"
 
         self.overrideredirect(True)
@@ -4264,7 +5062,7 @@ class PipelineApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.withdraw()   # hidden while building UI; shown at end of __init__
-        self.title("CUBE: Comprehensive Unsupervised Behavioral Explorer  v3.0")
+        self.title("CUBE: Comprehensive Unsupervised Behavioral Explorer  v5.0")
 
         _ico = HERE / "CUBE.ico"
         if _ico.is_file():
@@ -4301,6 +5099,15 @@ class PipelineApp(tk.Tk):
         self._chain_engine_after_prep = False
 
         self._build_ui()
+        # Restore ntfy topic saved from a previous session
+        _ntfy_file = HERE / "ntfy_topic.txt"
+        if _ntfy_file.is_file():
+            try:
+                _saved_topic = _ntfy_file.read_text(encoding="utf-8").strip()
+                if _saved_topic:
+                    self._settings.set_val("ntfy_topic", _saved_topic)
+            except Exception:
+                pass
         self._initial_log()
         self._tick_timer()
 
@@ -4357,10 +5164,12 @@ class PipelineApp(tk.Tk):
         hdr.pack(fill="x")
         tk.Label(hdr, text="  CUBE",
                  font=("Segoe UI", 18, "bold"),
-                 bg=C["log_bg"], fg=C["accent"]).pack(side="left", padx=(16, 0), pady=10)
+                 bg=C["log_bg"], fg=C["cube_title"]).pack(
+            side="left", padx=(16, 0), pady=(6, 8), anchor="s")
         tk.Label(hdr, text="  Comprehensive Unsupervised Behavioral Explorer",
                  font=("Segoe UI", 13),
-                 bg=C["log_bg"], fg=C["text"]).pack(side="left")
+                 bg=C["log_bg"], fg=C["text"]).pack(
+            side="left", pady=(0, 8), anchor="s")
 
         right = tk.Frame(hdr, bg=C["log_bg"])
         right.pack(side="right", padx=12)
@@ -4532,6 +5341,11 @@ class PipelineApp(tk.Tk):
                   font=("Segoe UI", 8, "bold"), bg=C["btn"], fg=C["purple"],
                   relief="flat", padx=8, pady=4, cursor="hand2",
                   command=self._open_cube_advanced).pack(side="left", pady=2)
+        tk.Button(adv_row, text="⬡  3D DLC Settings...",
+                  font=("Segoe UI", 8, "bold"), bg=C["btn"], fg="#4fc3f7",
+                  relief="flat", padx=8, pady=4, cursor="hand2",
+                  command=self._open_3d_settings).pack(side="left",
+                                                        padx=(4, 0), pady=2)
 
         # "Export Extra UMAP Evolution Videos" lives in the Tools menu bar
         # (see _build_menubar) rather than as a button in the main panel.
@@ -4540,17 +5354,19 @@ class PipelineApp(tk.Tk):
         right = tk.Frame(top, bg=C["bg"])
         right.pack(side="left", fill="both", expand=True,
                    padx=(4,10), pady=8)
-        for i in range(5):
+        _n_cards = len(STEP_META)
+        for i in range(_n_cards):
             right.columnconfigure(i, weight=1, uniform="card")
         right.rowconfigure(0, weight=1)
 
         self._cards: dict[str, StepCard] = {}
         CMDS = {
-            "dlc":       self._launch_dlc,
-            "bsoid_prep":self._launch_bsoid_prep,
-            "bsoid_run": self._launch_bsoid_run,
-            "annotate":  self._launch_annotate,
-            "analyse":   self._launch_analyse,
+            "dlc":        self._launch_dlc,
+            "dlc_3d":     self._launch_3d_dlc,
+            "bsoid_prep": self._launch_bsoid_prep,
+            "bsoid_run":  self._launch_bsoid_run,
+            "annotate":   self._launch_annotate,
+            "analyse":    self._launch_analyse,
         }
         for i, meta in enumerate(STEP_META):
             card = StepCard(right, meta, CMDS[meta["key"]])
@@ -4561,14 +5377,14 @@ class PipelineApp(tk.Tk):
         pb_outer = tk.Frame(right, bg=C["panel"],
                             highlightbackground=C["border"],
                             highlightthickness=1)
-        pb_outer.grid(row=1, column=0, columnspan=5, sticky="ew",
+        pb_outer.grid(row=1, column=0, columnspan=_n_cards, sticky="ew",
                       padx=4, pady=(6,0))
         right.rowconfigure(1, minsize=90)
         self._pb = DualProgressBar(pb_outer)
         self._pb.pack(fill="x")
 
         sb = tk.Frame(right, bg=C["card2"])
-        sb.grid(row=2, column=0, columnspan=5, sticky="ew", padx=4, pady=(4,0))
+        sb.grid(row=2, column=0, columnspan=_n_cards, sticky="ew", padx=4, pady=(4,0))
         self._status_lbl = tk.Label(sb, text="Ready.",
                                      font=("Segoe UI", 9),
                                      bg=C["card2"], fg=C["subtext"])
@@ -4592,10 +5408,10 @@ class PipelineApp(tk.Tk):
 
     def _initial_log(self):
         self._logger.step("=" * 60)
-        self._logger.step("  CUBE: Comprehensive Unsupervised Behavioral Explorer  v3.0")
+        self._logger.step("  CUBE: Comprehensive Unsupervised Behavioral Explorer  v5.0")
         self._logger.step("=" * 60)
         if CORE_OK:
-            self._logger.success("  ✓  cube_core v2 loaded")
+            self._logger.success("  ✓  cube_core v5 loaded")
         else:
             self._logger.error(f"  ✗  cube_core NOT found: {_CORE_ERR}")
         if _MOD_ANALYSER:
@@ -4713,7 +5529,8 @@ class PipelineApp(tk.Tk):
         self._cards[key].set_status("running")
         self._status(f"Running step: {key} ")
         self._start_step_timer()
-        step_idx = {"dlc":0, "bsoid_prep":1, "bsoid_run":2, "annotate":3, "analyse":4}.get(key, -1)
+        step_idx = {"dlc":0, "dlc_3d":1, "bsoid_prep":2,
+                    "bsoid_run":3, "annotate":4, "analyse":5}.get(key, -1)
         self._update_flow_bar(step_idx)
 
         def _worker():
@@ -4728,9 +5545,9 @@ class PipelineApp(tk.Tk):
                 self._after(lambda: self._status(f"Step '{key}' complete v"))
                 self._after(lambda: self._pb.step_done())
                 self._logger.success(f"Step '{key}' complete.")
-                # Auto-chain Steps 2+3 after DLC if user enabled it
-                if key == "dlc" and self._settings.get("auto_bsoid", False):
-                    self._logger.step("Auto-run: launching Steps 2+3...")
+                # Auto-chain Steps 2+3 after DLC (2D or 3D) if user enabled it
+                if key in ("dlc", "dlc_3d") and self._settings.get("auto_bsoid", False):
+                    self._logger.step("Auto-run: launching Step 3 (pre-processing) → Step 4 (BSoid analysis)...")
                     # Clear _running on the main-thread queue BEFORE the launch
                     # callback so _run_step doesn't see it still True (race condition).
                     self._after(lambda: setattr(self, '_running', False))
@@ -4738,7 +5555,7 @@ class PipelineApp(tk.Tk):
                 # If prep was auto-chained, trigger engine next
                 elif key == "bsoid_prep" and getattr(self, "_chain_engine_after_prep", False):
                     self._chain_engine_after_prep = False
-                    self._logger.step("Auto-run: launching Step 3 (clustering)...")
+                    self._logger.step("Auto-run: launching Step 4 (BSoid analysis / clustering)...")
                     self._after(lambda: setattr(self, '_running', False))
                     self._after(self._launch_bsoid_run)
             except Exception:
@@ -4776,6 +5593,9 @@ class PipelineApp(tk.Tk):
     def _open_cube_advanced(self):
         AdvancedCUBEWindow(self, self._session)
 
+    def _open_3d_settings(self):
+        ThreeDSettingsWindow(self, self._session)
+
     #   STEP LAUNCHERS
 
     def _launch_dlc(self):
@@ -4793,6 +5613,35 @@ class PipelineApp(tk.Tk):
             if not dlg.confirmed:
                 return
         self._run_step("dlc", _run_dlc_step,
+                       self._session, self._settings, self._logger,
+                       self._pb, self._after)
+
+    def _launch_3d_dlc(self):
+        if not CORE_OK:
+            messagebox.showerror("Missing", "cube_core.py not found.")
+            return
+        if not self._session.get("dlc_3d_enabled", False):
+            messagebox.showinfo("3D DLC",
+                "Enable 3D Mode via '⬡  3D DLC Settings…' first.")
+            return
+        calib_folder = self._session.get("dlc_3d_calib_folder", "")
+        if not calib_folder or not (Path(calib_folder) / "calibration.toml").exists():
+            messagebox.showerror("Calibration missing",
+                f"calibration.toml not found in:\n{calib_folder}\n\n"
+                "Please set the calibration folder in 3D DLC Settings.")
+            return
+        if not self._session.get("video_folders", []):
+            messagebox.showwarning("No source folders",
+                "Add at least one video source folder in the main panel "
+                "before running 3D DLC.")
+            return
+        try:
+            from cube_3d_dlc import _run_3d_dlc_step
+        except ImportError as e:
+            messagebox.showerror("Import Error",
+                f"Could not import cube_3d_dlc.py:\n{e}")
+            return
+        self._run_step("dlc_3d", _run_3d_dlc_step,
                        self._session, self._settings, self._logger,
                        self._pb, self._after)
 
@@ -5475,6 +6324,16 @@ class PipelineApp(tk.Tk):
         self._session = SessionState.load(Path(p))
         self._folder_list.set_folders(self._session["video_folders"])
         self._settings.apply_session(self._session)
+        # If the loaded session has no ntfy topic, fall back to the saved file
+        if not self._settings.get("ntfy_topic", ""):
+            _ntfy_file = HERE / "ntfy_topic.txt"
+            if _ntfy_file.is_file():
+                try:
+                    _saved_topic = _ntfy_file.read_text(encoding="utf-8").strip()
+                    if _saved_topic:
+                        self._settings.set_val("ntfy_topic", _saved_topic)
+                except Exception:
+                    pass
         # Clear any C-drive output_root saved in the session file so
         # _resolve_work_dir() will re-derive from the data drive.
         _sys_drive = Path.home().drive.upper()
@@ -5590,14 +6449,16 @@ def _check_and_warn():
 def _deferred_imports():
     """Import cube_core and companion scripts. Called after the loading splash renders."""
     global CORE_OK, _CORE_ERR
-    global PipelineLogger, BSoidEngine, run_bsoid_prep
+    global PipelineLogger, BSoidEngine, run_bsoid_prep, run_bsoid_prep_batch
     global filter_dlc_h5, cleanup_video_byproducts, create_umap_evolution_video
+    global find_dlc_files, peek_dlc_bodyparts, group_bodyparts_by_region
     global _MOD_VIDEO, _PATH_VIDEO, _MOD_ANALYSER, _PATH_ANALYSER
 
     try:
         from cube_core import (
-            PipelineLogger, BSoidEngine, run_bsoid_prep, filter_dlc_h5,
-            cleanup_video_byproducts, create_umap_evolution_video,
+            PipelineLogger, BSoidEngine, run_bsoid_prep, run_bsoid_prep_batch,
+            filter_dlc_h5, cleanup_video_byproducts, create_umap_evolution_video,
+            find_dlc_files, peek_dlc_bodyparts, group_bodyparts_by_region,
         )
         CORE_OK = True
     except ImportError as _ce:
@@ -5625,7 +6486,7 @@ def main():
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "Cube.BehaviouralExplorer.v3")
+            "Cube.BehaviouralExplorer.v5")
     except Exception:
         pass
 

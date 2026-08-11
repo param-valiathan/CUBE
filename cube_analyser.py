@@ -33,7 +33,7 @@ New in v6:
     minimum total duration (s), or minimum frequency before reclustering
     to discard clusters that are too brief or too rare to be meaningful.
 
-New in v4 (retained):
+New in v4, retained in v5:
     TSV import, colour picker, drag-and-drop reordering, Unbiased Analytics tab.
 """
 
@@ -49,6 +49,15 @@ import sys as _sys_early
 for _k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
            "NUMEXPR_NUM_THREADS"):
     _os_early.environ[_k] = "1"
+
+# Intel's MKL loads libiomp5md.dll while scikit-learn's compiled extensions
+# load VCOMP140.DLL (MSVC OpenMP) into the same process. When both runtimes
+# initialise, Intel's OpenMP detects the "duplicate runtime" condition and
+# calls abort() (OMP Error #15), surfaced by Windows as an unrecoverable
+# native crash (ucrtbase.dll, exception 0xc0000409) with no Python
+# traceback. Single-threading above does not prevent this; only disabling
+# the duplicate-runtime abort does.
+_os_early.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 # When run from a desktop shortcut without `conda activate`, the conda env's
 # DLL directory is absent from PATH.  Loky workers are spawned fresh on Windows
@@ -399,6 +408,80 @@ def find_umap_data(root: pathlib.Path):
     return None, None
 
 
+def find_cluster_confidence(root: pathlib.Path) -> pathlib.Path | None:
+    """
+    Search for cluster_confidence.csv saved by cube_core (BSoidEngine's
+    compute_cluster_confidence_profile). Mirrors find_umap_data's search
+    strategy: recurse downward from root, then walk up to 4 parent levels.
+    Returns the most-recently-modified match, or None if absent (optional file).
+    """
+    def _search(directory: pathlib.Path):
+        candidates = sorted(directory.rglob("cluster_confidence.csv"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+        return candidates[0] if candidates else None
+
+    hit = _search(root)
+    if hit:
+        return hit
+
+    candidate = root.resolve()
+    for _ in range(4):
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+        hit = _search(candidate)
+        if hit:
+            return hit
+
+    return None
+
+
+def load_cluster_confidence(path: pathlib.Path) -> dict:
+    """Load cluster_confidence.csv into {cluster_id: low_confidence_flag(bool)}."""
+    try:
+        df = pd.read_csv(path)
+        if "cluster_id" not in df.columns or "low_confidence_flag" not in df.columns:
+            return {}
+        return {
+            int(row["cluster_id"]): bool(row["low_confidence_flag"])
+            for _, row in df.iterrows()
+        }
+    except Exception:
+        return {}
+
+
+# Per-run-root cache of turned_away_cluster_id, so the same
+# bsoid_run_summary.json isn't re-read for every file in a multi-session
+# folder. Value is None for "no manifest / no reserved id" (cached too, so a
+# missing-file lookup isn't retried on every load).
+_TURNED_AWAY_ID_CACHE: dict = {}
+
+
+def _turned_away_cluster_id_for(path: pathlib.Path):
+    """
+    cube_core.py's BSoidEngine.run() writes bout CSVs to
+    <output_dir>/bout_lengths/<stem>_bout_lengths[_hmm].csv and, since Aug
+    2026, a sibling <output_dir>/bsoid_run_summary.json with a
+    "turned_away_cluster_id" field (the reserved "Turned Away" pseudo-cluster
+    id used in those CSVs, or None when exclude_turned_away=False). Returns
+    that id, or None if there's no manifest (older runs, or non-CUBE CSVs) --
+    a silent no-op fallback, not an error.
+    """
+    run_root = str(path.parent.parent)
+    if run_root in _TURNED_AWAY_ID_CACHE:
+        return _TURNED_AWAY_ID_CACHE[run_root]
+    ta_id = None
+    try:
+        _manifest = pathlib.Path(run_root) / "bsoid_run_summary.json"
+        if _manifest.is_file():
+            ta_id = json.loads(_manifest.read_text()).get("turned_away_cluster_id")
+    except Exception:
+        ta_id = None
+    _TURNED_AWAY_ID_CACHE[run_root] = ta_id
+    return ta_id
+
+
 def load_csv(path: pathlib.Path) -> pd.DataFrame:
     """Load a B-SOiD bout_lengths CSV (original format). Raises ValueError on error."""
     required = {"B-SOiD labels", "Start time (frames)", "Run lengths"}
@@ -421,6 +504,12 @@ def load_csv(path: pathlib.Path) -> pd.DataFrame:
     })
     for col in ("label", "start_frame", "run_len"):
         df[col] = df[col].astype(int)
+    # Drop "Turned Away" bouts (biologically meaningless for dwell-time,
+    # transition, and reclustering analysis) whenever the source run recorded
+    # its reserved id -- see _turned_away_cluster_id_for.
+    _ta_id = _turned_away_cluster_id_for(path)
+    if _ta_id is not None:
+        df = df[df["label"] != int(_ta_id)]
     return df.sort_values("start_frame").reset_index(drop=True)
 
 
@@ -712,14 +801,23 @@ def _present_only_kw(group_vals: dict, group_present: dict):
         return float("nan"), 1.0, n_used
 
 
-def pairwise_posthoc(group_vals: dict) -> list:
-    """Pairwise post-hoc comparisons across experimental groups for one cluster.
+def _pairwise_posthoc_raw(group_vals: dict, paired: bool = False) -> list:
+    """Pairwise post-hoc p-values (no FDR) across groups/levels for one cluster.
 
-    Localises an omnibus Kruskal-Wallis effect to specific group pairs.  Uses
-    Dunn's test (scikit-posthocs) when available, else pairwise Mann-Whitney U,
-    in both cases with a Benjamini-Hochberg adjustment over the pair family.
-    Returns a list of {group_a, group_b, p, q, direction}.  Empty for <2 groups
-    or when scipy is unavailable.
+    paired=False (independent groups): group_vals is {group_name: [values]}.
+    Localises an omnibus Kruskal-Wallis effect to specific group pairs, via
+    Dunn's test (scikit-posthocs) when available, else pairwise Mann-Whitney U.
+
+    paired=True (repeated measures): group_vals is {level_name: {subject_id: value}}.
+    Localises an omnibus Friedman/Wilcoxon effect via pairwise Wilcoxon
+    signed-rank on the subjects common to both levels of each pair — animals
+    missing one of the two levels are simply excluded from that one pairwise
+    test (they may still be usable for other pairs).
+
+    Returns a list of {group_a, group_b, p, direction}.  Empty for <2 groups or
+    when scipy is unavailable.  Callers must apply their own FDR correction —
+    see pairwise_posthoc (single family) and pairwise_posthoc_pooled (many
+    clusters/panels reported together).
     """
     if not SCIPY_OK:
         return []
@@ -728,6 +826,24 @@ def pairwise_posthoc(group_vals: dict) -> list:
     if len(names) < 2:
         return []
     pairs = list(_it.combinations(names, 2))
+
+    if paired:
+        recs = []
+        for a, b in pairs:
+            common = [s for s in group_vals[a] if s in group_vals[b]]
+            va = np.asarray([group_vals[a][s] for s in common], dtype=float)
+            vb = np.asarray([group_vals[b][s] for s in common], dtype=float)
+            try:
+                if len(common) < 1 or np.allclose(va, vb):
+                    p = 1.0
+                else:
+                    _, p = sp_stats.wilcoxon(va, vb)
+            except Exception:
+                p = 1.0
+            direction = ">" if np.mean(va) >= np.mean(vb) else "<" if len(va) else ">"
+            recs.append({"group_a": a, "group_b": b,
+                         "p": float(p), "direction": direction})
+        return recs
 
     # Optional Dunn's test (rank-based, matches the KW omnibus).
     dunn = None
@@ -743,7 +859,7 @@ def pairwise_posthoc(group_vals: dict) -> list:
     except Exception:
         dunn = None
 
-    recs, raw_p = [], []
+    recs = []
     for a, b in pairs:
         va = np.asarray(group_vals[a], dtype=float)
         vb = np.asarray(group_vals[b], dtype=float)
@@ -760,16 +876,64 @@ def pairwise_posthoc(group_vals: dict) -> list:
         direction = ">" if np.mean(va) >= np.mean(vb) else "<"
         recs.append({"group_a": a, "group_b": b,
                      "p": float(p), "direction": direction})
-        raw_p.append(p)
+    return recs
+
+
+def pairwise_posthoc(group_vals: dict, paired: bool = False) -> list:
+    """Pairwise post-hoc comparisons across experimental groups for one cluster.
+
+    BH-adjusts over just this cluster's own pair family.  Fine when reporting a
+    single comparison in isolation; when several clusters/panels are shown
+    together (e.g. one bracket set per subplot in a multi-cluster figure), use
+    pairwise_posthoc_pooled instead — correcting each panel's tiny family in
+    isolation lets the same literal group-pair comparison land on different
+    sides of q<0.05 from one panel to the next for no reason but which other
+    p-values happened to share its local family.
+    See _pairwise_posthoc_raw for the paired= shape contract.
+    Returns a list of {group_a, group_b, p, q, direction}.
+    """
+    recs = _pairwise_posthoc_raw(group_vals, paired=paired)
+    if not recs:
+        return recs
+    raw_p = [r["p"] for r in recs]
     q = benjamini_hochberg(np.asarray(raw_p, dtype=float))
     for r, qq in zip(recs, q):
         r["q"] = float(qq)
     return recs
 
 
+def pairwise_posthoc_pooled(group_vals_list: list, paired: bool = False) -> list:
+    """Pairwise post-hoc across MANY clusters/panels, FDR-pooled into one family.
+
+    group_vals_list: list of per-cluster group_vals dicts (see
+    _pairwise_posthoc_raw for the paired= shape contract — plain
+    {group: [values]} lists when paired=False, {level: {subject_id: value}}
+    dicts when paired=True), one per cluster/panel being reported together.
+    Raw pairwise p-values are computed independently per cluster, then a SINGLE
+    Benjamini-Hochberg pass runs across every pair from every cluster. This
+    keeps post-hoc q-values on the same footing as the omnibus per-cluster q
+    (also corrected across the whole reported family, see run_cluster_statistics)
+    so a q<0.05 star means the same thing whether it's the omnibus bracket or a
+    pairwise one below it, instead of drifting between panels purely from each
+    panel's local, much-smaller correction family.
+
+    Returns a list (same order/length as group_vals_list) of recs lists, each
+    entry {group_a, group_b, p, q, direction}.
+    """
+    per_cluster_raw = [_pairwise_posthoc_raw(gv, paired=paired) for gv in group_vals_list]
+    all_p = [r["p"] for recs in per_cluster_raw for r in recs]
+    if not all_p:
+        return per_cluster_raw
+    all_q = iter(benjamini_hochberg(np.asarray(all_p, dtype=float)))
+    for recs in per_cluster_raw:
+        for r in recs:
+            r["q"] = float(next(all_q))
+    return per_cluster_raw
+
+
 def draw_sig_brackets(ax, group_names: list, all_pts: list, y_start: float,
                       y_step: float, tick_color="#aaaacc",
-                      sig_color="#FF4081") -> float:
+                      sig_color="#FF4081", precomputed_recs: list = None) -> float:
     """Draw pairwise post-hoc significance brackets onto a bar axis.
 
     group_names : x-axis group order (index i sits at x=i).
@@ -778,9 +942,17 @@ def draw_sig_brackets(ax, group_names: list, all_pts: list, y_start: float,
                   y_step.  Returns the y above the topmost bracket so the caller
                   can extend ylim.  Only pairs with q < 0.05 are annotated, so a
                   panel with no significant pairs adds nothing.
+    precomputed_recs : recs (with 'q' already attached) from
+                  pairwise_posthoc_pooled, when this panel is one of several
+                  being reported together and their post-hoc FDR should share
+                  one family.  When omitted, falls back to a local, panel-only
+                  BH correction via pairwise_posthoc.
     """
-    gv = {g: list(v) for g, v in zip(group_names, all_pts)}
-    recs = pairwise_posthoc(gv)
+    if precomputed_recs is not None:
+        recs = precomputed_recs
+    else:
+        gv = {g: list(v) for g, v in zip(group_names, all_pts)}
+        recs = pairwise_posthoc(gv)
     sig = [r for r in recs if r.get("q", 1.0) < 0.05]
     if not sig:
         return y_start
@@ -816,13 +988,19 @@ def family_wide_fdr(stats_by_metric: dict) -> pd.DataFrame:
         for _, r in _df.iterrows():
             rows.append({"metric": _metric,
                          "cluster_id": r.get("cluster_id"),
-                         "pval_kw": float(r.get("pval_kw", 1.0))})
+                         "pval_kw": float(r.get("pval_kw", float("nan")))})
     if not rows:
         return pd.DataFrame(columns=["metric", "cluster_id",
                                      "pval_kw", "qval_family"])
     out = pd.DataFrame(rows)
-    out["qval_family"] = benjamini_hochberg(out["pval_kw"].to_numpy())
-    return out.sort_values("qval_family").reset_index(drop=True)
+    # Exclude NaN p-values from BH pooling: including them as 1.0 inflates the
+    # denominator, reducing power for all valid tests.  NaN rows get qval=NaN.
+    valid_mask = out["pval_kw"].notna()
+    out["qval_family"] = float("nan")
+    if valid_mask.any():
+        out.loc[valid_mask, "qval_family"] = benjamini_hochberg(
+            out.loc[valid_mask, "pval_kw"].to_numpy())
+    return out.sort_values("qval_family", na_position="last").reset_index(drop=True)
 
 
 # Columns produced by the parametric (ANOVA / eta-squared) path.  Hidden from
@@ -841,14 +1019,36 @@ def drop_parametric_columns(df: "pd.DataFrame", show_parametric: bool = False):
 
 def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
                            with_posthoc: bool = True,
-                           _compute_fn=None) -> pd.DataFrame:
+                           _compute_fn=None,
+                           design: str = "independent") -> pd.DataFrame:
     """
-    Run Kruskal-Wallis (non-parametric, robust for small n) and ANOVA across
-    experimental groups for every cluster present in the data.
+    Run an omnibus test + post-hoc across experimental groups/levels for every
+    cluster present in the data, then Benjamini-Hochberg FDR-correct across all
+    clusters tested.
 
-    Returns DataFrame sorted by p-value:
-      cluster_id, stat_kw, pval_kw, stat_anova, pval_anova,
-      effect_size_eta2, direction, group_means...
+    design="independent" (default, unchanged behaviour): groups are different
+      animals (e.g. Control vs MECH PAIN vs THERM PAIN).  Kruskal-Wallis
+      omnibus + ANOVA (parametric, hidden by default) + Dunn's/Mann-Whitney
+      post-hoc + structural-zero two-part decomposition (prevalence vs
+      present-only magnitude, driving the 'sig_driver' column).
+
+    design="repeated": levels are the SAME animals measured repeatedly (e.g.
+      Baseline/Day 3/Day 7), paired via each animal's 'subject_id' (Label 3 /
+      Animal ID).  Only animals with a non-blank subject_id present at EVERY
+      level are used (a complete matched set is required by Friedman/Wilcoxon);
+      the count of matched subjects and any excluded ones are recorded in
+      df_res.attrs.  Omnibus is Wilcoxon signed-rank (2 levels) or Friedman's
+      test (>=3 levels); post-hoc is pairwise Wilcoxon signed-rank, still
+      FDR-pooled across the whole reported family (pairwise_posthoc_pooled).
+      The structural-zero two-part decomposition and the parametric ANOVA/eta2
+      columns are independent-groups-only (out of scope for paired data —
+      would need McNemar/Cochran's Q and a repeated-measures ANOVA respectively)
+      and are left NaN here rather than silently reusing the unpaired versions;
+      'sig_driver' reports "n/a" for these rows accordingly.
+
+    Returns DataFrame sorted by q-value:
+      cluster_id, stat_kw, pval_kw, qval_kw, stat_anova, pval_anova,
+      effect_size_eta2, effect_size_epsilon2, direction, group_means...
 
     _compute_fn: optional callable(ani) -> DataFrame indexed by cluster_id.
       Defaults to compute_per_cluster_metrics. Pass compute_per_pair_transition_probs
@@ -856,31 +1056,122 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
     """
     if not SCIPY_OK:
         raise RuntimeError("scipy not available. pip install scipy")
+    if design not in ("independent", "repeated"):
+        raise ValueError(f"Unknown design {design!r}; expected 'independent' or 'repeated'")
 
     if _compute_fn is None:
         _compute_fn = lambda ani: compute_per_cluster_metrics(ani["df"], ani["fps"])
 
-    # Build per-cluster, per-group value lists
-    eg_map: dict = {}      # exp_group -> list of per_cluster DataFrames
+    # Build per-cluster, per-group value lists (subject_id carried along so a
+    # Repeated Measures design can pair the same animal across levels).
+    eg_map: dict = {}      # exp_group -> list of (subject_id, per_cluster DataFrame)
     for ani in animal_data:
         eg  = ani["exp_group"]
         pcm = _compute_fn(ani)
-        eg_map.setdefault(eg, []).append(pcm)
+        sid = str(ani.get("subject_id") or "").strip()
+        eg_map.setdefault(eg, []).append((sid, pcm))
 
     all_clusters = set()
     for frames in eg_map.values():
-        for pcm in frames:
+        for _sid, pcm in frames:
             all_clusters.update(pcm.index.tolist())
     all_clusters = sorted(all_clusters)
     eg_names     = list(eg_map.keys())
 
+    # Repeated Measures: only animals whose subject_id is present at EVERY
+    # level can be paired.  Build eg -> {subject_id: pcm} (first match wins on
+    # accidental duplicates) and intersect across levels.
+    common_subjects: list = []
+    n_excluded_subjects = 0
+    if design == "repeated":
+        level_pcm_by_subject = {
+            eg: {sid: pcm for sid, pcm in eg_map[eg] if sid}
+            for eg in eg_names
+        }
+        subj_sets = [set(level_pcm_by_subject[eg]) for eg in eg_names]
+        common_subjects = sorted(set.intersection(*subj_sets)) if subj_sets else []
+        all_seen = set().union(*subj_sets) if subj_sets else set()
+        n_excluded_subjects = len(all_seen) - len(common_subjects)
+
     rows = []
+    _posthoc_gv_by_cid = {}
     for cid in all_clusters:
+        if design == "repeated":
+            if len(eg_names) < 2 or len(common_subjects) < 3:
+                continue
+            level_vals = {}   # eg -> {subject_id: value}
+            for eg in eg_names:
+                by_sid = level_pcm_by_subject[eg]
+                level_vals[eg] = {
+                    sid: (float(by_sid[sid].loc[cid, metric])
+                          if cid in by_sid[sid].index else 0.0)
+                    for sid in common_subjects
+                }
+            aligned = [np.array([level_vals[eg][sid] for sid in common_subjects])
+                       for eg in eg_names]
+            n_subj, n_lvl = len(common_subjects), len(eg_names)
+
+            try:
+                if n_lvl == 2:
+                    if np.allclose(aligned[0], aligned[1]):
+                        stat_kw, pval_kw = 0.0, 1.0
+                    else:
+                        stat_kw, pval_kw = sp_stats.wilcoxon(aligned[0], aligned[1])
+                else:
+                    stat_kw, pval_kw = sp_stats.friedmanchisquare(*aligned)
+            except Exception:
+                stat_kw, pval_kw = np.nan, 1.0
+
+            # Effect size appropriate to the omnibus test used (not literally
+            # epsilon-squared): Kendall's W for Friedman, matched-pairs
+            # rank-biserial correlation for the 2-level Wilcoxon case.
+            try:
+                if n_lvl == 2:
+                    diffs = aligned[0] - aligned[1]
+                    nz = diffs[diffs != 0]
+                    if len(nz):
+                        r_pos, r_neg = np.sum(nz > 0), np.sum(nz < 0)
+                        eff = abs(float(r_pos) - float(r_neg)) / len(nz)
+                    else:
+                        eff = 0.0
+                else:
+                    eff = (float(stat_kw) / (n_subj * (n_lvl - 1))
+                           if np.isfinite(stat_kw) and n_subj > 0 else 0.0)
+                eff = float(min(max(eff, 0.0), 1.0))
+            except Exception:
+                eff = 0.0
+
+            row = {
+                "cluster_id":           cid,
+                "design":               "repeated",
+                "stat_kw":              stat_kw,
+                "pval_kw":              pval_kw,
+                "stat_anova":           np.nan,
+                "pval_anova":           np.nan,
+                "effect_size_eta2":     np.nan,
+                "effect_size_epsilon2": eff,
+                "neg_log10_p":          -np.log10(max(pval_kw, 1e-300)),
+                "stat_prevalence":      np.nan,
+                "pval_prevalence":      np.nan,
+                "stat_kw_present":      np.nan,
+                "pval_kw_present":      np.nan,
+                "n_present_total":      int(n_subj * n_lvl),
+            }
+            for eg in eg_names:
+                row[f"mean_{eg}"]         = float(np.mean(list(level_vals[eg].values())))
+                row[f"prevalence_{eg}"]   = float("nan")
+                row[f"n_{eg}"]            = n_subj
+                row[f"n_present_{eg}"]    = n_subj
+            if with_posthoc and len(eg_names) > 2:
+                _posthoc_gv_by_cid[cid] = dict(level_vals)
+            rows.append(row)
+            continue
+
         group_vals = {}
         group_present = {}   # eg -> list of 1/0 (cluster expressed by that animal)
         for eg in eg_names:
             vs, pres = [], []
-            for pcm in eg_map[eg]:
+            for _sid, pcm in eg_map[eg]:
                 if cid in pcm.index:
                     vs.append(float(pcm.loc[cid, metric]))
                     pres.append(1)
@@ -944,6 +1235,7 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
 
         row = {
             "cluster_id":         cid,
+            "design":             "independent",
             "stat_kw":            stat_kw,
             "pval_kw":            pval_kw,
             "stat_anova":         stat_an,
@@ -970,23 +1262,36 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
             row[f"n_{eg}"]         = int(len(_pres))
             row[f"n_present_{eg}"] = int(sum(_pres))
         # Pairwise post-hoc localisation (only stored when >2 groups & requested).
+        # The FDR pass runs after the loop, pooled across every cluster's pairs
+        # (see pairwise_posthoc_pooled) so post-hoc q-values share one family
+        # with each other and with qval_kw below, instead of each cluster row
+        # BH-correcting its own tiny 3-pair family in isolation.
         if with_posthoc and len(eg_names) > 2:
-            try:
-                _ph = pairwise_posthoc(group_vals)
-                row["posthoc_pairs"] = "; ".join(
-                    f"{r['group_a']}{r['direction']}{r['group_b']} "
-                    f"q={r['q']:.3g}" for r in _ph)
-                _sig = [r for r in _ph if r["q"] < 0.05]
-                row["posthoc_min_q"] = (min(r["q"] for r in _ph)
-                                        if _ph else float("nan"))
-                row["posthoc_n_sig_pairs"] = len(_sig)
-            except Exception:
-                row["posthoc_pairs"] = ""
-                row["posthoc_min_q"] = float("nan")
-                row["posthoc_n_sig_pairs"] = 0
+            _posthoc_gv_by_cid[cid] = dict(group_vals)
         rows.append(row)
 
     df_res = pd.DataFrame(rows)
+    if with_posthoc and _posthoc_gv_by_cid:
+        _ph_cids = list(_posthoc_gv_by_cid.keys())
+        _ph_pooled = pairwise_posthoc_pooled(
+            [_posthoc_gv_by_cid[c] for c in _ph_cids], paired=(design == "repeated"))
+        _ph_cols = {}
+        for c, _ph in zip(_ph_cids, _ph_pooled):
+            _sig = [r for r in _ph if r["q"] < 0.05]
+            _ph_cols[c] = {
+                "posthoc_pairs": "; ".join(
+                    f"{r['group_a']}{r['direction']}{r['group_b']} "
+                    f"q={r['q']:.3g}" for r in _ph),
+                "posthoc_min_q": (min(r["q"] for r in _ph)
+                                  if _ph else float("nan")),
+                "posthoc_n_sig_pairs": len(_sig),
+            }
+        df_res["posthoc_pairs"] = df_res["cluster_id"].map(
+            lambda c: _ph_cols.get(c, {}).get("posthoc_pairs", ""))
+        df_res["posthoc_min_q"] = df_res["cluster_id"].map(
+            lambda c: _ph_cols.get(c, {}).get("posthoc_min_q", float("nan")))
+        df_res["posthoc_n_sig_pairs"] = df_res["cluster_id"].map(
+            lambda c: _ph_cols.get(c, {}).get("posthoc_n_sig_pairs", 0))
     if not df_res.empty:
         # Benjamini-Hochberg FDR correction across all clusters tested.  With
         # ~30 clusters x several metrics, uncorrected p-values are not
@@ -995,20 +1300,32 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
         df_res["qval_kw"] = benjamini_hochberg(df_res["pval_kw"].to_numpy())
         df_res["neg_log10_q"] = -np.log10(
             np.clip(df_res["qval_kw"].to_numpy(), 1e-300, None))
-        # FDR for the two-part tests (same cluster family).
-        if "pval_prevalence" in df_res.columns:
-            df_res["qval_prevalence"] = benjamini_hochberg(
-                df_res["pval_prevalence"].to_numpy())
-        if "pval_kw_present" in df_res.columns:
-            df_res["qval_kw_present"] = benjamini_hochberg(
-                df_res["pval_kw_present"].to_numpy())
+        # FDR for the two-part tests (same cluster family).  Not computed for
+        # Repeated Measures (pval_prevalence/pval_kw_present are all NaN there
+        # — see run_cluster_statistics docstring) — skip BH rather than feed
+        # an all-NaN array through it (NaN propagates through the running-min
+        # in benjamini_hochberg, e.g. via reversed cumulative min).
+        if design != "repeated":
+            if "pval_prevalence" in df_res.columns:
+                df_res["qval_prevalence"] = benjamini_hochberg(
+                    df_res["pval_prevalence"].to_numpy())
+            if "pval_kw_present" in df_res.columns:
+                df_res["qval_kw_present"] = benjamini_hochberg(
+                    df_res["pval_kw_present"].to_numpy())
+        else:
+            df_res["qval_prevalence"] = float("nan")
+            df_res["qval_kw_present"] = float("nan")
         # sig_driver: what makes a cluster significant at q<0.05 —
         # the magnitude (present-only KW), the prevalence (presence/absence),
         # both, or neither.  Lets figures annotate WHY a cluster differs and
         # prevents a presence/absence effect being read as a magnitude change.
+        # Repeated Measures rows report "n/a" — the two-part decomposition is
+        # independent-groups-only (see run_cluster_statistics docstring).
         _SIG = 0.05
 
         def _driver(r):
+            if r.get("design") == "repeated":
+                return "n/a"
             mag  = float(r.get("qval_kw_present", 1.0)) < _SIG
             prev = float(r.get("qval_prevalence", 1.0)) < _SIG
             if mag and prev:
@@ -1020,6 +1337,10 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
             return "none"
         df_res["sig_driver"] = df_res.apply(_driver, axis=1)
         df_res = df_res.sort_values("qval_kw").reset_index(drop=True)
+    df_res.attrs["design"] = design
+    if design == "repeated":
+        df_res.attrs["n_matched_subjects"] = len(common_subjects)
+        df_res.attrs["n_excluded_subjects"] = n_excluded_subjects
     return df_res
 
 
@@ -2386,12 +2707,16 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
                          eg_colors_override: dict = None,
                          t: dict = None,
                          groups: dict = None,
-                         combined: dict = None) -> plt.Figure:
+                         combined: dict = None,
+                         design: str = "independent") -> plt.Figure:
     """
     Bar chart of top-N clusters: one subplot per cluster so each can have
     its own y-scale.  Stars always shown (*, **, ***, ns).
     Pass groups+combined to append user-defined behaviour-group panels.
     eg_colors_override: {eg_name: hex}
+    design: "independent" (default) or "repeated" — must match the design used
+      to build stats_df (run_cluster_statistics), so the post-hoc brackets
+      below use the same paired/unpaired pairwise test as the omnibus star.
     """
     if t is None:
         t = T()
@@ -2414,9 +2739,11 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
         (lambda a: compute_per_cluster_metrics(a["df"], a["fps"]))
     )
     eg_map: dict = {}
+    subject_map: dict = {}   # eg -> [subject_id,...] aligned with eg_map[eg]
     for ani in animal_data:
         eg = ani["exp_group"]
         eg_map.setdefault(eg, []).append(_pcm_fn(ani))
+        subject_map.setdefault(eg, []).append(str(ani.get("subject_id") or "").strip())
     eg_names = list(eg_map.keys())
     eg_colors: dict = {}
     for i, eg in enumerate(eg_names):
@@ -2432,7 +2759,37 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
     n_eg = len(eg_names)
     rng  = np.random.default_rng(7)
 
-    #   layout: separate subplot per cluster for independent y-scales  
+    # Pool the pairwise post-hoc FDR across every panel shown in this figure
+    # (see pairwise_posthoc_pooled) so a q<0.05 star means the same thing on
+    # every panel, instead of each panel's 3-pair family being BH-corrected in
+    # isolation — which let the same literal group-pair comparison (e.g.
+    # Control vs Therm Pain) show different stars from one cluster to the next
+    # for no reason but which other p-values happened to share its local family.
+    posthoc_by_panel = [[] for _ in top_ids]
+    if n_eg > 2:
+        panel_group_vals = []
+        for cid in top_ids:
+            gv = {}
+            for eg in eg_names:
+                if design == "repeated":
+                    vs_by_subj = {}
+                    for sid, pcm in zip(subject_map[eg], eg_map[eg]):
+                        if not sid:
+                            continue
+                        vs_by_subj[sid] = (float(pcm.loc[cid, metric])
+                                            if cid in pcm.index else 0.0)
+                    gv[eg] = vs_by_subj
+                else:
+                    gv[eg] = [float(pcm.loc[cid, metric]) if cid in pcm.index else 0.0
+                              for pcm in eg_map[eg]]
+            panel_group_vals.append(gv)
+        try:
+            posthoc_by_panel = pairwise_posthoc_pooled(
+                panel_group_vals, paired=(design == "repeated"))
+        except Exception:
+            posthoc_by_panel = [[] for _ in top_ids]
+
+    #   layout: separate subplot per cluster for independent y-scales
     ncols = min(n_c, 5)
     nrows = int(np.ceil(n_c / ncols))
     fig_w = max(12, ncols * 2.4)
@@ -2496,7 +2853,8 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
                         _ytop = draw_sig_brackets(
                             ax, eg_names, all_pts,
                             y_start=data_ceil * 1.06, y_step=head_top * 0.09,
-                            tick_color=t["tick"])
+                            tick_color=t["tick"],
+                            precomputed_recs=posthoc_by_panel[xi])
                         if _ytop > bh * 0.92:
                             ax.set_ylim(top=max(head_top, _ytop * 1.12))
                     except Exception:
@@ -2719,6 +3077,139 @@ def build_distance_matrix_figure(recluster_result: dict, groups: dict = None,
             "Blended = 70 % correlation + 30 % transition",
             color=t["tick"], fontweight="bold", fontsize=11)
         fig.tight_layout(rect=[0, 0, 1, 0.93])
+    return fig
+
+
+def build_cluster_validity_figure(embedding, labels, t: dict = None) -> "plt.Figure":
+    """
+    On-the-fly validity/consistency diagnostic for the PRIMARY HDBSCAN
+    clustering, computed from the saved umap_embedding.npy / umap_labels.npy
+    arrays (mirrors cube_core.py's plot_cluster_validity, but using this
+    module's own t: dict theme convention — see build_distance_matrix_figure
+    just above for the pattern this follows).
+
+    Left  : per-cluster silhouette diagram (sklearn.metrics.silhouette_samples,
+            restricted to non-noise labels) — horizontal bars per cluster,
+            sorted, coloured by cluster id, with the overall mean silhouette
+            line.
+    Right : simple 2-D scatter of embedding coloured by cluster id.  The
+            HDBSCAN condensed-tree view isn't available here (hdb_clf isn't
+            persisted to disk) — a text annotation points users to the
+            pipeline-exported cluster_validity.png for that view.
+    """
+    if t is None:
+        t = T()
+
+    import numpy as _np
+
+    def _placeholder(msg):
+        fig, ax = plt.subplots(figsize=(7, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, msg, ha="center", va="center", color=t["tick"],
+                transform=ax.transAxes, fontsize=9, multialignment="center")
+        _style_ax(ax, t)
+        return fig
+
+    if embedding is None or labels is None:
+        return _placeholder("No embedding/label data available.\n"
+                             "Run the pipeline with 'Save plots' enabled, or\n"
+                             "check umap_embedding.npy / umap_labels.npy exist\n"
+                             "in the run's model/ folder.")
+
+    embedding = _np.asarray(embedding, dtype=float)
+    labels    = _np.asarray(labels, dtype=int)
+    if embedding.shape[0] != len(labels):
+        return _placeholder(
+            "umap_embedding.npy / umap_labels.npy size mismatch —\n"
+            "this model folder predates a fix and the two files are no\n"
+            "longer index-aligned. Re-run the CUBE pipeline (Steps 4–5)\n"
+            "to regenerate matching UMAP files.")
+
+    valid_mask = labels >= 0
+    uniq = sorted(set(labels[valid_mask].tolist())) if valid_mask.any() else []
+
+    with plt.style.context(t["mpl_style"]):
+        fig, (axl, axr) = plt.subplots(1, 2, figsize=(13, 6), facecolor=t["fig_bg"])
+
+        sil_full = None
+        cluster_means = {}
+        if len(uniq) >= 2 and valid_mask.sum() >= 3:
+            try:
+                from sklearn.metrics import silhouette_samples
+                sil_valid = silhouette_samples(embedding[valid_mask], labels[valid_mask])
+                sil_full = _np.full(len(labels), _np.nan)
+                sil_full[valid_mask] = sil_valid
+                for cid in uniq:
+                    vals = sil_full[labels == cid]
+                    vals = vals[~_np.isnan(vals)]
+                    if vals.size:
+                        cluster_means[cid] = float(_np.mean(vals))
+            except Exception:
+                sil_full = None
+                cluster_means = {}
+
+        try:
+            n_cl = max(1, len([c for c in uniq if c >= 0]))
+            cmap = plt.cm.get_cmap("tab20", n_cl)
+        except Exception:
+            cmap = plt.cm.get_cmap("hsv", max(1, len(uniq)))
+
+        if cluster_means:
+            overall_mean = float(_np.nanmean(list(cluster_means.values())))
+            y0 = 0
+            yticks, yticklabels = [], []
+            for i, cid in enumerate(sorted(cluster_means)):
+                vals = _np.sort(sil_full[(labels == cid) & ~_np.isnan(sil_full)])
+                if vals.size == 0:
+                    continue
+                y1 = y0 + vals.size
+                color = cmap(i / max(n_cl - 1, 1))
+                axl.fill_betweenx(_np.arange(y0, y1), 0, vals,
+                                   facecolor=color, edgecolor=color, alpha=0.85)
+                yticks.append((y0 + y1) / 2)
+                yticklabels.append(f"C{cid}")
+                y0 = y1 + max(5, int(0.02 * len(sil_full)))
+            axl.axvline(overall_mean, color=t["tick"], linestyle="--", linewidth=1,
+                        label=f"mean = {overall_mean:.3f}")
+            axl.set_yticks(yticks)
+            axl.set_yticklabels(yticklabels, color=t["tick"], fontsize=8)
+            axl.legend(loc="lower right", facecolor=t["ax_bg"], edgecolor=t["border"],
+                       labelcolor=t["tick"], fontsize=8)
+        else:
+            axl.text(0.5, 0.5, "Not enough labelled clusters\nfor a silhouette diagram",
+                      ha="center", va="center", color=t["tick"], transform=axl.transAxes)
+        axl.set_xlabel("Silhouette coefficient", color=t["tick"])
+        axl.set_title("Per-cluster silhouette diagram", color=t["tick"], fontsize=10)
+        _style_ax(axl, t)
+
+        _ax_i, _ax_j = _best_umap_axis_pair(embedding, labels)
+        x = embedding[:, _ax_i]
+        y = embedding[:, _ax_j]
+        noise_mask = labels < 0
+        if noise_mask.any():
+            axr.scatter(x[noise_mask], y[noise_mask], c="#555566", s=3,
+                        alpha=0.25, linewidths=0, label="noise")
+        for i, cid in enumerate(uniq):
+            mask = labels == cid
+            color = cmap(i / max(n_cl - 1, 1))
+            axr.scatter(x[mask], y[mask], c=[color], s=5, alpha=0.65,
+                        linewidths=0, label=f"C{cid}")
+        if len(uniq) <= 20:
+            axr.legend(fontsize=7, loc="upper right", ncol=2,
+                       facecolor=t["ax_bg"], edgecolor=t["border"],
+                       labelcolor=t["tick"], markerscale=2)
+        axr.set_xlabel(f"UMAP-{_ax_i + 1}", color=t["tick"], fontsize=10)
+        axr.set_ylabel(f"UMAP-{_ax_j + 1}", color=t["tick"], fontsize=10)
+        axr.set_title("Cluster projection (2-D)", color=t["tick"], fontsize=10)
+        axr.text(0.02, 0.02,
+                  "Condensed-tree view requires the fitted HDBSCAN\n"
+                  "classifier (not saved to disk) — see the pipeline-\n"
+                  "exported cluster_validity.png for that panel.",
+                  transform=axr.transAxes, ha="left", va="bottom",
+                  fontsize=6.5, color=t["muted"] if "muted" in t else t["tick"])
+        _style_ax(axr, t)
+
+        fig.suptitle("Cluster validity", color=t["tick"], fontweight="bold", fontsize=12)
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
     return fig
 
 
@@ -5670,7 +6161,8 @@ class GroupRow(ctk.CTkFrame):
     COLS = 8
 
     def __init__(self, parent, group_name, color, all_labels,
-                 selected, on_change, on_delete, on_move_up, on_move_down, **kw):
+                 selected, on_change, on_delete, on_move_up, on_move_down,
+                 low_conf_ids=None, **kw):
         super().__init__(parent, fg_color=T()["card"],
                          corner_radius=8, **kw)
         self.on_change   = on_change
@@ -5678,6 +6170,10 @@ class GroupRow(ctk.CTkFrame):
         self.on_move_up  = on_move_up
         self.on_move_down = on_move_down
         self._color_hex  = color
+        # cluster ids cube_core flagged as dominated by low-confidence/turned-away
+        # tracking (cluster_confidence.csv), surfaced here rather than presented
+        # as a real behavior cluster
+        self._low_conf_ids = set(low_conf_ids or ())
 
         self.columnconfigure(4, weight=1)
 
@@ -5746,11 +6242,16 @@ class GroupRow(ctk.CTkFrame):
         for i, lbl in enumerate(sorted(all_labels)):
             var = tk.BooleanVar(value=lbl in selected)
             self._check_vars[lbl] = var
-            cb = ctk.CTkCheckBox(
-                self._label_scroll, text=str(lbl), variable=var,
-                width=68, command=self._on_cb,
+            flagged = lbl in self._low_conf_ids
+            cb_kwargs = dict(
+                text=f"{lbl} ⚠" if flagged else str(lbl),
+                variable=var,
+                width=100 if flagged else 68, command=self._on_cb,
                 checkbox_width=16, checkbox_height=16,
             )
+            if flagged:
+                cb_kwargs["text_color"] = T().get("warn", "#e8a838")
+            cb = ctk.CTkCheckBox(self._label_scroll, **cb_kwargs)
             cb.grid(row=i // self.COLS, column=i % self.COLS,
                     padx=2, pady=1, sticky="w")
         self._update_badge()
@@ -5908,6 +6409,8 @@ class GroupEditorWindow(ctk.CTkToplevel):
         idx   = len(self._group_rows)
         color = color or PALETTE[idx % len(PALETTE)]
         name  = name  or f"Group {idx + 1}"
+        low_conf = {cid for cid, flag in
+                    getattr(self.app, "_cluster_confidence", {}).items() if flag}
         row   = GroupRow(
             self._scroll,
             group_name=name,
@@ -5918,6 +6421,7 @@ class GroupEditorWindow(ctk.CTkToplevel):
             on_delete=self._delete_row,
             on_move_up=lambda r: self._move_row(r, -1),
             on_move_down=lambda r: self._move_row(r, +1),
+            low_conf_ids=low_conf,
         )
         row.grid(row=idx, column=0, sticky="ew", padx=4, pady=3)
         self._group_rows.append(row)
@@ -6037,7 +6541,8 @@ class AnimalListPanel(ctk.CTkFrame):
         hdr = ctk.CTkFrame(self, fg_color=T()["hdr_bg"])
         hdr.grid(row=1, column=0, sticky="ew", padx=6, pady=(2, 0))
         for col_txt, col_w in [("", 24), ("#", 28), ("Animal", 130),
-                                ("Label 1", 90), ("Label 2", 80), ("Label 3", 80), ("FPS", 46)]:
+                                ("Label 1", 90), ("Label 2", 80),
+                                ("Label 3 / Animal ID", 110), ("FPS", 46)]:
             ctk.CTkLabel(hdr, text=col_txt, width=col_w, anchor="w",
                          font=ctk.CTkFont(size=11, weight="bold"),
                          text_color=T()["hdr_text"],
@@ -6255,7 +6760,7 @@ class AnimalListPanel(ctk.CTkFrame):
         for row_i, (lbl, var, ph) in enumerate([
             ("Label 1", v1, "leave blank to keep current"),
             ("Label 2", v2, "leave blank to keep current"),
-            ("Label 3", v3, "leave blank to keep current"),
+            ("Label 3 / Animal ID", v3, "leave blank to keep current"),
         ]):
             ctk.CTkLabel(dlg, text=lbl, anchor="w").grid(
                 row=row_i, column=0, padx=(12, 4), pady=6, sticky="w")
@@ -6325,12 +6830,18 @@ class AnimalListPanel(ctk.CTkFrame):
     def _label_key_to_str(label_key: str) -> str:
         """Convert dropdown display label to internal group_by key."""
         return {"Label 1": "label1", "Label 2": "label2",
-                "Label 3": "label3", "All Labels": "all"}.get(label_key, "label1")
+                "Label 3 / Animal ID": "label3",
+                "All Labels": "all"}.get(label_key, "label1")
 
     def get_animals(self, group_by: str = "label1") -> list:
         """group_by controls which label column becomes exp_group:
-        'label1' = Label 1 (default), 'label2' = Label 2, 'label3' = Label 3,
-        'all' = all three joined with ' | '."""
+        'label1' = Label 1 (default), 'label2' = Label 2,
+        'label3' = Label 3 / Animal ID, 'all' = all three joined with ' | '.
+
+        Every returned dict also carries the raw Label 3 / Animal ID value as
+        'subject_id' (regardless of group_by) — this is the animal identity
+        used to pair repeated measurements of the same animal across levels
+        for a Repeated Measures design (see run_cluster_statistics)."""
         out = []
         for a in self._animals:
             if group_by == "all":
@@ -6342,12 +6853,13 @@ class AnimalListPanel(ctk.CTkFrame):
             else:
                 eg = self._read_eg(a)
             out.append({
-                "uid":       a["uid"],
-                "name":      a["name"],
-                "path":      a["path"],
-                "df":        a["df"],
-                "fps":       a["fps"],
-                "exp_group": eg,
+                "uid":        a["uid"],
+                "name":       a["name"],
+                "path":       a["path"],
+                "df":         a["df"],
+                "fps":        a["fps"],
+                "exp_group":  eg,
+                "subject_id": self._read_extra_label(a, "label3"),
             })
         return out
 
@@ -6432,12 +6944,13 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
     EXHAUSTIVE_COMBO_LIMIT = 15_000
 
     def __init__(self, parent, get_animals_fn, load_groups_to_editor_fn=None,
-                 get_groups_fn=None, get_combined_fn=None, **kw):
+                 get_groups_fn=None, get_combined_fn=None, get_umap_fn=None, **kw):
         super().__init__(parent, fg_color=T()["panel"], **kw)
         self._get_animals           = get_animals_fn
         self._load_groups_to_editor = load_groups_to_editor_fn
         self._get_groups_fn         = get_groups_fn   # () -> {group_name: {labels, color}}
         self._get_combined_fn       = get_combined_fn  # () -> combined dict or None
+        self._get_umap_fn           = get_umap_fn      # () -> (embedding, labels) or None
         self._stats_df:    pd.DataFrame | None = None
         self._recluster:   dict | None          = None
         self._raw_preview: dict | None          = None  # pre-recluster transition preview
@@ -6474,11 +6987,23 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
 
         #   Statistical settings
         sf = section(ctrl, "Statistical Settings")
+        ctk.CTkLabel(sf, text="Experimental Design:", text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
+        self._design_var = ctk.StringVar(value="Independent Groups")
+        ctk.CTkOptionMenu(sf, variable=self._design_var,
+                          values=["Independent Groups", "Repeated Measures"],
+                          width=240).pack(padx=12, pady=(2, 2))
+        ctk.CTkLabel(sf,
+                     text="Repeated Measures pairs animals by Label 3 / Animal ID\n"
+                          "across the levels of 'Group by' (e.g. Baseline/Day 3/Day 7).",
+                     text_color=T()["muted"], font=ctk.CTkFont(size=9),
+                     justify="left").pack(anchor="w", padx=12, pady=(0, 4))
         ctk.CTkLabel(sf, text="Group by:", text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
         self._group_by_var = ctk.StringVar(value="Label 1")
         ctk.CTkOptionMenu(sf, variable=self._group_by_var,
-                          values=["Label 1", "Label 2", "Label 3", "All Labels"],
+                          values=["Label 1", "Label 2", "Label 3 / Animal ID",
+                                  "All Labels"],
                           width=240).pack(padx=12, pady=(2, 4))
         ctk.CTkLabel(sf, text="Metric:", text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
@@ -6636,7 +7161,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             values=["Top-N Bar", "Volcano", "Heatmap",
                     "Elbow/Silhouette", "Recombination",
                     "Dist Matrix", "Transitions", "Grp Transitions",
-                    "Cluster Stats"],
+                    "Cluster Stats", "Cluster Validity"],
             variable=self._plot_mode,
             command=self._switch_plot,
         ).pack(side="left", padx=4, pady=6)
@@ -6797,6 +7322,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             "dist_matrix":        ("Dist Matrix",         False, False, True),
             "transitions":        ("Transitions",         False, False, True),
             "cluster_stats":      ("Cluster Stats",       False, False, True),
+            "cluster_validity":   ("Cluster Validity",    False, False, False),
         }
         for fname, (mode, needs_stats, needs_full_rc, raw_ok) in modes.items():
             if needs_stats and self._stats_df is None:
@@ -6805,6 +7331,10 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                 skipped.append(mode); continue
             if raw_ok and recluster_data is None:
                 skipped.append(mode); continue
+            if mode == "Cluster Validity":
+                _emb, _lbl = self._get_umap()
+                if _emb is None or _lbl is None:
+                    skipped.append(mode); continue
             try:
                 figs_to_save = []
                 if mode == "Top-N Bar":
@@ -6863,6 +7393,9 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                 elif mode == "Cluster Stats":
                     figs_to_save = [build_cluster_stats_figure(
                         recluster_data, animals, groups=user_groups or None)]
+                elif mode == "Cluster Validity":
+                    _emb, _lbl = self._get_umap()
+                    figs_to_save = [build_cluster_validity_figure(_emb, _lbl)]
                 else:
                     continue
                 for fi, fig in enumerate(figs_to_save):
@@ -6904,6 +7437,9 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
 
     def _group_by_key(self) -> str:
         return AnimalListPanel._label_key_to_str(self._group_by_var.get())
+
+    def _design_key(self) -> str:
+        return "repeated" if self._design_var.get() == "Repeated Measures" else "independent"
 
     def _get_save_k(self) -> int:
         try:
@@ -6963,6 +7499,15 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             messagebox.showerror("Missing library",
                 "scipy is required:\n  pip install scipy")
             return
+        design = self._design_key()
+        if design == "repeated":
+            n_with_sid = sum(1 for a in animals if str(a.get("subject_id") or "").strip())
+            if n_with_sid < 3:
+                messagebox.showwarning("Need Animal IDs",
+                    "Repeated Measures needs at least 3 animals with a "
+                    "Label 3 / Animal ID value set (used to pair the same "
+                    "animal across the levels of 'Group by').")
+                return
         self._raw_preview = None  # invalidate cached raw preview
         p_thresh, top_n, metric = self._get_params()
         self._status("Running statistical tests...")
@@ -6970,23 +7515,42 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             if metric == "transition_prob":
                 self._stats_df = run_cluster_statistics(
                     animals, metric="transition_prob",
-                    _compute_fn=lambda ani: compute_per_pair_transition_probs(ani["df"]))
+                    _compute_fn=lambda ani: compute_per_pair_transition_probs(ani["df"]),
+                    design=design)
             else:
-                self._stats_df = run_cluster_statistics(animals, metric)
+                self._stats_df = run_cluster_statistics(animals, metric, design=design)
             # Retain inputs so the export can build the family-wide FDR table
             # across all metrics without re-selecting groups.
             self._last_animals = animals
             self._last_metric  = metric
+            self._last_design  = design
         except Exception:
             messagebox.showerror("Stats Error", traceback.format_exc())
             self._status("Error.", "#cc4444")
             return
+        if design == "repeated" and self._stats_df.empty:
+            gb_label = self._group_by_var.get()
+            messagebox.showwarning("No matched clusters",
+                "Repeated Measures needs at least 3 animals with a matching "
+                f"Label 3 / Animal ID value present at every level of "
+                f"'{gb_label}'. No cluster had enough matched subjects to test.")
+            self._status("No matched clusters — check Label 3 / Animal ID pairing.",
+                          "#cc4444")
+            return
         _sig_col, _sw = fdr_sig_column(self._stats_df)
         n_sig = int((self._stats_df[_sig_col] < p_thresh).sum())
         _unit = "transition pairs" if metric == "transition_prob" else "clusters"
+        _design_note = ""
+        if design == "repeated":
+            n_matched  = self._stats_df.attrs.get("n_matched_subjects", 0)
+            n_excluded = self._stats_df.attrs.get("n_excluded_subjects", 0)
+            _design_note = (f"\n{n_matched} matched animal(s) across all levels"
+                             + (f", {n_excluded} excluded (incomplete Animal ID)."
+                                if n_excluded else "."))
         self._status(
             f"Done. {len(self._stats_df)} {_unit} tested.\n"
-            f"{n_sig} significant at {_sw} < {p_thresh} (FDR-corrected).", "#88cc88")
+            f"{n_sig} significant at {_sw} < {p_thresh} (FDR-corrected)."
+            f"{_design_note}", "#88cc88")
         self._switch_plot(self._plot_mode.get())
 
     def _run_reclustering(self):
@@ -7072,6 +7636,19 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             pass
         return None
 
+    def _get_umap(self):
+        """Return (embedding, labels) tuple, or (None, None) if unavailable.
+        Mirrors BehavioralExplorerPanel._get_umap — same get_umap_fn callback
+        convention wired from BSOiDApp's self._umap_embedding/_umap_labels."""
+        try:
+            if self._get_umap_fn:
+                result = self._get_umap_fn()
+                if result and len(result) == 2:
+                    return result[0], result[1]
+        except Exception:
+            pass
+        return None, None
+
     def _switch_plot(self, mode: str):
         animals  = self._apply_bio_filter(
             self._get_animals(group_by=self._group_by_key()))
@@ -7137,7 +7714,8 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                     self._stats_df, animals, top_n, p_thresh, metric,
                     eg_colors_override=eg_colors or None,
                     groups=None if metric == "transition_prob" else user_groups or None,
-                    combined=user_combined)
+                    combined=user_combined,
+                    design=self._design_key())
                 if isinstance(result, tuple):
                     fig_clusters, fig_groups = result
                     self._show_figure(fig_clusters)
@@ -7247,6 +7825,16 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             elif mode == "Cluster Stats":
                 self._show_figure(build_cluster_stats_figure(
                     recluster_data, animals, groups=user_groups or None))
+            elif mode == "Cluster Validity":
+                _emb, _lbl = self._get_umap()
+                if _emb is None or _lbl is None:
+                    self._show_placeholder(
+                        "No embedding data available.\n"
+                        "Run the CUBE pipeline (Step 3) with 'Save plots' enabled\n"
+                        "so umap_embedding.npy / umap_labels.npy are exported,\n"
+                        "then reload this run folder.")
+                    return
+                self._show_figure(build_cluster_validity_figure(_emb, _lbl))
             else:
                 return
             # Show advisory status when displaying pre-recluster raw preview
@@ -7332,7 +7920,8 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                 for _m in ("total_duration", "frequency", "mean_bout"):
                     try:
                         _by_metric[_m] = run_cluster_statistics(
-                            self._last_animals, _m, with_posthoc=False)
+                            self._last_animals, _m, with_posthoc=False,
+                            design=getattr(self, "_last_design", "independent"))
                     except Exception:
                         pass
                 _fam = family_wide_fdr(_by_metric)
@@ -7384,7 +7973,8 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                 for _m in _metrics:
                     try:
                         _by_metric[_m] = run_cluster_statistics(
-                            self._last_animals, _m, with_posthoc=False)
+                            self._last_animals, _m, with_posthoc=False,
+                            design=getattr(self, "_last_design", "independent"))
                     except Exception:
                         pass
                 _fam = family_wide_fdr(_by_metric)
@@ -7412,6 +8002,46 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         messagebox.showinfo("Saved", f"Statistics saved:\n{path}{_extra}")
 
 
+def _best_umap_axis_pair(embedding, labels) -> tuple:
+    """
+    Pick the 2 of N UMAP axes that best separate the given cluster labels.
+
+    cube_core's default pipeline fits a 3-D UMAP embedding (see
+    umap_n_components in cube_core.py), but the analyser's static figures are
+    flat 2-D scatters. Always plotting columns (0, 1) silently discards
+    whichever axis happens to carry the separating structure, making
+    well-separated clusters look like a mixed blob. Score every candidate
+    axis pair by silhouette and keep the best one.
+    """
+    import numpy as _np
+    embedding = _np.asarray(embedding, dtype=float)
+    n_dim = embedding.shape[1]
+    if n_dim < 3:
+        return (0, 1)
+
+    labels = _np.asarray(labels, dtype=int)
+    valid = labels >= 0
+    uniq = _np.unique(labels[valid])
+    if valid.sum() < 3 or len(uniq) < 2:
+        return (0, 1)
+
+    from itertools import combinations
+    try:
+        from sklearn.metrics import silhouette_score
+    except ImportError:
+        return (0, 1)
+
+    best_pair, best_score = (0, 1), -1.0
+    for i, j in combinations(range(n_dim), 2):
+        try:
+            score = silhouette_score(embedding[valid][:, [i, j]], labels[valid])
+        except Exception:
+            continue
+        if score > best_score:
+            best_score, best_pair = score, (i, j)
+    return best_pair
+
+
 def build_umap_comparison_figure(embedding, labels, new_groups: dict,
                                   t: dict = None) -> "plt.Figure":
     """
@@ -7430,16 +8060,32 @@ def build_umap_comparison_figure(embedding, labels, new_groups: dict,
 
     import numpy as _np
 
-    x = _np.asarray(embedding[:, 0], dtype=float)
-    y = _np.asarray(embedding[:, 1], dtype=float)
+    def _placeholder(msg):
+        fig, ax = plt.subplots(figsize=(7, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, msg, ha="center", va="center", color=t["tick"],
+                transform=ax.transAxes, fontsize=9, multialignment="center")
+        _style_ax(ax, t)
+        return fig
+
     labels = _np.asarray(labels, dtype=int)
 
-    # Guard: stale model files can produce mismatched lengths.
-    if len(x) != len(labels):
-        _n = min(len(x), len(labels))
-        x      = x[:_n]
-        y      = y[:_n]
-        labels = labels[:_n]
+    # A length mismatch here means umap_embedding.npy (n_bins, chronological
+    # bin order) and umap_labels.npy (n_samp, random UMAP-training-subsample
+    # order) came from a stale run predating the fix that keeps both arrays
+    # the same n_bins length and index-aligned. Truncating both to the
+    # shorter length would silently pair each embedding point with an
+    # unrelated label (the subsample order is random, not a chronological
+    # prefix) — refuse instead of rendering a misleading scatter.
+    if embedding.shape[0] != len(labels):
+        return _placeholder(
+            "umap_embedding.npy / umap_labels.npy size mismatch —\n"
+            "this model folder predates a fix and the two files are no\n"
+            "longer index-aligned. Re-run the CUBE pipeline (Steps 4–5)\n"
+            "to regenerate matching UMAP files.")
+
+    _ax_i, _ax_j = _best_umap_axis_pair(embedding, labels)
+    x = _np.asarray(embedding[:, _ax_i], dtype=float)
+    y = _np.asarray(embedding[:, _ax_j], dtype=float)
 
     # Map original cluster IDs → new group index
     new_label_arr = _np.full(len(labels), -1, dtype=int)
@@ -7458,6 +8104,8 @@ def build_umap_comparison_figure(embedding, labels, new_groups: dict,
     with plt.style.context(t["mpl_style"]):
         fig, (ax1, ax2) = plt.subplots(
             1, 2, figsize=(14, 6), facecolor=t["fig_bg"])
+        fig.patch.set_facecolor(t["fig_bg"])
+        fig.patch.set_alpha(1.0)
 
         #   Left: original HDBSCAN clusters
         orig_idx = 0
@@ -7474,8 +8122,8 @@ def build_umap_comparison_figure(embedding, labels, new_groups: dict,
 
         ax1.set_title("Original Clusters  (HDBSCAN)",
                       color=t["tick"], fontweight="bold", fontsize=12, pad=8)
-        ax1.set_xlabel("UMAP-1", color=t["tick"], fontsize=10)
-        ax1.set_ylabel("UMAP-2", color=t["tick"], fontsize=10)
+        ax1.set_xlabel(f"UMAP-{_ax_i + 1}", color=t["tick"], fontsize=10)
+        ax1.set_ylabel(f"UMAP-{_ax_j + 1}", color=t["tick"], fontsize=10)
         # Compact legend: only show if ≤ 20 clusters
         if n_orig <= 20:
             ax1.legend(fontsize=7, loc="upper right", ncol=2,
@@ -7498,8 +8146,8 @@ def build_umap_comparison_figure(embedding, labels, new_groups: dict,
 
         ax2.set_title("Combined Behaviour Groups  (after recombination)",
                       color=t["tick"], fontweight="bold", fontsize=12, pad=8)
-        ax2.set_xlabel("UMAP-1", color=t["tick"], fontsize=10)
-        ax2.set_ylabel("UMAP-2", color=t["tick"], fontsize=10)
+        ax2.set_xlabel(f"UMAP-{_ax_i + 1}", color=t["tick"], fontsize=10)
+        ax2.set_ylabel(f"UMAP-{_ax_j + 1}", color=t["tick"], fontsize=10)
         ax2.legend(fontsize=8, loc="upper right", ncol=1,
                    facecolor=t["ax_bg"], edgecolor=t["border"],
                    labelcolor=t["tick"], markerscale=2)
@@ -7518,6 +8166,55 @@ def _label_text_color(hex_color: str) -> str:
         return "#111111" if 0.299 * r + 0.587 * g + 0.114 * b > 0.55 else "white"
     except Exception:
         return "white"
+
+
+def _place_cluster_label(ax, cx, cy, text, color, all_x, all_y, placed,
+                          x_rng, y_rng, fontsize=6.5, alpha=0.85,
+                          zorder=50):
+    """
+    Draw a badge label near (cx, cy), nudged toward a locally sparse spot so
+    it isn't obstructed by the point cloud, and steered away from
+    already-placed labels. Always draws (never dropped). Appends the final
+    (lx, ly) to `placed` and returns it.
+    """
+    import numpy as _np
+
+    diag = float(_np.hypot(x_rng, y_rng)) or 1.0
+    dens_r = diag * 0.03
+    label_gap = min(x_rng, y_rng) * 0.10
+
+    radii = [0.0] + [diag * f for f in (0.035, 0.07, 0.11, 0.16)]
+    angles = _np.linspace(0, 2 * _np.pi, 8, endpoint=False)
+
+    best_pt, best_score = (cx, cy), None
+    for r in radii:
+        candidates = [(cx, cy)] if r == 0.0 else [
+            (cx + r * _np.cos(a), cy + r * _np.sin(a)) for a in angles]
+        found_clean = False
+        for (px, py) in candidates:
+            dens = float(((all_x - px) ** 2 + (all_y - py) ** 2
+                          <= dens_r ** 2).sum())
+            clash = any(_np.hypot(px - lx, py - ly) < label_gap
+                        for lx, ly in placed)
+            dist_pen = (r / diag) * 5.0
+            score = dens + (1e6 if clash else 0.0) + dist_pen
+            if best_score is None or score < best_score:
+                best_score, best_pt = score, (px, py)
+            if not clash and dens <= 0:
+                found_clean = True
+        if found_clean and r > 0.0:
+            break
+
+    lx, ly = best_pt
+    placed.append((lx, ly))
+    ax.text(lx, ly, text,
+            color=_label_text_color(color),
+            fontsize=fontsize, fontweight="bold",
+            ha="center", va="center",
+            bbox=dict(boxstyle="round,pad=0.2",
+                      facecolor=color, edgecolor="none", alpha=alpha),
+            zorder=zorder)
+    return lx, ly
 
 
 def build_energy_landscape_figure(
@@ -7559,18 +8256,26 @@ def build_energy_landscape_figure(
         return _placeholder(
             "scipy / mpl_toolkits not available for Energy Landscape.")
 
-    umap_x = _np.asarray(umap_embedding[:, 0], dtype=float)
-    umap_y = _np.asarray(umap_embedding[:, 1], dtype=float)
-    umap_l = _np.asarray(umap_labels, dtype=int)
+    umap_labels_arr = _np.asarray(umap_labels, dtype=int)
 
-    # Guard: older model files saved before a bug-fix could produce mismatched
-    # array lengths (embedding n_bins vs labels n_samp).  Truncate to the
-    # shorter so every downstream boolean mask is consistent.
-    if len(umap_x) != len(umap_l):
-        _n = min(len(umap_x), len(umap_l))
-        umap_x = umap_x[:_n]
-        umap_y = umap_y[:_n]
-        umap_l = umap_l[:_n]
+    # A length mismatch here means umap_embedding.npy (n_bins, chronological
+    # bin order) and umap_labels.npy (n_samp, random UMAP-training-subsample
+    # order) came from a stale run predating the fix that keeps both arrays
+    # the same n_bins length and index-aligned. Truncating both to the
+    # shorter length would silently pair each embedding point with an
+    # unrelated label (the subsample order is random, not a chronological
+    # prefix) — refuse instead of rendering a misleading scatter.
+    if umap_embedding.shape[0] != len(umap_labels_arr):
+        return _placeholder(
+            "umap_embedding.npy / umap_labels.npy size mismatch —\n"
+            "this model folder predates a fix and the two files are no\n"
+            "longer index-aligned. Re-run the CUBE pipeline (Steps 4–5)\n"
+            "to regenerate matching UMAP files.")
+
+    _ax_i, _ax_j = _best_umap_axis_pair(umap_embedding, umap_labels_arr)
+    umap_x = _np.asarray(umap_embedding[:, _ax_i], dtype=float)
+    umap_y = _np.asarray(umap_embedding[:, _ax_j], dtype=float)
+    umap_l = umap_labels_arr
 
     # Noise exclusion: HDBSCAN labels -1 as noise; skip those points entirely.
     _noise_mask = umap_l < 0
@@ -7582,18 +8287,13 @@ def build_energy_landscape_figure(
             for _gcid in _gdata.get("labels", []):
                 _cid_to_gname[int(_gcid)] = _gname
 
-    groups_eg: dict = {}
-    for ani in animal_data:
-        groups_eg.setdefault(ani["exp_group"], []).append(ani)
-    eg_names = list(groups_eg.keys())
-    n_eg = len(eg_names)
-    if n_eg == 0:
+    if not animal_data:
         return _placeholder("No animals loaded.")
 
     GRID_N  = 200
     N_VALS  = 5      # top-N valleys to label
     ncols   = 3
-    nrows   = n_eg
+    nrows   = 2      # row 0 = all clusters (pooled), row 1 = behavior groups (pooled)
     fig_w   = max(22.0, ncols * 7.5)
     fig_h   = max(6.0,  nrows * 4.8 + 1.8)
 
@@ -7631,279 +8331,425 @@ def build_energy_landscape_figure(
     except Exception:
         _support_mask = _np.zeros((GRID_N, GRID_N), dtype=bool)
 
+    # ── Pooled per-cluster occupancy probability (noise excluded, all animals) ──
+    cl_counts: dict = {}
+    for ani in animal_data:
+        for lbl in ani["df"]["label"].values:
+            k = int(lbl)
+            if k < 0:
+                continue   # skip noise frames
+            cl_counts[k] = cl_counts.get(k, 0) + 1
+    total = max(sum(cl_counts.values()), 1)
+    P_cl  = {k: v / total for k, v in cl_counts.items()}
+
+    # Weight UMAP points by cluster occupancy probability; noise → 0
+    weights = _np.array(
+        [0.0 if int(l) < 0 else P_cl.get(int(l), 1e-9)
+         for l in umap_l], dtype=float)
+    wsum = weights.sum()
+    weights = weights / wsum if wsum > 0 else \
+              _np.ones_like(weights) / len(weights)
+
+    # ── Weighted KDE → energy surface (shared by both rows) ────────────────
+    try:
+        kde     = _gkde(_np.vstack([umap_x, umap_y]),
+                        weights=weights, bw_method="scott")
+        ZZ_dens = kde(_np.vstack([XX.ravel(), YY.ravel()])
+                      ).reshape(GRID_N, GRID_N)
+    except Exception:
+        ZZ_dens = _np.full((GRID_N, GRID_N), 1e-9)
+        for cid, p in P_cl.items():
+            mask = umap_l == cid
+            if not mask.any():
+                continue
+            cx, cy = float(umap_x[mask].mean()), float(umap_y[mask].mean())
+            dist2  = (XX - cx) ** 2 + (YY - cy) ** 2
+            sigma  = max(x_rng, y_rng) * 0.08
+            ZZ_dens += p * _np.exp(-dist2 / (2 * sigma ** 2))
+
+    ZZ_dens   = _np.maximum(ZZ_dens, 1e-12)
+    ZZ_smooth = _gfilt(ZZ_dens, sigma=0.7)
+    ZZ_energy = -_np.log(_np.maximum(ZZ_smooth, 1e-12))
+
+    supported  = ~_support_mask
+    E_lo       = float(_np.nanmin(ZZ_energy[supported]))
+    ZZ_shifted = _np.maximum(ZZ_energy - E_lo, 0.0)
+    E_hi       = float(_np.nanmax(ZZ_shifted[supported]))
+    ZZ_norm    = ZZ_shifted / max(E_hi, 1e-9)
+    ZZ_norm[_support_mask] = 0.0
+
+    # NaN mask for 2D contourf so unsupported cells render as background
+    ZZ_plot = ZZ_norm.copy().astype(float)
+    ZZ_plot[_support_mask] = _np.nan
+    # NaN mask for 3D surface so the flat padded skirt is not rendered
+    ZZ_surface = ZZ_norm.copy().astype(float)
+    ZZ_surface[_support_mask] = _np.nan
+
+    # ── Behavior-group membership + combined occupancy (duration-based) ────
+    _gmember: dict = {}
+    for _cid, _gn in _cid_to_gname.items():
+        _gmember.setdefault(_gn, []).append(_cid)
+    P_group = {_gn: sum(P_cl.get(c, 0.0) for c in _cids)
+               for _gn, _cids in _gmember.items()}
+
+    # ── Group-weighted energy surface for the Behavioral Groups row ────────
+    # Each point's weight is its GROUP's total occupancy rather than its own
+    # individual cluster's — so every location belonging to a common group
+    # reads as low-energy (common), even a spatially-rare member cluster,
+    # reflecting how much time the animal spends in that behavior overall
+    # rather than in that one specific pose-space variant of it. Points not
+    # in any group get weight 0 (excluded, like noise).
+    ZZ_plot_g = ZZ_surface_g = ZZ_norm_g = None
+    if _gmember:
+        weights_group = _np.array(
+            [0.0 if int(l) < 0 or int(l) not in _cid_to_gname
+             else P_group.get(_cid_to_gname[int(l)], 1e-9)
+             for l in umap_l], dtype=float)
+        wsum_g = weights_group.sum()
+        if wsum_g > 0:
+            weights_group = weights_group / wsum_g
+            try:
+                kde_g     = _gkde(_np.vstack([umap_x, umap_y]),
+                                  weights=weights_group, bw_method="scott")
+                ZZ_dens_g = kde_g(_np.vstack([XX.ravel(), YY.ravel()])
+                                  ).reshape(GRID_N, GRID_N)
+            except Exception:
+                ZZ_dens_g = _np.full((GRID_N, GRID_N), 1e-9)
+                for _gn, _cids in _gmember.items():
+                    _gmask = _np.isin(umap_l, _cids)
+                    if not _gmask.any():
+                        continue
+                    cx, cy = float(umap_x[_gmask].mean()), float(umap_y[_gmask].mean())
+                    dist2  = (XX - cx) ** 2 + (YY - cy) ** 2
+                    sigma  = max(x_rng, y_rng) * 0.08
+                    ZZ_dens_g += P_group[_gn] * _np.exp(-dist2 / (2 * sigma ** 2))
+
+            ZZ_dens_g   = _np.maximum(ZZ_dens_g, 1e-12)
+            ZZ_smooth_g = _gfilt(ZZ_dens_g, sigma=0.7)
+            ZZ_energy_g = -_np.log(_np.maximum(ZZ_smooth_g, 1e-12))
+
+            E_lo_g       = float(_np.nanmin(ZZ_energy_g[supported]))
+            ZZ_shifted_g = _np.maximum(ZZ_energy_g - E_lo_g, 0.0)
+            E_hi_g       = float(_np.nanmax(ZZ_shifted_g[supported]))
+            ZZ_norm_g    = ZZ_shifted_g / max(E_hi_g, 1e-9)
+            ZZ_norm_g[_support_mask] = 0.0
+
+            ZZ_plot_g = ZZ_norm_g.copy().astype(float)
+            ZZ_plot_g[_support_mask] = _np.nan
+            ZZ_surface_g = ZZ_norm_g.copy().astype(float)
+            ZZ_surface_g[_support_mask] = _np.nan
+
+    # ── Scatter point order (sort by cluster; noise excluded) ──────────────
+    sort_idx = _np.argsort(umap_l)
+    _valid   = umap_l[sort_idx] >= 0
+    sx = umap_x[sort_idx][_valid]
+    sy = umap_y[sort_idx][_valid]
+    sc = scatter_colors[sort_idx][_valid]
+
+    _vx = umap_x[~_noise_mask]
+    _vy = umap_y[~_noise_mask]
+    _vl = umap_l[~_noise_mask]
+
+    # ── Top-N valley clusters (highest occupancy = lowest energy) ──────────
+    top_n_cluster = [
+        (f"C{cid}", p, umap_l == cid, PALETTE[int(cid) % len(PALETTE)])
+        for cid, p in sorted(P_cl.items(), key=lambda kv: kv[1], reverse=True)[:N_VALS]
+    ]
+
+    # ── Top-N valley groups (behavior groups, if any are defined) ──────────
+    top_n_group: list = []
+    if _cid_to_gname:
+        for _gn, _p in sorted(P_group.items(), key=lambda kv: kv[1],
+                              reverse=True)[:N_VALS]:
+            # Anchor the valley marker on the group's single dominant
+            # constituent cluster (highest occupancy) rather than pooling
+            # every member's points into one mean / bounding-box search.
+            # A group merging spatially disjoint clusters would otherwise
+            # place the heatmap star in empty space between them, or have
+            # the 3D local-minimum search silently snap to whichever
+            # member is deepest and hide the rest — P_p still reflects
+            # the group's full combined occupancy for ranking purposes.
+            _members  = _gmember[_gn]
+            _dominant = max(_members, key=lambda c: P_cl.get(c, 0.0))
+            _mask = umap_l == _dominant
+            if not _mask.any():
+                continue
+            _gcol = groups.get(_gn, {}).get("color", PALETTE[0])
+            top_n_group.append((_gn, _p, _mask, _gcol))
+
+    _diag = float(_np.hypot(x_rng, y_rng)) or 1.0
+    _label_angles = _np.linspace(0, 2 * _np.pi, 10, endpoint=False)
+
+    def _spiral_label_xy(cx, cy, placed, radii, gap):
+        """Search outward for a label spot that clears every entry in
+        `placed`; falls back to the least-crowded candidate if none is
+        fully clear. Mirrors _place_cluster_label's search but without a
+        point-density term (valley panels have no scatter cloud)."""
+        best_pt, best_score = (cx, cy), None
+        for r in radii:
+            candidates = [(cx, cy)] if r == 0.0 else [
+                (cx + r * _np.cos(a), cy + r * _np.sin(a))
+                for a in _label_angles]
+            found_clean = False
+            for (px, py) in candidates:
+                clash = any(_np.hypot(px - lx, py - ly) < gap
+                            for lx, ly in placed)
+                score = (1e6 if clash else 0.0) + (r / _diag) * 5.0
+                if best_score is None or score < best_score:
+                    best_score, best_pt = score, (px, py)
+                if not clash:
+                    found_clean = True
+            if found_clean and r > 0.0:
+                break
+        placed.append(best_pt)
+        return best_pt
+
+    def _draw_valley_stars(ax1, ax3d, top_list, star_label, zz_norm):
+        # ── Col 1 — 2D heatmap valley stars ─────────────────────────────────
+        # No zero-radius candidate: the label must never sit exactly on top
+        # of its own star, or the star disappears underneath the label box.
+        _radii_2d = [_diag * f for f in (0.07, 0.12, 0.18, 0.25, 0.33)]
+        _gap_2d   = min(x_rng, y_rng) * 0.16
+        _placed_2d: list = []
+        for _key, _p, mask, _color in top_list:
+            if not mask.any():
+                continue
+            cx = float(umap_x[mask].mean())
+            cy = float(umap_y[mask].mean())
+            ax1.scatter(cx, cy, marker="*", s=350,
+                        color="#FFD700", zorder=6,
+                        edgecolors=t["tick"], linewidths=1.0)
+            lx, ly = _spiral_label_xy(cx, cy, _placed_2d, _radii_2d, _gap_2d)
+            # Annotate with a leader line connecting label to the star
+            ax1.annotate(
+                _key,
+                xy=(cx, cy),
+                xytext=(lx, ly),
+                color=t["tick"], fontsize=9.5, fontweight="bold",
+                ha="center", va="center", zorder=8,
+                arrowprops=dict(arrowstyle="-", color=t["tick"],
+                                lw=0.8, alpha=0.7),
+                bbox=dict(boxstyle="round,pad=0.2",
+                          fc=t["ax_bg"], alpha=0.85, ec=t["spine"]),
+            )
+        ax1.set_title(f"Energy Heatmap  (★ = top {N_VALS} {star_label})",
+                      color=t["tick"], fontsize=10, pad=5)
+
+        # ── Col 2 — 3D surface valley labels (local-minimum search) ─────────
+        _ZZ_search = zz_norm.copy()
+        _nan_fill  = float(_np.nanmax(zz_norm)) + 1.0
+        _ZZ_search[_np.isnan(_ZZ_search)] = _nan_fill
+        _vpts = []   # (vx, vy, vz, key)
+        for _key, _p, mask, _color in top_list:
+            if not mask.any():
+                continue
+            _ix0 = max(0, int(_np.searchsorted(xi, float(umap_x[mask].min()))) - 1)
+            _ix1 = min(GRID_N, int(_np.searchsorted(xi, float(umap_x[mask].max()))) + 2)
+            _iy0 = max(0, int(_np.searchsorted(yi, float(umap_y[mask].min()))) - 1)
+            _iy1 = min(GRID_N, int(_np.searchsorted(yi, float(umap_y[mask].max()))) + 2)
+            if _ix1 <= _ix0 or _iy1 <= _iy0:
+                _cx = float(umap_x[mask].mean())
+                _cy = float(umap_y[mask].mean())
+                _ix0 = max(0, int(_np.argmin(_np.abs(xi - _cx))) - 2)
+                _ix1 = _ix0 + 5
+                _iy0 = max(0, int(_np.argmin(_np.abs(yi - _cy))) - 2)
+                _iy1 = _iy0 + 5
+            _sub = _ZZ_search[_iy0:_iy1, _ix0:_ix1]
+            _li  = _np.unravel_index(_np.argmin(_sub), _sub.shape)
+            vx   = float(xi[_ix0 + _li[1]])
+            vy   = float(yi[_iy0 + _li[0]])
+            vz   = float(zz_norm[_iy0 + _li[0], _ix0 + _li[1]])
+            _vpts.append((vx, vy, 0.0 if _np.isnan(vz) else vz, _key))
+
+        # Resolve crowding with a combined xy spiral offset (same search as
+        # the 2D heatmap) plus a z stagger, so nearby valley labels neither
+        # sit on top of each other in-plane nor at the same height.
+        _radii_3d = [_diag * f for f in (0.10, 0.16, 0.23, 0.31, 0.40)]
+        _gap_3d   = min(x_rng, y_rng) * 0.20
+        _placed_3d: list = []
+        _lbls = []   # (lx, ly, lz, vx, vy, vz, key)
+        for _i, (vx, vy, vz, _key) in enumerate(_vpts):
+            lx, ly = _spiral_label_xy(vx, vy, _placed_3d, _radii_3d, _gap_3d)
+            lz = vz + 0.07
+            for (_plx, _ply, _plz, *_rest) in _lbls:
+                if _np.hypot(lx - _plx, ly - _ply) < _gap_3d * 0.6:
+                    lz = max(lz, _plz + 0.16)
+            _lbls.append((lx, ly, lz, vx, vy, vz, _key))
+
+        # Draw dots, leader lines, and non-overlapping labels.
+        for (lx, ly, lz, vx, vy, vz, _key) in _lbls:
+            ax3d.scatter([vx], [vy], [vz], color="#FFD700",
+                         s=40, zorder=9, depthshade=False)
+            ax3d.plot([vx, lx], [vy, ly], [vz, lz],
+                      color=t["tick"], lw=0.9, alpha=0.75, zorder=8)
+            ax3d.text(lx, ly, lz + 0.01, _key,
+                      color=t["tick"], fontsize=9, fontweight="bold",
+                      ha="center", va="bottom", zorder=10)
+
+    def _style_energy_axes(ax0, ax1, ax3d, title):
+        ax0.set_title(title, color=t["tick"],
+                      fontweight="bold", fontsize=12, pad=5)
+        for ax in (ax0, ax1):
+            ax.set_xlabel(f"UMAP-{_ax_i + 1}", color=t["tick"], fontsize=10)
+            ax.set_ylabel(f"UMAP-{_ax_j + 1}", color=t["tick"], fontsize=10)
+            ax.tick_params(colors=t["tick"], labelsize=8)
+            for sp in ("top", "right"):
+                ax.spines[sp].set_visible(False)
+            for sp in ("bottom", "left"):
+                ax.spines[sp].set_edgecolor(t["spine"])
+            ax.set_xlim(umap_x.min() - x_rng * 0.02, umap_x.max() + x_rng * 0.02)
+            ax.set_ylim(umap_y.min() - y_rng * 0.02, umap_y.max() + y_rng * 0.02)
+
+        ax3d.view_init(elev=38, azim=215)
+        ax3d.set_xlabel(f"UMAP-{_ax_i + 1}", color=t["tick"], fontsize=10, labelpad=4)
+        ax3d.set_ylabel(f"UMAP-{_ax_j + 1}", color=t["tick"], fontsize=10, labelpad=4)
+        ax3d.set_zlabel("−ln P",  color=t["tick"], fontsize=10, labelpad=4)
+        ax3d.set_title("3D Energy Surface",
+                       color=t["tick"], fontsize=10, pad=5)
+        ax3d.tick_params(colors=t["tick"], labelsize=7)
+        for pane in (ax3d.xaxis.pane, ax3d.yaxis.pane, ax3d.zaxis.pane):
+            pane.fill = False
+            pane.set_edgecolor(t["border"])
+        ax3d.grid(True, alpha=0.12, color=t["border"])
+
     with plt.style.context(t["mpl_style"]):
         fig = plt.figure(figsize=(fig_w, fig_h), facecolor=t["fig_bg"], dpi=150)
+        # Belt-and-suspenders against the figure background rendering as
+        # transparent (and thus black in most viewers) in a saved PNG: force
+        # full opacity explicitly rather than relying on the facecolor kwarg
+        # surviving untouched through style-context exit / tight_layout.
+        fig.patch.set_facecolor(t["fig_bg"])
+        fig.patch.set_alpha(1.0)
         gs  = fig.add_gridspec(nrows, ncols, width_ratios=[1, 1.15, 1],
                                left=0.06, right=0.97, top=0.88, bottom=0.06,
                                wspace=0.30, hspace=0.55)
 
-        for ei, eg in enumerate(eg_names):
-            ani_list = groups_eg[eg]
-            eg_color = PALETTE[ei % len(PALETTE)]
+        # ══════════════════════════════════════════════════════════════════
+        # Row 0 — All Clusters
+        # ══════════════════════════════════════════════════════════════════
+        ax0 = fig.add_subplot(gs[0, 0])
+        ax0.set_facecolor(t["ax_bg"])
+        # Translucent energy contour behind the scatter (subtle, no lines)
+        ax0.contourf(xi, yi, ZZ_plot, levels=8, cmap=_ECMAP, alpha=0.22)
+        ax0.scatter(sx, sy, c=sc, s=14, linewidths=0, alpha=0.80)
 
-            # ── Per-cluster occupancy probability (noise excluded) ─────────
-            cl_counts: dict = {}
-            for ani in ani_list:
-                for lbl in ani["df"]["label"].values:
-                    k = int(lbl)
-                    if k < 0:
-                        continue   # skip noise frames
-                    cl_counts[k] = cl_counts.get(k, 0) + 1
-            total = max(sum(cl_counts.values()), 1)
-            P_cl  = {k: v / total for k, v in cl_counts.items()}
+        # Cluster centroid labels — every non-noise cluster gets a badge.
+        _placed: list = []
+        for _gcid in sorted(_np.unique(_vl), key=lambda c: -(_vl == c).sum()):
+            _gmask = _vl == _gcid
+            if not _gmask.any():
+                continue
+            _gcx = float(_vx[_gmask].mean())
+            _gcy = float(_vy[_gmask].mean())
+            _gcol = PALETTE[int(_gcid) % len(PALETTE)]
+            _place_cluster_label(ax0, _gcx, _gcy, f"C{_gcid}", _gcol,
+                                 _vx, _vy, _placed, x_rng, y_rng)
 
-            # Weight UMAP points by cluster occupancy probability; noise → 0
-            weights = _np.array(
-                [0.0 if int(l) < 0 else P_cl.get(int(l), 1e-9)
-                 for l in umap_l], dtype=float)
-            wsum = weights.sum()
-            weights = weights / wsum if wsum > 0 else \
-                      _np.ones_like(weights) / len(weights)
+        ax1 = fig.add_subplot(gs[0, 1])
+        ax1.set_facecolor(t["ax_bg"])
+        cf = ax1.contourf(xi, yi, ZZ_plot, levels=12, cmap=_ECMAP)
+        ax1.contour(xi, yi, ZZ_plot, levels=5,
+                    colors=t["tick"], linewidths=0.7, alpha=0.50)
+        cbar = fig.colorbar(cf, ax=ax1, fraction=0.038, pad=0.02)
+        cbar.set_label("−ln P  (energy)", color=t["tick"], fontsize=9)
+        cbar.ax.tick_params(colors=t["tick"], labelsize=8)
+        cbar.ax.set_facecolor(t["ax_bg"])
+        cbar.outline.set_edgecolor(t["spine"])
 
-            # ── Weighted KDE → energy surface ──────────────────────────────
-            try:
-                kde     = _gkde(_np.vstack([umap_x, umap_y]),
-                                weights=weights, bw_method="scott")
-                ZZ_dens = kde(_np.vstack([XX.ravel(), YY.ravel()])
-                              ).reshape(GRID_N, GRID_N)
-            except Exception:
-                ZZ_dens = _np.full((GRID_N, GRID_N), 1e-9)
-                for cid, p in P_cl.items():
-                    mask = umap_l == cid
-                    if not mask.any():
-                        continue
-                    cx, cy = float(umap_x[mask].mean()), float(umap_y[mask].mean())
-                    dist2  = (XX - cx) ** 2 + (YY - cy) ** 2
-                    sigma  = max(x_rng, y_rng) * 0.08
-                    ZZ_dens += p * _np.exp(-dist2 / (2 * sigma ** 2))
+        ax3d = fig.add_subplot(gs[0, 2], projection="3d")
+        ax3d.set_facecolor(t["ax_bg"])
+        ax3d.patch.set_facecolor(t["ax_bg"])
+        ax3d.plot_surface(XX, YY, ZZ_surface, cmap=_ECMAP,
+                          alpha=0.92, linewidth=0, antialiased=True,
+                          rstride=1, cstride=1)
 
-            ZZ_dens   = _np.maximum(ZZ_dens, 1e-12)
-            ZZ_smooth = _gfilt(ZZ_dens, sigma=0.7)
-            ZZ_energy = -_np.log(_np.maximum(ZZ_smooth, 1e-12))
+        _draw_valley_stars(ax1, ax3d, top_n_cluster, "valleys", ZZ_norm)
+        _style_energy_axes(ax0, ax1, ax3d, "All Clusters")
 
-            supported  = ~_support_mask
-            E_lo       = float(_np.nanmin(ZZ_energy[supported]))
-            ZZ_shifted = _np.maximum(ZZ_energy - E_lo, 0.0)
-            E_hi       = float(_np.nanmax(ZZ_shifted[supported]))
-            ZZ_norm    = ZZ_shifted / max(E_hi, 1e-9)
-            ZZ_norm[_support_mask] = 0.0
+        # ══════════════════════════════════════════════════════════════════
+        # Row 1 — Behavioral Groups
+        # ══════════════════════════════════════════════════════════════════
+        if not groups or ZZ_plot_g is None:
+            ax_ph = fig.add_subplot(gs[1, :])
+            ax_ph.set_facecolor(t["ax_bg"])
+            _ph_msg = ("No behavior groups defined.\n"
+                       "Create groups in the Group Editor to see this row.") \
+                      if not groups else \
+                      ("Behavior groups are defined, but none of their\n"
+                       "member cluster IDs are present in this dataset.")
+            ax_ph.text(0.5, 0.5, _ph_msg,
+                       ha="center", va="center", color=t["tick"],
+                       transform=ax_ph.transAxes, fontsize=11)
+            ax_ph.set_xticks([]); ax_ph.set_yticks([])
+            for sp in ax_ph.spines.values():
+                sp.set_visible(False)
+        else:
+            ax0g = fig.add_subplot(gs[1, 0])
+            ax0g.set_facecolor(t["ax_bg"])
+            ax0g.contourf(xi, yi, ZZ_plot_g, levels=8, cmap=_ECMAP, alpha=0.22)
 
-            # NaN mask for 2D contourf so unsupported cells render as background
-            ZZ_plot = ZZ_norm.copy().astype(float)
-            ZZ_plot[_support_mask] = _np.nan
-            # NaN mask for 3D surface so the flat padded skirt is not rendered
-            ZZ_surface = ZZ_norm.copy().astype(float)
-            ZZ_surface[_support_mask] = _np.nan
+            _point_gn = _np.array(
+                [_cid_to_gname.get(int(l), None) for l in umap_l], dtype=object)
+            _unassigned = (umap_l < 0) | _np.array(
+                [g is None for g in _point_gn])
+            if _unassigned.any():
+                ax0g.scatter(umap_x[_unassigned], umap_y[_unassigned],
+                            c=t.get("muted", "#555566"), s=8, alpha=0.15,
+                            linewidths=0, zorder=1)
+            for _gi, _gn in enumerate(groups.keys()):
+                _gmask = _point_gn == _gn
+                if not _gmask.any():
+                    continue
+                _gcol = groups[_gn].get("color", PALETTE[_gi % len(PALETTE)])
+                ax0g.scatter(umap_x[_gmask], umap_y[_gmask],
+                            c=[_gcol], s=14, alpha=0.80,
+                            linewidths=0, zorder=2 + _gi)
 
-            # ── Top-N valley clusters (highest occupancy = lowest energy) ──
-            top_n = sorted(P_cl.items(), key=lambda kv: kv[1], reverse=True)[:N_VALS]
+            # Group centroid labels, one per group, anchored on its largest
+            # constituent cluster (avoids landing in empty space between
+            # disjoint sub-clusters when a group spans several of them).
+            _placed_g: list = []
+            _done_groups: set = set()
+            for _gcid in sorted(_np.unique(_vl), key=lambda c: -(_vl == c).sum()):
+                _gn = _cid_to_gname.get(int(_gcid))
+                if _gn is None or _gn in _done_groups:
+                    continue
+                _member_cids = [c for c, n in _cid_to_gname.items() if n == _gn]
+                _gpts = _np.isin(_vl, _member_cids)
+                if not _gpts.any():
+                    continue
+                _done_groups.add(_gn)
+                _counts = {c: int((_vl == c).sum()) for c in _member_cids}
+                _counts = {c: n for c, n in _counts.items() if n > 0}
+                _anchor_mask = (_vl == max(_counts, key=_counts.get)
+                                if _counts else _gpts)
+                _gcx = float(_vx[_anchor_mask].mean())
+                _gcy = float(_vy[_anchor_mask].mean())
+                _gcol = groups[_gn].get("color",
+                                        PALETTE[len(_done_groups) % len(PALETTE)])
+                _place_cluster_label(ax0g, _gcx, _gcy, _gn, _gcol,
+                                     _vx, _vy, _placed_g, x_rng, y_rng)
 
-            # ── Scatter point order (sort by cluster; noise excluded) ──────
-            sort_idx = _np.argsort(umap_l)
-            _valid   = umap_l[sort_idx] >= 0
-            sx = umap_x[sort_idx][_valid]
-            sy = umap_y[sort_idx][_valid]
-            sc = scatter_colors[sort_idx][_valid]
-
-            # ══════════════════════════════════════════════════════════════════
-            # Col 0 — UMAP scatter + energy contour overlay
-            # ══════════════════════════════════════════════════════════════════
-            ax0 = fig.add_subplot(gs[ei, 0])
-            ax0.set_facecolor(t["ax_bg"])
-            # Translucent energy contour behind the scatter (subtle, no lines)
-            ax0.contourf(xi, yi, ZZ_plot, levels=8, cmap=_ECMAP, alpha=0.22)
-            ax0.scatter(sx, sy, c=sc, s=14, linewidths=0, alpha=0.80)
-
-            # ── Cluster / group centroid labels (overlap-suppressed) ────────
-            _vx = umap_x[~_noise_mask]
-            _vy = umap_y[~_noise_mask]
-            _vl = umap_l[~_noise_mask]
-            _total_v = max(len(_vl), 1)
-            _prox = min(x_rng, y_rng) * 0.10   # min gap between label centres
-            _placed: list = []                   # (cx, cy) of placed labels
-
-            if _cid_to_gname:
-                # Group mode: one badge per group at the group's point centroid
-                _done_groups: set = set()
-                for _gcid in sorted(_np.unique(_vl),
-                                    key=lambda c: -(_vl == c).sum()):
-                    _gn = _cid_to_gname.get(int(_gcid))
-                    if _gn is None or _gn in _done_groups:
-                        continue
-                    _gpts = _np.isin(_vl,
-                        [c for c, n in _cid_to_gname.items() if n == _gn])
-                    if not _gpts.any():
-                        continue
-                    _done_groups.add(_gn)
-                    _gcx = float(_vx[_gpts].mean())
-                    _gcy = float(_vy[_gpts].mean())
-                    if any(_np.hypot(_gcx - px, _gcy - py) < _prox
-                           for px, py in _placed):
-                        continue
-                    _placed.append((_gcx, _gcy))
-                    _gcol = groups[_gn].get("color",
-                                            PALETTE[len(_placed) % len(PALETTE)])
-                    ax0.text(_gcx, _gcy, _gn,
-                             color=_label_text_color(_gcol),
-                             fontsize=6.5, fontweight="bold",
-                             ha="center", va="center",
-                             bbox=dict(boxstyle="round,pad=0.2",
-                                       facecolor=_gcol, edgecolor="none",
-                                       alpha=0.85),
-                             zorder=10)
-            else:
-                # Cluster mode: badge per non-noise cluster, skip tiny/crowded
-                for _gcid in sorted(_np.unique(_vl),
-                                    key=lambda c: -(_vl == c).sum()):
-                    _gmask = _vl == _gcid
-                    if _gmask.sum() / _total_v < 0.005:
-                        continue
-                    _gcx = float(_vx[_gmask].mean())
-                    _gcy = float(_vy[_gmask].mean())
-                    if any(_np.hypot(_gcx - px, _gcy - py) < _prox
-                           for px, py in _placed):
-                        continue
-                    _placed.append((_gcx, _gcy))
-                    _gcol = PALETTE[int(_gcid) % len(PALETTE)]
-                    ax0.text(_gcx, _gcy, f"C{_gcid}",
-                             color=_label_text_color(_gcol),
-                             fontsize=6.5, fontweight="bold",
-                             ha="center", va="center",
-                             bbox=dict(boxstyle="round,pad=0.2",
-                                       facecolor=_gcol, edgecolor="none",
-                                       alpha=0.85),
-                             zorder=10)
-
-            ax0.set_title(eg, color=eg_color,
-                          fontweight="bold", fontsize=12, pad=5)
-            ax0.set_xlabel("UMAP-1", color=t["tick"], fontsize=10)
-            ax0.set_ylabel("UMAP-2", color=t["tick"], fontsize=10)
-            ax0.tick_params(colors=t["tick"], labelsize=8)
-            for sp in ("top", "right"):
-                ax0.spines[sp].set_visible(False)
-            for sp in ("bottom", "left"):
-                ax0.spines[sp].set_edgecolor(t["spine"])
-            ax0.set_xlim(umap_x.min() - x_rng * 0.02, umap_x.max() + x_rng * 0.02)
-            ax0.set_ylim(umap_y.min() - y_rng * 0.02, umap_y.max() + y_rng * 0.02)
-
-            # ══════════════════════════════════════════════════════════════════
-            # Col 1 — 2D filled energy heatmap + top-N valley labels
-            # ══════════════════════════════════════════════════════════════════
-            ax1 = fig.add_subplot(gs[ei, 1])
-            ax1.set_facecolor(t["ax_bg"])
-            cf = ax1.contourf(xi, yi, ZZ_plot, levels=12, cmap=_ECMAP)
-            ax1.contour(xi, yi, ZZ_plot, levels=5,
+            ax1g = fig.add_subplot(gs[1, 1])
+            ax1g.set_facecolor(t["ax_bg"])
+            cfg = ax1g.contourf(xi, yi, ZZ_plot_g, levels=12, cmap=_ECMAP)
+            ax1g.contour(xi, yi, ZZ_plot_g, levels=5,
                         colors=t["tick"], linewidths=0.7, alpha=0.50)
-            cbar = fig.colorbar(cf, ax=ax1, fraction=0.038, pad=0.02)
-            cbar.set_label("−ln P  (energy)", color=t["tick"], fontsize=9)
-            cbar.ax.tick_params(colors=t["tick"], labelsize=8)
-            cbar.outline.set_edgecolor(t["spine"])
+            cbarg = fig.colorbar(cfg, ax=ax1g, fraction=0.038, pad=0.02)
+            cbarg.set_label("−ln P  (energy)", color=t["tick"], fontsize=9)
+            cbarg.ax.tick_params(colors=t["tick"], labelsize=8)
+            cbarg.ax.set_facecolor(t["ax_bg"])
+            cbarg.outline.set_edgecolor(t["spine"])
 
-            for _rank, (cid, _p) in enumerate(top_n):
-                mask = umap_l == cid
-                if not mask.any():
-                    continue
-                cx = float(umap_x[mask].mean())
-                cy = float(umap_y[mask].mean())
-                ax1.scatter(cx, cy, marker="*", s=350,
-                            color="#FFD700", zorder=6,
-                            edgecolors=t["tick"], linewidths=1.0)
-                # Annotate with a short line connecting label to the star
-                ax1.annotate(
-                    f"C{cid}",
-                    xy=(cx, cy),
-                    xytext=(cx + x_rng * 0.04, cy + y_rng * 0.06),
-                    color=t["tick"], fontsize=9.5, fontweight="bold",
-                    ha="center", va="bottom", zorder=8,
-                    arrowprops=dict(arrowstyle="-", color=t["tick"],
-                                    lw=0.8, alpha=0.7),
-                    bbox=dict(boxstyle="round,pad=0.2",
-                              fc=t["ax_bg"], alpha=0.75, ec=t["spine"]),
-                )
+            ax3dg = fig.add_subplot(gs[1, 2], projection="3d")
+            ax3dg.set_facecolor(t["ax_bg"])
+            ax3dg.patch.set_facecolor(t["ax_bg"])
+            ax3dg.plot_surface(XX, YY, ZZ_surface_g, cmap=_ECMAP,
+                               alpha=0.92, linewidth=0, antialiased=True,
+                               rstride=1, cstride=1)
 
-            ax1.set_title(f"Energy Heatmap  (★ = top {N_VALS} valleys)",
-                          color=t["tick"], fontsize=10, pad=5)
-            ax1.set_xlabel("UMAP-1", color=t["tick"], fontsize=10)
-            ax1.set_ylabel("UMAP-2", color=t["tick"], fontsize=10)
-            ax1.tick_params(colors=t["tick"], labelsize=8)
-            for sp in ("top", "right"):
-                ax1.spines[sp].set_visible(False)
-            for sp in ("bottom", "left"):
-                ax1.spines[sp].set_edgecolor(t["spine"])
-            ax1.set_xlim(umap_x.min() - x_rng * 0.02, umap_x.max() + x_rng * 0.02)
-            ax1.set_ylim(umap_y.min() - y_rng * 0.02, umap_y.max() + y_rng * 0.02)
-
-            # ══════════════════════════════════════════════════════════════════
-            # Col 2 — Clean 3D surface (single viewpoint from above)
-            # ══════════════════════════════════════════════════════════════════
-            ax3d = fig.add_subplot(gs[ei, 2], projection="3d")
-            ax3d.set_facecolor(t["ax_bg"])
-
-            ax3d.plot_surface(XX, YY, ZZ_surface, cmap=_ECMAP,
-                              alpha=0.92, linewidth=0, antialiased=True,
-                              rstride=1, cstride=1)
-
-            # ── Two-pass valley labelling ───────────────────────────────────
-            # Pass 1: find the actual local energy minimum for each top-N cluster.
-            _ZZ_search = ZZ_norm.copy()
-            _nan_fill  = float(_np.nanmax(ZZ_norm)) + 1.0
-            _ZZ_search[_np.isnan(_ZZ_search)] = _nan_fill
-            _vpts = []   # (vx, vy, vz, cid)
-            for _rank, (cid, _p) in enumerate(top_n):
-                mask = umap_l == cid
-                if not mask.any():
-                    continue
-                _ix0 = max(0, int(_np.searchsorted(xi, float(umap_x[mask].min()))) - 1)
-                _ix1 = min(GRID_N, int(_np.searchsorted(xi, float(umap_x[mask].max()))) + 2)
-                _iy0 = max(0, int(_np.searchsorted(yi, float(umap_y[mask].min()))) - 1)
-                _iy1 = min(GRID_N, int(_np.searchsorted(yi, float(umap_y[mask].max()))) + 2)
-                if _ix1 <= _ix0 or _iy1 <= _iy0:
-                    _cx = float(umap_x[mask].mean())
-                    _cy = float(umap_y[mask].mean())
-                    _ix0 = max(0, int(_np.argmin(_np.abs(xi - _cx))) - 2)
-                    _ix1 = _ix0 + 5
-                    _iy0 = max(0, int(_np.argmin(_np.abs(yi - _cy))) - 2)
-                    _iy1 = _iy0 + 5
-                _sub = _ZZ_search[_iy0:_iy1, _ix0:_ix1]
-                _li  = _np.unravel_index(_np.argmin(_sub), _sub.shape)
-                vx   = float(xi[_ix0 + _li[1]])
-                vy   = float(yi[_iy0 + _li[0]])
-                vz   = float(ZZ_norm[_iy0 + _li[0], _ix0 + _li[1]])
-                _vpts.append((vx, vy, 0.0 if _np.isnan(vz) else vz, cid))
-
-            # Pass 2: assign staggered label Z-heights for nearby valleys.
-            # Proximity threshold = 15 % of the shorter UMAP axis span.
-            _prox = min(x_rng, y_rng) * 0.18
-            _lz   = [vz for (_, _, vz, _) in _vpts]   # base label heights
-            for _i in range(len(_vpts)):
-                for _j in range(_i):
-                    _d = _np.hypot(_vpts[_i][0] - _vpts[_j][0],
-                                   _vpts[_i][1] - _vpts[_j][1])
-                    if _d < _prox:
-                        _lz[_i] = max(_lz[_i], _lz[_j] + 0.16)
-
-            # Draw dots, stems, and non-overlapping labels.
-            for _i, (vx, vy, vz, cid) in enumerate(_vpts):
-                stem_top = _lz[_i] + 0.07
-                ax3d.scatter([vx], [vy], [vz], color="#FFD700",
-                             s=40, zorder=9, depthshade=False)
-                ax3d.plot([vx, vx], [vy, vy], [vz, stem_top],
-                          color=t["tick"], lw=0.9, alpha=0.75, zorder=8)
-                ax3d.text(vx, vy, stem_top + 0.01, f"C{cid}",
-                          color=t["tick"], fontsize=9, fontweight="bold",
-                          ha="center", va="bottom", zorder=10)
-
-            ax3d.view_init(elev=38, azim=215)
-            ax3d.set_xlabel("UMAP-1", color=t["tick"], fontsize=10, labelpad=4)
-            ax3d.set_ylabel("UMAP-2", color=t["tick"], fontsize=10, labelpad=4)
-            ax3d.set_zlabel("−ln P",  color=t["tick"], fontsize=10, labelpad=4)
-            ax3d.set_title("3D Energy Surface",
-                           color=t["tick"], fontsize=10, pad=5)
-            ax3d.tick_params(colors=t["tick"], labelsize=7)
-            for pane in (ax3d.xaxis.pane, ax3d.yaxis.pane, ax3d.zaxis.pane):
-                pane.fill = False
-                pane.set_edgecolor(t["border"])
-            ax3d.grid(True, alpha=0.12, color=t["border"])
+            _draw_valley_stars(ax1g, ax3dg, top_n_group, "groups", ZZ_norm_g)
+            _style_energy_axes(ax0g, ax1g, ax3dg, "Behavioral Groups")
 
         fig.suptitle(
             "Behavioral Energy Landscape  ·  blue = common states  ·  red = rare states  ·  ★ = top valleys",
@@ -7940,17 +8786,44 @@ def build_umap_groups_figure(
         return _placeholder(
             "No behaviour groups defined.\nCreate groups in the Group Editor first.")
 
-    umap_x = _np.asarray(umap_embedding[:, 0], dtype=float)
-    umap_y = _np.asarray(umap_embedding[:, 1], dtype=float)
-    umap_l = _np.asarray(umap_labels, dtype=int)
+    umap_l_arr = _np.asarray(umap_labels, dtype=int)
 
-    # Guard: stale model files can produce mismatched lengths (embedding n_bins
-    # vs labels n_samp).  Truncate to the shorter so masks stay consistent.
-    if len(umap_x) != len(umap_l):
-        _n = min(len(umap_x), len(umap_l))
-        umap_x = umap_x[:_n]
-        umap_y = umap_y[:_n]
-        umap_l = umap_l[:_n]
+    # A length mismatch here means umap_embedding.npy (n_bins, chronological
+    # bin order) and umap_labels.npy (n_samp, random UMAP-training-subsample
+    # order) came from a stale run predating the fix that keeps both arrays
+    # the same n_bins length and index-aligned. Truncating both to the
+    # shorter length would silently pair each embedding point with an
+    # unrelated label (the subsample order is random, not a chronological
+    # prefix) — refuse instead of rendering a misleading scatter.
+    if umap_embedding.shape[0] != len(umap_l_arr):
+        return _placeholder(
+            "umap_embedding.npy / umap_labels.npy size mismatch —\n"
+            "this model folder predates a fix and the two files are no\n"
+            "longer index-aligned. Re-run the CUBE pipeline (Steps 4–5)\n"
+            "to regenerate matching UMAP files.")
+
+    _ax_i, _ax_j = _best_umap_axis_pair(umap_embedding, umap_l_arr)
+    umap_x = _np.asarray(umap_embedding[:, _ax_i], dtype=float)
+    umap_y = _np.asarray(umap_embedding[:, _ax_j], dtype=float)
+    umap_l = umap_l_arr
+    x_rng = float(umap_x.max() - umap_x.min()) or 1.0
+    y_rng = float(umap_y.max() - umap_y.min()) or 1.0
+
+    # Raw UMAP-1 vs UMAP-2 axes, independent of the auto-selected best pair.
+    umap_x0 = _np.asarray(umap_embedding[:, 0], dtype=float)
+    umap_y0 = _np.asarray(umap_embedding[:, 1], dtype=float)
+    x_rng0 = float(umap_x0.max() - umap_x0.min()) or 1.0
+    y_rng0 = float(umap_y0.max() - umap_y0.min()) or 1.0
+
+    # Raw UMAP-1 vs UMAP-3 axes (only if the embedding has a 3rd dimension) —
+    # clusters/groups that only separate along dim 3 are invisible in the
+    # first two rows above, so surface them explicitly here.
+    _has_dim3 = umap_embedding.shape[1] >= 3
+    if _has_dim3:
+        umap_x2 = _np.asarray(umap_embedding[:, 0], dtype=float)
+        umap_y2 = _np.asarray(umap_embedding[:, 2], dtype=float)
+        x_rng2 = float(umap_x2.max() - umap_x2.min()) or 1.0
+        y_rng2 = float(umap_y2.max() - umap_y2.min()) or 1.0
 
     group_names = list(groups.keys())
     cid_to_gi: dict = {}
@@ -7959,64 +8832,106 @@ def build_umap_groups_figure(
             cid_to_gi[int(cid)] = gi
 
     point_gi = _np.array([cid_to_gi.get(int(l), -1) for l in umap_l], dtype=int)
+    _clustered_mask = umap_l >= 0
 
-    with plt.style.context(t["mpl_style"]):
-        fig, (ax_orig, ax_grp) = plt.subplots(
-            1, 2, figsize=(16, 6.5), facecolor=t["fig_bg"])
-
-        # ── Left panel: original clusters ──────────────────────────────────
-        ax_orig.set_facecolor(t["ax_bg"])
+    def _draw_orig_panel(ax, gx, gy, gxr, gyr, title, xlabel, ylabel):
+        ax.set_facecolor(t["ax_bg"])
+        _placed_o: list = []
         for cid in sorted(_np.unique(umap_l)):
             mask = umap_l == cid
-            color = PALETTE[int(cid) % len(PALETTE)]
-            ax_orig.scatter(umap_x[mask], umap_y[mask],
-                            c=[color], s=5, alpha=0.65,
-                            linewidths=0, rasterized=True, zorder=2)
-            cx = float(umap_x[mask].mean())
-            cy = float(umap_y[mask].mean())
-            ax_orig.text(cx, cy, f"C{cid}",
-                         color=_label_text_color(color),
-                         fontsize=6.5, fontweight="bold",
-                         ha="center", va="center",
-                         bbox=dict(boxstyle="round,pad=0.2",
-                                   facecolor=color, edgecolor="none", alpha=0.82),
-                         zorder=10)
-        ax_orig.set_xlabel("UMAP-1", color=t["tick"], fontsize=11)
-        ax_orig.set_ylabel("UMAP-2", color=t["tick"], fontsize=11)
-        ax_orig.set_title("UMAP — Original Clusters",
-                          color=t["tick"], fontweight="bold", fontsize=13, pad=10)
-        _style_ax(ax_orig, t)
-
-        # ── Right panel: behaviour groups ───────────────────────────────────
-        ax_grp.set_facecolor(t["ax_bg"])
-        unassigned = point_gi < 0
-        if unassigned.any():
-            ax_grp.scatter(umap_x[unassigned], umap_y[unassigned],
+            if cid < 0:
+                # Noise/unclustered — muted styling matching the group
+                # panels' unassigned points, no label badge.
+                ax.scatter(gx[mask], gy[mask],
                            c=t.get("muted", "#555566"), s=3, alpha=0.12,
                            linewidths=0, rasterized=True, zorder=1)
+                continue
+            color = PALETTE[int(cid) % len(PALETTE)]
+            ax.scatter(gx[mask], gy[mask],
+                       c=[color], s=5, alpha=0.65,
+                       linewidths=0, rasterized=True, zorder=2)
+            cx = float(gx[mask].mean())
+            cy = float(gy[mask].mean())
+            _place_cluster_label(ax, cx, cy, f"C{cid}", color,
+                                 gx[_clustered_mask], gy[_clustered_mask],
+                                 _placed_o, gxr, gyr, alpha=0.82)
+        ax.set_xlabel(xlabel, color=t["tick"], fontsize=11)
+        ax.set_ylabel(ylabel, color=t["tick"], fontsize=11)
+        ax.set_title(title, color=t["tick"], fontweight="bold",
+                     fontsize=13, pad=10)
+        _style_ax(ax, t)
+
+    def _draw_groups_panel(ax, gx, gy, gxr, gyr, title, xlabel, ylabel):
+        ax.set_facecolor(t["ax_bg"])
+        unassigned = point_gi < 0
+        if unassigned.any():
+            ax.scatter(gx[unassigned], gy[unassigned],
+                       c=t.get("muted", "#555566"), s=3, alpha=0.12,
+                       linewidths=0, rasterized=True, zorder=1)
+        _placed_g: list = []
         for gi, gname in enumerate(group_names):
             mask = point_gi == gi
             if not mask.any():
                 continue
             color = groups[gname].get("color", PALETTE[gi % len(PALETTE)])
-            ax_grp.scatter(umap_x[mask], umap_y[mask],
-                           c=[color], s=9, alpha=0.78,
-                           linewidths=0, rasterized=True, zorder=2 + gi)
-            cx = float(umap_x[mask].mean())
-            cy = float(umap_y[mask].mean())
-            ax_grp.annotate(
-                gname, xy=(cx, cy),
-                color="white", fontsize=8.5, fontweight="bold",
-                ha="center", va="center",
-                bbox=dict(boxstyle="round,pad=0.3",
-                          facecolor=color, edgecolor="none", alpha=0.82),
-                zorder=12,
-            )
-        ax_grp.set_xlabel("UMAP-1", color=t["tick"], fontsize=11)
-        ax_grp.set_ylabel("UMAP-2", color=t["tick"], fontsize=11)
-        ax_grp.set_title("UMAP — Behavioural Groups",
-                         color=t["tick"], fontweight="bold", fontsize=13, pad=10)
-        _style_ax(ax_grp, t)
+            ax.scatter(gx[mask], gy[mask],
+                       c=[color], s=9, alpha=0.78,
+                       linewidths=0, rasterized=True, zorder=2 + gi)
+            # Anchor the label on the group's largest constituent cluster
+            # rather than the mean of all its points, so it doesn't land in
+            # empty space between disjoint sub-clusters.
+            _member_cids = [int(c) for c in groups[gname].get("labels", [])]
+            _counts = {c: int((umap_l == c).sum()) for c in _member_cids}
+            _counts = {c: n for c, n in _counts.items() if n > 0}
+            anchor_mask = (umap_l == max(_counts, key=_counts.get)
+                           if _counts else mask)
+            cx = float(gx[anchor_mask].mean())
+            cy = float(gy[anchor_mask].mean())
+            _place_cluster_label(ax, cx, cy, gname, color,
+                                 gx[point_gi >= 0], gy[point_gi >= 0],
+                                 _placed_g, gxr, gyr, fontsize=8.5, alpha=0.82)
+        ax.set_xlabel(xlabel, color=t["tick"], fontsize=11)
+        ax.set_ylabel(ylabel, color=t["tick"], fontsize=11)
+        ax.set_title(title, color=t["tick"], fontweight="bold",
+                     fontsize=13, pad=10)
+        _style_ax(ax, t)
+
+    with plt.style.context(t["mpl_style"]):
+        nrows = 3 if _has_dim3 else 2
+        fig, axes = plt.subplots(
+            nrows, 2, figsize=(16, 6.5 * nrows), facecolor=t["fig_bg"])
+        # Force full opacity so the margins around each panel can't be
+        # saved as transparent (which most viewers then render as black,
+        # regardless of the light/dark theme actually in use).
+        fig.patch.set_facecolor(t["fig_bg"])
+        fig.patch.set_alpha(1.0)
+        (ax_orig, ax_grp), (ax_orig2, ax_grp2) = axes[0], axes[1]
+
+        # ── Row 1: best-separating axis pair ─────────────────────────────────
+        _draw_orig_panel(ax_orig, umap_x, umap_y, x_rng, y_rng,
+                         "UMAP — Original Clusters",
+                         f"UMAP-{_ax_i + 1}", f"UMAP-{_ax_j + 1}")
+        _draw_groups_panel(ax_grp, umap_x, umap_y, x_rng, y_rng,
+                           "UMAP — Behavioural Groups",
+                           f"UMAP-{_ax_i + 1}", f"UMAP-{_ax_j + 1}")
+
+        # ── Row 2: raw UMAP-1 vs UMAP-2 ──────────────────────────────────────
+        _draw_orig_panel(ax_orig2, umap_x0, umap_y0, x_rng0, y_rng0,
+                         "UMAP-1 vs UMAP-2 — Original Clusters",
+                         "UMAP-1", "UMAP-2")
+        _draw_groups_panel(ax_grp2, umap_x0, umap_y0, x_rng0, y_rng0,
+                           "UMAP-1 vs UMAP-2 — Behavioural Groups",
+                           "UMAP-1", "UMAP-2")
+
+        # ── Row 3: raw UMAP-1 vs UMAP-3 (only if a 3rd embedding dim exists) ─
+        if _has_dim3:
+            ax_orig3, ax_grp3 = axes[2]
+            _draw_orig_panel(ax_orig3, umap_x2, umap_y2, x_rng2, y_rng2,
+                             "UMAP-1 vs UMAP-3 — Original Clusters",
+                             "UMAP-1", "UMAP-3")
+            _draw_groups_panel(ax_grp3, umap_x2, umap_y2, x_rng2, y_rng2,
+                               "UMAP-1 vs UMAP-3 — Behavioural Groups",
+                               "UMAP-1", "UMAP-3")
 
         fig.tight_layout()
     return fig
@@ -8079,9 +8994,12 @@ def save_umap_groups_3d(
                                   t_cur["tick"], t_cur["tick"])
             views   = [(20, 45), (20, 200), (60, 100)]
             fig_s   = _plt.figure(figsize=(18, 6), facecolor=bg)
+            fig_s.patch.set_facecolor(bg)
+            fig_s.patch.set_alpha(1.0)
             for vi, (elev, azim) in enumerate(views):
                 ax = fig_s.add_subplot(1, 3, vi + 1, projection="3d")
                 ax.set_facecolor(panel)
+                ax.patch.set_facecolor(panel)
                 unassigned = point_gi < 0
                 if unassigned.any():
                     ax.scatter(e3[unassigned, 0], e3[unassigned, 1],
@@ -8112,7 +9030,7 @@ def save_umap_groups_3d(
             png_path = pathlib.Path(out_path).with_suffix(".png")
             png_path.parent.mkdir(parents=True, exist_ok=True)
             fig_s.savefig(str(png_path), dpi=150, bbox_inches="tight",
-                          facecolor=fig_s.get_facecolor())
+                          facecolor=fig_s.get_facecolor(), transparent=False)
             _plt.close(fig_s)
         except Exception:
             pass
@@ -8321,9 +9239,12 @@ def save_group_transitions_3d(
             tc     = t_cur["tick"]
             views  = [(20, 45), (20, 200), (60, 100)]
             fig_s  = _plt.figure(figsize=(18, 6), facecolor=bg)
+            fig_s.patch.set_facecolor(bg)
+            fig_s.patch.set_alpha(1.0)
             for vi, (elev, azim) in enumerate(views):
                 ax = fig_s.add_subplot(1, 3, vi + 1, projection="3d")
                 ax.set_facecolor(panel)
+                ax.patch.set_facecolor(panel)
                 # Translucent point cloud coloured by behavioural group
                 for gi, gname in enumerate(group_names):
                     mask = point_gi == gi
@@ -8373,7 +9294,7 @@ def save_group_transitions_3d(
             png_path = pathlib.Path(out_path).with_suffix(".png")
             png_path.parent.mkdir(parents=True, exist_ok=True)
             fig_s.savefig(str(png_path), dpi=150, bbox_inches="tight",
-                          facecolor=fig_s.get_facecolor())
+                          facecolor=fig_s.get_facecolor(), transparent=False)
             _plt.close(fig_s)
         except Exception:
             pass
@@ -9573,8 +10494,19 @@ class GroupPredictorPanel(ctk.CTkFrame):
         # ── Permutation test: flat (n_perm × n_folds) job list ────────────────
         # Pre-generate all shuffles so results are reproducible regardless of
         # thread scheduling order (each worker receives a fixed y_perm array).
+        # StratifiedShuffleSplit preserves class proportions in each permutation
+        # so the null distribution is not biased for imbalanced cohorts
+        # (e.g. 3 vs. 30 animals).  Falls back to plain permutation if
+        # stratification is impossible (single sample per class).
         rng = np.random.default_rng(42)
-        all_y_perms = [rng.permutation(y_enc) for _ in range(n_permutations)]
+        try:
+            from sklearn.model_selection import StratifiedShuffleSplit as _SSS
+            _sss = _SSS(n_splits=n_permutations, test_size=None, random_state=42)
+            all_y_perms = []
+            for _perm_idx, _ in _sss.split(X, y_enc):
+                all_y_perms.append(y_enc[_perm_idx])
+        except Exception:
+            all_y_perms = [rng.permutation(y_enc) for _ in range(n_permutations)]
 
         if progress_fn:
             progress_fn(
@@ -14471,7 +15403,8 @@ class BehavioralExplorerPanel(ctk.CTkFrame):
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
         self._group_by_var = ctk.StringVar(value="Label 1")
         ctk.CTkOptionMenu(gb, variable=self._group_by_var,
-                          values=["Label 1", "Label 2", "Label 3", "All Labels"],
+                          values=["Label 1", "Label 2", "Label 3 / Animal ID",
+                                  "All Labels"],
                           width=220).pack(padx=12, pady=(2, 8))
 
         # Diff heatmap settings
@@ -14724,13 +15657,34 @@ class BehavioralExplorerPanel(ctk.CTkFrame):
             for child in w.winfo_children():
                 _bind_wheel(child)
 
+        def _keep_aspect(event, widget, aspect):
+            # FigureCanvasTkAgg's own <Configure> handler sets the figure's
+            # pixel size directly from the widget's raw (width, height) —
+            # since we only pack with fill="x", width tracks the panel but
+            # height stays pinned at the figure's original creation-time
+            # pixel height, distorting wide figures (e.g. Energy Landscape,
+            # ~3.4:1) into a visibly stretched shape the export never has.
+            # Re-anchor height to the figure's native aspect ratio whenever
+            # width changes; the resulting geometry change re-fires
+            # <Configure> with a correct (width, height) pair for mpl to
+            # rescale against. The size check prevents an infinite loop.
+            target_h = max(1, int(event.width * aspect))
+            if abs(widget.winfo_height() - target_h) > 2:
+                widget.configure(height=target_h)
+
         is_sankey = self._view_var.get() == "Sankey"
         last_canvas = None
         for fi, fig in enumerate(figs):
             mpl_c = FigureCanvasTkAgg(fig, master=self._inner)
             mpl_c.draw()
             widget = mpl_c.get_tk_widget()
+            _fig_w_in, _fig_h_in = fig.get_size_inches()
+            _aspect = (_fig_h_in / _fig_w_in) if _fig_w_in else 1.0
             widget.pack(fill="x", expand=True, padx=2, pady=(0, 2))
+            widget.bind(
+                "<Configure>",
+                lambda e, _w=widget, _a=_aspect: _keep_aspect(e, _w, _a),
+                add="+")
             _bind_wheel(widget)
             if is_sankey and fi == 0:
                 mpl_c.mpl_connect("pick_event", self._on_sankey_pick)
@@ -15202,7 +16156,8 @@ class BehavioralExplorerPanel(ctk.CTkFrame):
                     fig.savefig(
                         str(out_dir / f"explorer_{view_slug}{sfx}_{ts}.{ext}"),
                         dpi=300 if ext == "png" else None,
-                        bbox_inches="tight", facecolor=fig.get_facecolor())
+                        bbox_inches="tight", facecolor=fig.get_facecolor(),
+                        transparent=False)
                 plt.close(fig)
                 n += 1
 
@@ -15226,7 +16181,8 @@ class BehavioralExplorerPanel(ctk.CTkFrame):
             if len(self._current_figs) == 1:
                 self._current_figs[0].savefig(
                     str(base), dpi=200, bbox_inches="tight",
-                    facecolor=self._current_figs[0].get_facecolor())
+                    facecolor=self._current_figs[0].get_facecolor(),
+                    transparent=False)
                 saved.append(base.name)
             else:
                 suffixes = ["_clusters", "_beh_groups"]
@@ -15234,7 +16190,8 @@ class BehavioralExplorerPanel(ctk.CTkFrame):
                     sfx   = suffixes[i] if i < len(suffixes) else f"_{i}"
                     fpath = base.parent / (base.stem + sfx + base.suffix)
                     fig.savefig(str(fpath), dpi=200, bbox_inches="tight",
-                                facecolor=fig.get_facecolor())
+                                facecolor=fig.get_facecolor(),
+                                transparent=False)
                     saved.append(fpath.name)
 
             # ── 3D companion figures for the Energy Landscape view ────────────
@@ -15302,6 +16259,7 @@ class BSOiDApp(ctk.CTk):
         self._editor:         GroupEditorWindow | None = None
         self._umap_embedding: object              = None   # np.ndarray or None
         self._umap_labels:    object              = None   # np.ndarray or None
+        self._cluster_confidence: dict            = {}     # {cluster_id: low_confidence_flag}
         self._ignore_groups_var: ctk.BooleanVar | None = None  # set in _build_ui
 
         ctk.set_appearance_mode("dark")
@@ -15455,6 +16413,10 @@ class BSOiDApp(ctk.CTk):
             load_groups_to_editor_fn=self._load_reclustered_groups,
             get_groups_fn=self._get_groups,
             get_combined_fn=lambda: getattr(self, "_combined", None),
+            get_umap_fn=lambda: (
+                getattr(self, "_umap_embedding", None),
+                getattr(self, "_umap_labels",    None),
+            ),
         )
         self._unbiased_panel.grid(row=0, column=0, sticky="nsew")
 
@@ -15615,7 +16577,8 @@ class BSOiDApp(ctk.CTk):
         if not hasattr(self, "_combined_group_by_var"):
             self._combined_group_by_var = ctk.StringVar(value="Label 1")
         ctk.CTkOptionMenu(btns, variable=self._combined_group_by_var,
-                          values=["Label 1", "Label 2", "Label 3", "All Labels"],
+                          values=["Label 1", "Label 2", "Label 3 / Animal ID",
+                                  "All Labels"],
                           width=120).pack(side="left", padx=2, pady=6)
 
         # Scrollable plot area: tk.Canvas + vertical scrollbar
@@ -15725,6 +16688,7 @@ class BSOiDApp(ctk.CTk):
         # Reset cached UMAP data
         self._umap_embedding = None
         self._umap_labels    = None
+        self._cluster_confidence = {}
 
         csv_ok = False
         try:
@@ -15737,6 +16701,7 @@ class BSOiDApp(ctk.CTk):
             self._csv_paths = files
             self._csv_combo.configure(values=[p.name for p in files])
             self._csv_combo.set(files[0].name)
+            self._refresh_all_labels_union()
             self._load_csv(files[0])
             csv_ok = True
         except Exception as e:
@@ -15775,11 +16740,35 @@ class BSOiDApp(ctk.CTk):
                 except Exception:
                     pass   # UMAP data is optional
 
+            # Load per-cluster low-confidence flags if cube_core saved them
+            conf_p = find_cluster_confidence(self._root_dir)
+            if conf_p:
+                self._cluster_confidence = load_cluster_confidence(conf_p)
+
     def _csv_changed(self, name):
         for p in self._csv_paths:
             if p.name == name:
                 self._load_csv(p)
                 break
+
+    def _refresh_all_labels_union(self):
+        """
+        Union the cluster labels found across ALL animal CSVs in the loaded
+        folder (not just the currently-previewed one). A cluster can be rare
+        or absent in one animal's bout CSV yet present in others (and in the
+        UMAP embedding, which is built from all sessions) - using only the
+        active file's labels would silently hide those clusters from the
+        Group Editor.
+        """
+        labels: set = set()
+        for p in self._csv_paths:
+            try:
+                labels.update(load_csv(p)["label"].unique().tolist())
+            except Exception:
+                continue
+        self._all_labels = sorted(labels)
+        if self._editor and self._editor.winfo_exists():
+            self._editor.refresh_labels(self._all_labels)
 
     def _load_csv(self, path: pathlib.Path):
         try:
@@ -15791,7 +16780,8 @@ class BSOiDApp(ctk.CTk):
         self._active_csv = path
         self._fps        = extract_fps(path)
         self._fps_var.set(str(self._fps))
-        self._all_labels = sorted(df["label"].unique().tolist())
+        if not self._all_labels:
+            self._all_labels = sorted(df["label"].unique().tolist())
         if self._editor and self._editor.winfo_exists():
             self._editor.refresh_labels(self._all_labels)
         dur = session_duration(df, self._fps)
