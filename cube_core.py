@@ -17,7 +17,7 @@ Handles:
 """
 
 #   stdlib  
-import json, pickle, re, shutil, time, traceback, warnings
+import gc, json, os, pickle, re, shutil, time, traceback, warnings
 from datetime import datetime
 from itertools import combinations
 from pathlib import Path
@@ -1343,9 +1343,218 @@ def run_umap(feats_sc_T: np.ndarray, cfg: dict):
     return reducer, reducer.fit_transform(feats_sc_T)
 
 
-#  
+#
+#  ADAPTIVE RESOURCE MANAGEMENT  (cores/RAM-aware parallelism budget for the
+#  HDBSCAN-side stages: primary sweep, split_impure_clusters, seed_sweep_stability.
+#  UMAP stays forced single-threaded elsewhere for embedding reproducibility --
+#  not covered here.)
+#
+
+def detect_system_resources() -> dict:
+    """Cores + RAM snapshot used to size adaptive parallelism."""
+    import psutil
+    vm = psutil.virtual_memory()
+    return {
+        "cpu_count":        os.cpu_count() or 1,
+        "total_ram_gb":     vm.total / 1e9,
+        "available_ram_gb": vm.available / 1e9,
+        "ram_used_pct":     vm.percent,
+    }
+
+
+def compute_adaptive_n_jobs(cfg: dict, log_fn=None) -> int:
+    """Core budget for HDBSCAN-side parallel stages.
+
+    Targets `system_resource_target_pct` of logical cores (default 0.65, i.e.
+    the 60-70% "ideal sustained" band), hard-capped at `system_resource_cap_pct`
+    (default 0.80) regardless of core count.  Shrunk further if RAM is already
+    under pressure at call time -- this is the crash-avoidance mechanism: the
+    budget only ever shrinks from the target, it never expands past the cap.
+    """
+    res = detect_system_resources()
+    target_pct = float(cfg.get("system_resource_target_pct", 0.65))
+    cap_pct    = float(cfg.get("system_resource_cap_pct",    0.80))
+    n_jobs = max(1, int(res["cpu_count"] * target_pct))
+    n_jobs = min(n_jobs, max(1, int(res["cpu_count"] * cap_pct)))
+    # Memory-pressure guard: >75% RAM already used, or <1.5 GB free per
+    # planned worker, halves the budget rather than risking OOM under
+    # concurrent HDBSCAN fits (each fit builds its own mutual-reachability /
+    # condensed-tree working set).
+    if res["ram_used_pct"] > 75 or res["available_ram_gb"] < 1.5 * n_jobs:
+        n_jobs = max(1, n_jobs // 2)
+        if log_fn:
+            log_fn(f"  [SYSTEM] RAM pressure detected ({res['ram_used_pct']:.0f}% "
+                   f"used, {res['available_ram_gb']:.1f} GB free) — "
+                   f"reducing parallel budget to {n_jobs} worker(s).")
+    return n_jobs
+
+
+def resolve_n_jobs(cfg: dict, cfg_key: str, log_fn=None) -> int:
+    """Resolve one of the HDBSCAN-side `*_n_jobs` cfg keys to an actual worker
+    count.  `-1` (the shared default/"auto" sentinel across `hdbscan_sweep_n_jobs`,
+    `hdbscan_split_n_jobs`, `seed_sweep_n_jobs`, `consensus_n_jobs`) means "auto-managed" when
+    `auto_resource_management` is on -- resolved via compute_adaptive_n_jobs().
+    Any other explicit value (1 = sequential, or a user-pinned positive
+    integer) is honoured exactly as given, unchanged from prior behaviour.
+    """
+    raw = int(cfg.get(cfg_key, -1) or -1)
+    if raw == -1 and bool(cfg.get("auto_resource_management", True)):
+        try:
+            return compute_adaptive_n_jobs(cfg, log_fn=log_fn)
+        except Exception:
+            # psutil missing, or any other resource-detection failure --
+            # fall back to the pre-auto-management behaviour (-1 = literal
+            # "all cores" via joblib) rather than crashing the pipeline.
+            if log_fn:
+                log_fn(f"  [SYSTEM] resource detection failed for {cfg_key} "
+                       f"(psutil missing?) — falling back to all-cores.")
+            return -1
+    return raw if raw != -1 else -1
+
+
+import contextlib
+
+@contextlib.contextmanager
+def _numba_single_thread():
+    """Thread-local cap of numba's own parallel-region thread pool to 1.
+
+    Confirmed thread-local (not process-global) via numba.set_num_threads —
+    each thread's mask is independent, so this is safe to call concurrently
+    from multiple joblib worker threads without racing each other. Restores
+    this thread's previous count on exit.
+
+    Why this matters: every outer `*_n_jobs` sweep in this module
+    (seed_sweep_stability, split_impure_clusters, consensus_cluster) already
+    forces the INNER run_hdbscan()/run_umap() call's own `*_sweep_n_jobs` cfg
+    key to 1 so joblib doesn't nest worker pools -- but that only controls
+    joblib-level dispatch. UMAP's neighbour search (pynndescent) is
+    numba-jitted and, independently of any joblib setting, spins up its own
+    thread pool sized to the full logical core count by default (confirmed
+    via numba.get_num_threads() == 32 on a 16-core/32-thread box). With N
+    outer joblib worker threads each then trying to claim ~all cores for its
+    own UMAP fit, the result is N x cores contending threads -- severe
+    oversubscription that thrashes instead of parallelising, which is why a
+    "parallel" sweep can still run as slow as (or slower than) sequential.
+    Scoping numba to 1 thread per worker here makes actual core usage match
+    resolve_n_jobs()'s intended budget (n_jobs workers x 1 core each).
+    No-op if numba isn't importable.
+    """
+    prev = None
+    try:
+        import numba
+        prev = numba.get_num_threads()
+        numba.set_num_threads(1)
+    except Exception:
+        pass
+    try:
+        yield
+    finally:
+        if prev is not None:
+            try:
+                numba.set_num_threads(prev)
+            except Exception:
+                pass
+
+
+@contextlib.contextmanager
+def _blas_single_thread_for_dispatch():
+    """Cap BLAS (OpenBLAS/MKL, via threadpoolctl) to 1 thread for the
+    duration of an ENTIRE joblib.Parallel(...) dispatch call -- wrap the
+    Parallel(...) call itself in this, not each individual worker.
+
+    threadpoolctl's limiter is documented as process-global with "no thread
+    level isolation" (unlike numba's per-thread mask, see
+    _numba_single_thread above) -- setting/restoring it independently inside
+    each of N concurrently-running worker threads would race: one worker
+    finishing and restoring the original (full) thread count mid-sweep would
+    silently un-cap BLAS for every other still-running worker. A single
+    enter/exit around the whole dispatch avoids that race entirely while
+    still preventing oversubscription, since BLAS calls inside numpy/sklearn
+    steps (PCA, scaling, HDBSCAN's numpy ops) would otherwise each try to
+    claim all cores per worker on top of the numba contention above.
+    No-op if threadpoolctl isn't importable.
+    """
+    try:
+        from threadpoolctl import threadpool_limits
+        with threadpool_limits(limits=1):
+            yield
+    except ImportError:
+        yield
+
+
+def _patch_pynndescent_thread_safety():
+    """Force pynndescent's internal leaf-array step to run single-threaded,
+    process-wide, unconditionally -- same "safety over marginal speed"
+    philosophy as the BLAS/MKL env vars forced at the top of cube.py and
+    cube_analyser.py, applied here because this one has no env-var or
+    config-flag equivalent to control it.
+
+    Root cause (confirmed via a real crash + faulthandler stack trace, then
+    verified by reading pynndescent 0.5.x's own source): UMAP's nearest-
+    neighbour search (pynndescent) builds its random-projection forest with
+    UMAP's own n_jobs respected (via NNDescent(n_jobs=...) -> make_forest())
+    -- but pynndescent.rp_trees.rptree_leaf_array_parallel(), a SEPARATE
+    step that runs unconditionally after forest-building on every single
+    UMAP fit, HARDCODES joblib.Parallel(n_jobs=-1, ...) with no parameter to
+    override it. CUBE's own UMAP(n_jobs=1) has zero effect on this one step
+    -- confirmed by reading the call chain (NNDescent.__init__ ->
+    rptree_leaf_array -> rptree_leaf_array_parallel, the last of which never
+    receives or forwards n_jobs at all).
+
+    This is harmless when a UMAP fit runs standalone (the primary run_umap()
+    call in BSoidEngine.run()) -- the burst of up-to-all-core threads is
+    short-lived and nothing else is contending for those cores. It becomes
+    a real crash when run_umap() is called from an ALREADY-parallel outer
+    joblib worker -- which split_impure_clusters()/seed_sweep_stability()/
+    consensus_cluster() all do, each dispatching several such workers at
+    once via their own *_n_jobs Parallel(...). Every one of those outer
+    workers then independently bursts its own full-width (all-CPU-core)
+    thread pool for this one pynndescent step AT THE SAME TIME -- unlike
+    numba (capped per-worker via _numba_single_thread()) and BLAS (capped
+    per-dispatch via _blas_single_thread_for_dispatch()), nothing in this
+    module touched pynndescent's own joblib usage, because it isn't reached
+    through either of those mechanisms. Confirmed as the actual crash cause
+    via a real run's faulthandler dump: the full stack trace terminated in
+    rptree_leaf_array_parallel(), called via run_umap() from inside
+    _seed_sweep_one_seed(), itself one of seed_sweep_stability()'s parallel
+    workers -- dozens of simultaneous per-worker bursts, severe enough to
+    trigger a fatal SIGABRT.
+
+    joblib.parallel_config(n_jobs=1) does NOT fix this: it only supplies a
+    default for Parallel(...) calls that omit n_jobs, and pynndescent's call
+    passes n_jobs=-1 explicitly -- confirmed empirically (an outer
+    parallel_config(n_jobs=1) context measurably had no effect on a nested
+    Parallel(n_jobs=-1) call's actual thread count). Patching the function
+    itself to always dispatch with n_jobs=1 is safe: results are bit-for-
+    bit identical, just serialized -- extracting each tree's leaf-index
+    array from an already-built tree is cheap, and this is confirmed by
+    benchmark to cost no measurable wall-clock time even on a full-size fit
+    (this step was never the bottleneck; NN-descent search is). No-op if
+    pynndescent isn't installed under this name/layout (future version
+    changed the function's location), so a version bump degrades back to
+    the pre-patch (nesting-unsafe) behaviour rather than raising.
+    """
+    try:
+        import pynndescent.rp_trees as _rpt
+        import joblib as _joblib
+
+        def _patched_leaf_array_parallel(rp_forest):
+            _max_leaf_size = np.max([t.leaf_size for t in rp_forest])
+            return _joblib.Parallel(n_jobs=1, require="sharedmem")(
+                _joblib.delayed(_rpt.get_leaves_from_tree)(t, _max_leaf_size)
+                for t in rp_forest)
+
+        _rpt.rptree_leaf_array_parallel = _patched_leaf_array_parallel
+    except Exception:
+        pass
+
+
+_patch_pynndescent_thread_safety()
+
+
+#
 #  HDBSCAN  (auto-sweep min_cluster_size - B-SOiD default strategy)
-#  
+#
 
 def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None,
                 log_fn=None):
@@ -1418,7 +1627,7 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None,
     # ── User preferences ──────────────────────────────────────────────────────
     target_n = int(cfg.get("target_n_clusters", 0))       # 0 = no specific target
     pref_lo  = int(cfg.get("preferred_clusters_lo", 8))   # auto-mode lower bound
-    pref_hi  = int(cfg.get("preferred_clusters_hi", 30))  # auto-mode upper bound
+    pref_hi  = int(cfg.get("preferred_clusters_hi", 20))  # auto-mode upper bound
 
     # ── Sweep bounds ──────────────────────────────────────────────────────────
     # pct values are in units of 0.1 % of ref_n.
@@ -1499,31 +1708,84 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None,
 
     # ── Sweep: collect every viable candidate ─────────────────────────────────
     # tuple: (score, n_clusters, labels, clf, method)
-    candidates = []
+    # Dispatched via a thread pool sized by resolve_n_jobs() (System Resources,
+    # DEFAULTS): threads, not processes -- run_umap()/hdbscan JIT-compile via
+    # numba, and process-based (loky) workers compiling that JIT concurrently
+    # for the first time hit a real Windows access-violation crash in testing
+    # (numba's on-disk JIT cache isn't safe under concurrent cross-process
+    # first-compilation). HDBSCAN's Cython core and numba's nopython-mode
+    # functions both release the GIL during their heavy numeric work, so a
+    # thread pool still parallelizes the actual computation -- same choice,
+    # for the same reason, as split_impure_clusters() below. Result selection
+    # afterward is order-independent (best-score pick over an unordered list),
+    # so parallel completion order cannot change which candidate wins.
+    _sweep_n_jobs = resolve_n_jobs(cfg, "hdbscan_sweep_n_jobs", log_fn=log_fn)
+    # Oversubscription guard: once the outer sweep itself is running N fits
+    # concurrently, each individual fit must not ALSO spawn hdbscan's own
+    # internal core_dist_n_jobs threads (default 4) on top of that -- total
+    # concurrency must stay bounded by the resolved budget alone.
+    _core_dist_n_jobs = 1 if _sweep_n_jobs != 1 else None
 
-    for method in methods:
-        for pct in pcts:
-            mcs = max(2, int(round(0.001 * pct * ref_n)))
-            clf = _hdb.HDBSCAN(
-                prediction_data          = True,
-                min_cluster_size         = mcs,
-                min_samples              = max(5, mcs // 5),
-                metric                   = cfg.get("hdbscan_metric", "euclidean"),
-                cluster_selection_method = method,
-                # relative_validity_ (DBCV) raises AttributeError without this
-                # -- silently swallowed by the getattr() default below, which
-                # made DBCV permanently unavailable (every candidate falling
-                # through to the "degenerate" branch, unconditionally) rather
-                # than only when the density graph is genuinely degenerate.
-                gen_min_span_tree        = True,
-            ).fit(embedding)
+    def _fit_one(method, pct):
+        mcs = max(2, int(round(0.001 * pct * ref_n)))
+        _kwargs = dict(
+            prediction_data          = True,
+            min_cluster_size         = mcs,
+            min_samples              = max(5, mcs // 5),
+            metric                   = cfg.get("hdbscan_metric", "euclidean"),
+            cluster_selection_method = method,
+            # relative_validity_ (DBCV) raises AttributeError without this
+            # -- silently swallowed by the getattr() default below, which
+            # made DBCV permanently unavailable (every candidate falling
+            # through to the "degenerate" branch, unconditionally) rather
+            # than only when the density graph is genuinely degenerate.
+            gen_min_span_tree        = True,
+        )
+        if _core_dist_n_jobs is not None:
+            _kwargs["core_dist_n_jobs"] = _core_dist_n_jobs
+        # Oversubscription guard (thread-count half): mirrors split_impure_
+        # clusters()/seed_sweep_stability()/consensus_cluster(), which all cap
+        # numba to 1 thread per outer worker for the same reason -- HDBSCAN's
+        # numba-jitted core-distance/boruvka code spins up its OWN thread pool
+        # (sized to all CPU cores by default) independently of joblib's
+        # n_jobs. Without this, each of the _sweep_n_jobs outer worker
+        # threads above ALSO launches a full-width numba thread pool,
+        # multiplying concurrency to roughly _sweep_n_jobs x core_count
+        # threads -- confirmed on a real run: dozens of live threads and a
+        # fatal "Aborted" (SIGABRT) crash with no Python traceback, the
+        # thread-count analogue of the core_dist_n_jobs guard just above.
+        with _numba_single_thread():
+            clf = _hdb.HDBSCAN(**_kwargs).fit(embedding)
 
-            n_cl = len(set(clf.labels_)) - (1 if -1 in clf.labels_ else 0)
-            if n_cl < 2:
-                continue
+        n_cl = len(set(clf.labels_)) - (1 if -1 in clf.labels_ else 0)
+        if n_cl < 2:
+            return None
 
-            score = getattr(clf, "relative_validity_", -np.inf)
-            candidates.append((score, n_cl, clf.labels_.copy(), clf, method))
+        score = getattr(clf, "relative_validity_", -np.inf)
+        return (score, n_cl, clf.labels_.copy(), clf, method)
+
+    _tasks = [(method, pct) for method in methods for pct in pcts]
+    if _sweep_n_jobs != 1 and len(_tasks) > 1:
+        try:
+            from joblib import Parallel, delayed
+            # Oversubscription guard (BLAS half): mirrors split_impure_
+            # clusters()/seed_sweep_stability()/consensus_cluster(), which
+            # all wrap their own Parallel(...) dispatch the same way -- see
+            # _blas_single_thread_for_dispatch()'s docstring for why this has
+            # to wrap the WHOLE dispatch call rather than each worker
+            # individually (threadpoolctl's limiter is process-global, so
+            # per-worker enter/exit would race). Without this, BLAS calls
+            # inside each worker's own numpy/sklearn steps (PCA, distance
+            # computation) would each try to claim all cores on top of the
+            # numba contention _fit_one already guards against above.
+            with _blas_single_thread_for_dispatch():
+                _raw = Parallel(n_jobs=_sweep_n_jobs, prefer="threads")(
+                    delayed(_fit_one)(method, pct) for method, pct in _tasks)
+        except Exception:
+            _raw = [_fit_one(method, pct) for method, pct in _tasks]
+    else:
+        _raw = [_fit_one(method, pct) for method, pct in _tasks]
+    candidates = [r for r in _raw if r is not None]
 
     # ── Fallback: sweep produced nothing with ≥ 2 clusters ────────────────────
     if not candidates:
@@ -1703,6 +1965,15 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None,
                      sorted(candidates, key=lambda c: -c[0])[0]
 
     best_score, _, best_labels, best_clf, _ = chosen
+    # Non-selected candidates' clf objects (each retains a condensed tree /
+    # minimum spanning tree; up to ~80 coexist in `candidates` by construction)
+    # need no explicit release here: they're plain refcounted objects with no
+    # reference cycles, so they're freed the instant this function returns and
+    # `candidates` goes out of scope -- an explicit gc.collect() would only
+    # add a full generation-2 scan on every one of run_hdbscan()'s many nested
+    # calls (once per seed-sweep seed, once per split-pass candidate) for no
+    # memory benefit.
+
     return best_clf, best_labels, best_score, _score_label
 
 
@@ -2035,6 +2306,11 @@ def split_impure_clusters(feats_sc: np.ndarray, embedding: np.ndarray,
         local_cfg["hdbscan_leaf_bonus"]    = 0.0
         local_cfg["hdbscan_method"]        = "eom"
         local_cfg["hdbscan_sweep_n_steps"] = _split_n_steps
+        # Force the LOCAL sweep sequential: hdbscan_split_n_jobs below already
+        # parallelizes across candidates, so letting each candidate's own
+        # run_hdbscan() also spawn a thread pool would nest parallelism and
+        # oversubscribe past the resolved budget.
+        local_cfg["hdbscan_sweep_n_jobs"] = 1
         tasks.append((cid, idx, sub_feats_T, local_cfg))
 
     if not tasks:
@@ -2042,9 +2318,10 @@ def split_impure_clusters(feats_sc: np.ndarray, embedding: np.ndarray,
 
     def _attempt_split(sub_feats_T, local_cfg, n_total):
         try:
-            _, sub_embedding = run_umap(sub_feats_T, local_cfg)
-            sub_clf, sub_labels, sub_score, _ = run_hdbscan(
-                sub_embedding, local_cfg, n_total=n_total)
+            with _numba_single_thread():
+                _, sub_embedding = run_umap(sub_feats_T, local_cfg)
+                sub_clf, sub_labels, sub_score, _ = run_hdbscan(
+                    sub_embedding, local_cfg, n_total=n_total)
         except Exception:
             return None
         n_sub_cl = len(set(sub_labels[sub_labels >= 0]))
@@ -2070,7 +2347,7 @@ def split_impure_clusters(feats_sc: np.ndarray, embedding: np.ndarray,
                 return None   # self-merge collapsed the split back to one cluster
         return sub_labels, sub_score, n_sub_cl
 
-    _n_jobs = int(cfg.get("hdbscan_split_n_jobs", -1) or -1)
+    _n_jobs = resolve_n_jobs(cfg, "hdbscan_split_n_jobs", log_fn=log_fn)
     if _n_jobs != 1 and len(tasks) > 1:
         try:
             from joblib import Parallel, delayed
@@ -2086,8 +2363,9 @@ def split_impure_clusters(feats_sc: np.ndarray, embedding: np.ndarray,
             # that every CALLER script guard its entry point with
             # `if __name__ == "__main__":` (not guaranteed for every context
             # this function is called from).
-            raw_results = Parallel(n_jobs=_n_jobs, prefer="threads")(
-                delayed(_attempt_split)(t[2], t[3], t[1].size) for t in tasks)
+            with _blas_single_thread_for_dispatch():
+                raw_results = Parallel(n_jobs=_n_jobs, prefer="threads")(
+                    delayed(_attempt_split)(t[2], t[3], t[1].size) for t in tasks)
         except Exception:
             raw_results = [_attempt_split(t[2], t[3], t[1].size) for t in tasks]
     else:
@@ -3900,7 +4178,8 @@ def plot_split_merge_refinement(embedding: np.ndarray, labels_before: np.ndarray
     _savefig(fig, out_path)
 
 
-def _seed_sweep_one_seed(s: int, feats_sc_T: np.ndarray, cfg: dict, n_total: int):
+def _seed_sweep_one_seed(s: int, feats_sc_T: np.ndarray, cfg: dict, n_total: int,
+                          progress_cb=None):
     """Single-seed UMAP+HDBSCAN(+refinement) fit for seed_sweep_stability()'s
     per-seed loop.
 
@@ -3916,19 +4195,48 @@ def _seed_sweep_one_seed(s: int, feats_sc_T: np.ndarray, cfg: dict, n_total: int
     seed values to deliberately fail on) used by the crash-isolation test --
     it is never set by production code and has zero effect unless a caller
     explicitly injects it.
+
+    progress_cb(s, result), if given, is called exactly once right before
+    returning (result is None on failure) -- lets the parallel dispatch path
+    report per-seed completion as it happens instead of going silent for the
+    whole sweep's duration (each seed's own UMAP+HDBSCAN(+refinement) fit can
+    run for minutes, and with no output in between a stalled seed and a busy
+    one look identical from the log). PipelineLogger is lock-protected, so
+    calling it from worker threads here is safe.
     """
     try:
         if s in (cfg.get("_debug_fail_seeds") or ()):
             raise RuntimeError(f"[debug] injected failure for seed {s}")
         c2 = dict(cfg); c2["umap_random_state"] = s
-        _, emb = run_umap(feats_sc_T, c2)
-        clf, lbls, _, _ = run_hdbscan(emb, c2, n_total=n_total)
-        lbls = refine_clusters_iterative(
-            feats_sc_T.T, emb, lbls, clf, c2, log_fn=None)
+        # Force per-seed HDBSCAN work sequential: seed_sweep_n_jobs already
+        # parallelizes across seeds, so letting each seed's own run_hdbscan()
+        # (below) OR refine_clusters_iterative()'s split pass (which calls
+        # split_impure_clusters(), itself parallel via hdbscan_split_n_jobs)
+        # also spawn their own thread pools would nest parallelism -- outer
+        # seeds x inner workers -- and oversubscribe well past the resolved
+        # budget.
+        c2["hdbscan_sweep_n_jobs"] = 1
+        c2["hdbscan_split_n_jobs"] = 1
+        with _numba_single_thread():
+            _, emb = run_umap(feats_sc_T, c2)
+            clf, lbls, dbcv_score, _ = run_hdbscan(emb, c2, n_total=n_total)
+            lbls = refine_clusters_iterative(
+                feats_sc_T.T, emb, lbls, clf, c2, log_fn=None)
         lbls = np.asarray(lbls)
         count = len(set(int(x) for x in lbls if x >= 0))
-        return dict(seed=s, labels=lbls, count=count)
+        result = dict(seed=s, labels=lbls, count=count, dbcv=float(dbcv_score))
+        if progress_cb is not None:
+            try:
+                progress_cb(s, result)
+            except Exception:
+                pass
+        return result
     except Exception:
+        if progress_cb is not None:
+            try:
+                progress_cb(s, None)
+            except Exception:
+                pass
         return None
 
 
@@ -3953,7 +4261,7 @@ def seed_sweep_stability(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
     logged here (log_fn=None passed through) to avoid per-seed log spam —
     only the resulting cluster count is reported, same as before.
 
-    cfg["seed_sweep_n_jobs"] (default 1 = today's exact sequential behaviour,
+    cfg["seed_sweep_n_jobs"] (default -1 = auto-managed, see System Resources;
     T1.P ARI-stability plan Aug 2026): when != 1, dispatches each seed's
     independent UMAP+HDBSCAN(+refinement) fit via joblib.Parallel with a
     thread-based pool (prefer="threads") -- same choice as
@@ -3965,8 +4273,10 @@ def seed_sweep_stability(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
     regardless of completion order, so output content is identical to the
     sequential path -- only wall-clock time changes.
 
-    Returns {seeds, counts, ari, mean_ari}.  Empty dict if n_seeds < 2 or the
-    required libraries are missing.
+    Returns {seeds, counts, ari, mean_ari, dbcv}.  `dbcv` is each seed's DBCV
+    (relative_validity_) from its own run_hdbscan() selection, aligned with
+    `counts` (successful seeds only, same order). Empty dict if n_seeds < 2
+    or the required libraries are missing.
     """
     if n_seeds is None or int(n_seeds) < 2:
         return {}
@@ -3976,8 +4286,8 @@ def seed_sweep_stability(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
         return {}
     base_seed = int(cfg.get("umap_random_state", 42))
     seeds = [base_seed + i for i in range(int(n_seeds))]
-    n_jobs = int(cfg.get("seed_sweep_n_jobs", 1) or 1)
-    all_labels, counts = [], []
+    n_jobs = resolve_n_jobs(cfg, "seed_sweep_n_jobs", log_fn=log_fn)
+    all_labels, counts, dbcv_scores = [], [], []
     if n_jobs == 1:
         results = [_seed_sweep_one_seed(s, feats_sc_T, cfg, feats_sc_T.shape[0])
                    for s in seeds]
@@ -3987,10 +4297,47 @@ def seed_sweep_stability(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
             if log_fn:
                 log_fn(f"  [seed-sweep] dispatching {len(seeds)} seeds across "
                        f"n_jobs={n_jobs} worker threads...")
-            results = Parallel(n_jobs=n_jobs, prefer="threads")(
-                delayed(_seed_sweep_one_seed)(s, feats_sc_T, cfg, feats_sc_T.shape[0])
-                for s in seeds
-            )
+            # Report as each seed's worker thread finishes -- without this the
+            # log goes silent for the sweep's entire wall-clock (each seed can
+            # take minutes), indistinguishable from a hang. PipelineLogger is
+            # lock-protected so calling log_fn from these worker threads is safe.
+            _t0 = time.time()
+            _progress_lock = _threading.Lock()
+            _progress_done = [0]
+            def _on_seed_done(s, r):
+                if not log_fn:
+                    return
+                with _progress_lock:
+                    _progress_done[0] += 1
+                    n_done = _progress_done[0]
+                status = f"{r['count']} clusters, DBCV={r['dbcv']:.3f}" if r else "failed"
+                log_fn(f"  [seed-sweep] {n_done}/{len(seeds)} done — seed {s}: "
+                       f"{status}  ({time.time() - _t0:.0f}s elapsed)")
+            # Heartbeat: all seeds are dispatched at once and do similar work,
+            # so their completions tend to arrive in a burst near the end
+            # rather than spread across the sweep -- _on_seed_done alone can
+            # still leave a long silent stretch early on. A periodic "still
+            # running" line makes that stretch distinguishable from a hang.
+            _hb_stop = _threading.Event()
+            def _heartbeat():
+                while not _hb_stop.wait(30):
+                    with _progress_lock:
+                        n_done = _progress_done[0]
+                    if log_fn:
+                        log_fn(f"  [seed-sweep] still running — "
+                               f"{n_done}/{len(seeds)} seeds done, "
+                               f"{time.time() - _t0:.0f}s elapsed...")
+            _threading.Thread(target=_heartbeat, daemon=True).start()
+            try:
+                with _blas_single_thread_for_dispatch():
+                    results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                        delayed(_seed_sweep_one_seed)(
+                            s, feats_sc_T, cfg, feats_sc_T.shape[0],
+                            progress_cb=_on_seed_done)
+                        for s in seeds
+                    )
+            finally:
+                _hb_stop.set()
         except Exception:
             results = [_seed_sweep_one_seed(s, feats_sc_T, cfg, feats_sc_T.shape[0])
                        for s in seeds]
@@ -4001,8 +4348,10 @@ def seed_sweep_stability(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
         else:
             all_labels.append(r["labels"])
             counts.append(r["count"])
+            dbcv_scores.append(r.get("dbcv", float("nan")))
             if log_fn:
-                log_fn(f"  [seed-sweep] seed {s}: {r['count']} clusters")
+                log_fn(f"  [seed-sweep] seed {s}: {r['count']} clusters, "
+                       f"DBCV={r.get('dbcv', float('nan')):.3f}")
     m = len(all_labels)
     if m < 2:
         return {}
@@ -4014,9 +4363,35 @@ def seed_sweep_stability(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
             except Exception:
                 a = np.nan
             ari[i, j] = ari[j, i] = a
-    triu = ari[np.triu_indices(m, 1)]
+    # mean_ari excludes any pair touching a degenerate seed (fewer than
+    # seed_sweep_min_valid_clusters real clusters, default 6 -- i.e. that
+    # seed's fit collapsed/under-fit rather than finding a trustworthy
+    # partition). Comparing a degenerate partition against a real one is
+    # guaranteed near-zero ARI regardless of whether the genuine structure is
+    # actually seed-stable, so leaving them in systematically drags the mean
+    # down and can spuriously trip consensus_auto_threshold. `ari` (the full
+    # matrix, degenerate seeds included) and `counts` are returned unfiltered
+    # so callers/plots can still see and label which seeds were degenerate.
+    _min_valid = int(cfg.get("seed_sweep_min_valid_clusters", 6) or 6)
+    _stable = [i for i in range(m) if counts[i] >= _min_valid]
+    if len(_stable) >= 2:
+        _pairs = [ari[i, j] for a_, i in enumerate(_stable)
+                  for j in _stable[a_ + 1:]]
+        mean_ari = float(np.nanmean(_pairs)) if _pairs else 1.0
+        stable_counts = [counts[i] for i in _stable]
+        if len(_stable) < m and log_fn:
+            _degenerate_seeds = [seeds[i] for i in range(m) if i not in _stable]
+            log_fn(f"  [seed-sweep] excluding degenerate seed(s) "
+                   f"{_degenerate_seeds} (< {_min_valid} clusters found) from "
+                   f"the mean ARI -- comparing them against real partitions "
+                   f"is guaranteed near-zero regardless of true stability.")
+    else:
+        triu = ari[np.triu_indices(m, 1)]
+        mean_ari = float(np.nanmean(triu)) if triu.size else 1.0
+        stable_counts = counts
     return dict(seeds=seeds, counts=counts, ari=ari, labels=all_labels,
-                mean_ari=float(np.nanmean(triu)) if triu.size else 1.0)
+                mean_ari=mean_ari, stable_counts=stable_counts,
+                dbcv=dbcv_scores)
 
 
 def seed_sweep_stability_bootstrap(feats_good: np.ndarray, cfg: dict, n_seeds: int,
@@ -4130,6 +4505,52 @@ def seed_sweep_stability_bootstrap(feats_good: np.ndarray, cfg: dict, n_seeds: i
                 pair_overlap_sizes=pair_overlap_sizes)
 
 
+def _consensus_one_seed(s: int, feats_sc_T: np.ndarray, cfg: dict, n_samp: int,
+                         progress_cb=None):
+    """Single-seed UMAP+HDBSCAN fit for consensus_cluster()'s per-seed loop.
+
+    Module-level (not a closure), same reasoning as _seed_sweep_one_seed:
+    dispatched via joblib's thread-based pool, so it needs to be picklable-
+    shaped even though threads share the parent process's memory. No
+    refine_clusters_iterative() here -- consensus_cluster()'s own
+    co-association/Ward-linkage step resolves fragmentation across seeds
+    instead, so per-seed refinement would be redundant cost (see the
+    docstring note above about one seed's split pass costing 25+ minutes
+    on a real dataset).
+
+    progress_cb(s, result), if given, is called exactly once right before
+    returning (result is None on failure) -- see _seed_sweep_one_seed's
+    docstring for why: without it the log goes silent for the whole
+    dispatch's wall-clock, indistinguishable from a hang.
+    """
+    try:
+        c2 = dict(cfg); c2["umap_random_state"] = s
+        # Force per-seed HDBSCAN sweep sequential: consensus_n_jobs already
+        # parallelizes across seeds, so letting each seed's own run_hdbscan()
+        # also spawn a thread pool would nest parallelism and oversubscribe
+        # past the resolved budget (same reasoning as _seed_sweep_one_seed).
+        c2["hdbscan_sweep_n_jobs"] = 1
+        with _numba_single_thread():
+            _, emb = run_umap(feats_sc_T, c2)
+            clf, lbls, _, _ = run_hdbscan(emb, c2, n_total=n_samp, log_fn=None)
+        lbls = np.asarray(lbls)
+        n_cl = len(set(int(x) for x in lbls if x >= 0))
+        result = dict(seed=s, labels=lbls, count=n_cl)
+        if progress_cb is not None:
+            try:
+                progress_cb(s, result)
+            except Exception:
+                pass
+        return result
+    except Exception:
+        if progress_cb is not None:
+            try:
+                progress_cb(s, None)
+            except Exception:
+                pass
+        return None
+
+
 def consensus_cluster(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
                        log_fn=None, embedding: "np.ndarray | None" = None):
     """
@@ -4224,32 +4645,87 @@ def consensus_cluster(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
                    f"train_frac to reduce the training-bin count.")
         return None
 
-    per_seed_labels, per_seed_counts, _ok_seeds = [], [], []
-    for s in seeds:
+    # NOT running refine_clusters_iterative() per seed here (unlike
+    # seed_sweep_stability's diagnostic loop): its split pass runs a full
+    # 40-step x 2-method HDBSCAN sweep PER impure cluster candidate, per
+    # refinement iteration. On a real 21-session dataset this compounded
+    # catastrophically for one seed (25+ min for a single seed's split pass
+    # alone, vs 1-2 min for every other seed observed) when that seed's raw
+    # partition happened to have many impure clusters. The co-association/
+    # Ward-linkage step below already resolves fragmentation via cross-seed
+    # agreement, so per-seed refinement's main benefit is largely redundant
+    # here for a large, unpredictable worst-case cost. See _consensus_one_seed.
+    #
+    # consensus_n_jobs (default -1 = auto-managed, same resolve_n_jobs /
+    # compute_adaptive_n_jobs budget as seed_sweep_n_jobs / hdbscan_split_
+    # n_jobs) dispatches each seed's independent UMAP+HDBSCAN fit via joblib
+    # thread pool. This loop used to be strictly sequential regardless of
+    # cfg -- unlike seed_sweep_stability and split_impure_clusters, which
+    # both already had a working `*_n_jobs` dispatch, this one had none,
+    # so the 8-seed (default consensus_n_seeds) co-association pass ran
+    # one full UMAP+HDBSCAN fit after another with most cores idle.
+    n_jobs = resolve_n_jobs(cfg, "consensus_n_jobs", log_fn=log_fn)
+    if n_jobs == 1:
+        results = [_consensus_one_seed(s, feats_sc_T, cfg, n_samp) for s in seeds]
+    else:
         try:
-            c2 = dict(cfg); c2["umap_random_state"] = s
-            _, emb = run_umap(feats_sc_T, c2)
-            # NOT running refine_clusters_iterative() per seed here (unlike
-            # seed_sweep_stability's diagnostic loop): its split pass runs a
-            # full 40-step x 2-method HDBSCAN sweep PER impure cluster
-            # candidate, per refinement iteration. On a real 21-session
-            # dataset this compounded catastrophically for one seed (25+ min
-            # for a single seed's split pass alone, vs 1-2 min for every
-            # other seed observed) when that seed's raw partition happened
-            # to have many impure clusters. The co-association/Ward-linkage
-            # step below already resolves fragmentation via cross-seed
-            # agreement, so per-seed refinement's main benefit is largely
-            # redundant here for a large, unpredictable worst-case cost.
-            clf, lbls, _, _ = run_hdbscan(emb, c2, n_total=n_samp, log_fn=None)
-            per_seed_labels.append(np.asarray(lbls))
-            n_cl = len(set(int(x) for x in lbls if x >= 0))
-            per_seed_counts.append(n_cl)
-            _ok_seeds.append(s)
+            from joblib import Parallel, delayed
             if log_fn:
-                log_fn(f"  [consensus] seed {s}: {n_cl} clusters")
+                log_fn(f"  [consensus] dispatching {len(seeds)} seeds across "
+                       f"n_jobs={n_jobs} worker threads...")
+            # Report as each seed's worker thread finishes -- same reasoning
+            # as seed_sweep_stability's dispatch: each seed's UMAP+HDBSCAN fit
+            # can take minutes, and with no output in between a stalled seed
+            # and a busy one look identical from the log.
+            _t0 = time.time()
+            _progress_lock = _threading.Lock()
+            _progress_done = [0]
+            def _on_seed_done(s, r):
+                if not log_fn:
+                    return
+                with _progress_lock:
+                    _progress_done[0] += 1
+                    n_done = _progress_done[0]
+                status = f"{r['count']} clusters" if r else "failed"
+                log_fn(f"  [consensus] {n_done}/{len(seeds)} done — seed {s}: "
+                       f"{status}  ({time.time() - _t0:.0f}s elapsed)")
+            # Heartbeat: all seeds are dispatched at once and do similar work,
+            # so their completions tend to arrive in a burst near the end
+            # rather than spread across the run -- see seed_sweep_stability's
+            # matching heartbeat for the same reasoning.
+            _hb_stop = _threading.Event()
+            def _heartbeat():
+                while not _hb_stop.wait(30):
+                    with _progress_lock:
+                        n_done = _progress_done[0]
+                    if log_fn:
+                        log_fn(f"  [consensus] still running — "
+                               f"{n_done}/{len(seeds)} seeds done, "
+                               f"{time.time() - _t0:.0f}s elapsed...")
+            _threading.Thread(target=_heartbeat, daemon=True).start()
+            try:
+                with _blas_single_thread_for_dispatch():
+                    results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                        delayed(_consensus_one_seed)(
+                            s, feats_sc_T, cfg, n_samp, progress_cb=_on_seed_done)
+                        for s in seeds
+                    )
+            finally:
+                _hb_stop.set()
         except Exception:
+            results = [_consensus_one_seed(s, feats_sc_T, cfg, n_samp) for s in seeds]
+
+    per_seed_labels, per_seed_counts, _ok_seeds = [], [], []
+    for s, r in zip(seeds, results):
+        if r is None:
             if log_fn:
                 log_fn(f"  [consensus] seed {s} failed; skipped")
+        else:
+            per_seed_labels.append(np.asarray(r["labels"]))
+            per_seed_counts.append(r["count"])
+            _ok_seeds.append(s)
+            if log_fn:
+                log_fn(f"  [consensus] seed {s}: {r['count']} clusters")
 
     if len(per_seed_labels) < 2:
         return None
@@ -4279,9 +4755,23 @@ def consensus_cluster(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
                 except Exception:
                     _a = np.nan
                 _ari[_i, _j] = _ari[_j, _i] = _a
-        _triu = _ari[np.triu_indices(_m, 1)]
+        # Same degenerate-seed exclusion as seed_sweep_stability() -- a seed
+        # with fewer than seed_sweep_min_valid_clusters real clusters
+        # compared against a real partition is guaranteed near-zero ARI
+        # regardless of true stability.
+        _min_valid = int(cfg.get("seed_sweep_min_valid_clusters", 6) or 6)
+        _stable = [i for i in range(_m) if per_seed_counts[i] >= _min_valid]
+        if len(_stable) >= 2:
+            _pairs = [_ari[i, j] for a_, i in enumerate(_stable)
+                      for j in _stable[a_ + 1:]]
+            _mean_ari = float(np.nanmean(_pairs)) if _pairs else 1.0
+            _stable_counts = [per_seed_counts[i] for i in _stable]
+        else:
+            _triu = _ari[np.triu_indices(_m, 1)]
+            _mean_ari = float(np.nanmean(_triu)) if _triu.size else 1.0
+            _stable_counts = per_seed_counts
         _stability = dict(seeds=_ok_seeds, counts=per_seed_counts, ari=_ari,
-                           mean_ari=float(np.nanmean(_triu)) if _triu.size else 1.0)
+                           mean_ari=_mean_ari, stable_counts=_stable_counts)
     except Exception:
         _stability = {}
 
@@ -4309,7 +4799,7 @@ def consensus_cluster(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
     # selection uses, so consensus mode doesn't need its own separate tuning.
     target_n = int(cfg.get("target_n_clusters", 0))
     pref_lo  = int(cfg.get("preferred_clusters_lo", 12))
-    pref_hi  = int(cfg.get("preferred_clusters_hi", 30))
+    pref_hi  = int(cfg.get("preferred_clusters_hi", 20))
     candidates = [target_n] if target_n > 0 else list(range(pref_lo, pref_hi + 1))
 
     rng = np.random.default_rng(base_seed)
@@ -4513,6 +5003,7 @@ def plot_cluster_stability(sweep: dict, out_path: Path):
     ari    = np.asarray(sweep["ari"], dtype=float)
     seeds  = sweep.get("seeds", list(range(len(counts))))
     mean_ari = sweep.get("mean_ari", float("nan"))
+    dbcv   = [d for d in sweep.get("dbcv", []) if d == d]  # drop NaN
 
     fig, (axc, axa) = plt.subplots(1, 2, figsize=(13, 5), facecolor=_BG)
     _dark_ax(axc); _dark_ax(axa)
@@ -4522,8 +5013,11 @@ def plot_cluster_stability(sweep: dict, out_path: Path):
         _vals, _cnts = np.unique(counts, return_counts=True)
         axc.bar([str(v) for v in _vals], _cnts, color="#4E79A7", alpha=0.85)
     axc.set_xlabel("Cluster count"); axc.set_ylabel("Seeds")
+    _dbcv_note = (f"  |  DBCV mean {np.mean(dbcv):.3f} "
+                  f"(range {min(dbcv):.3f}–{max(dbcv):.3f})" if dbcv else "")
     axc.set_title(f"Cluster-count stability across {len(seeds)} seeds\n"
-                  f"(range {min(counts) if counts else 0}–{max(counts) if counts else 0})",
+                  f"(range {min(counts) if counts else 0}–{max(counts) if counts else 0})"
+                  f"{_dbcv_note}",
                   color=_TEXT_COL, fontsize=10)
 
     # Right: pairwise ARI heatmap.
@@ -4628,6 +5122,15 @@ def plot_cluster_hierarchy(feats_sc, labels, out_path,
     interpretable as "how different is the underlying movement/pose pattern"
     -- the question the user is actually asking when manually merging
     clusters after inspection.
+
+    Branch color is deliberately a single neutral tone throughout (just
+    thicker than a default dendrogram) -- tree topology itself, not branch
+    color, is what shows which clusters are more similar to each other.
+    Each LEAF gets a colored dot + label in that cluster's permanent CUBE
+    identity color (the same _cmap() mapping every other cluster plot in
+    this module uses), so a specific cluster can be spotted here and then
+    cross-referenced against an ethogram/UMAP/etc. at a glance -- that is
+    the only thing color is meant to encode on this plot.
     """
     if feats_sc is None or labels is None:
         return
@@ -4651,15 +5154,38 @@ def plot_cluster_hierarchy(feats_sc, labels, out_path,
     centroids = np.vstack([X[labels == c].mean(axis=0) for c in uniq])
 
     Z = linkage(centroids, method=linkage_method)
-    leaf_labels = [f"{c}  (n={sizes[c]})" for c in uniq]
+    leaf_labels = [f"C{c}" for c in uniq]
 
-    fig_w = max(8.0, 0.5 * len(uniq) + 2.0)
-    fig, ax = plt.subplots(figsize=(fig_w, 6), facecolor=_BG)
+    fig_w = max(8.0, 0.55 * len(uniq) + 2.0)
+    fig, ax = plt.subplots(figsize=(fig_w, 6.5), facecolor=_BG)
     _dark_ax(ax)
-    dendrogram(Z, labels=leaf_labels, ax=ax,
-               link_color_func=lambda k: _TICK_COL)
-    ax.tick_params(axis="x", labelrotation=90, colors=_TICK_COL, labelsize=8)
+    dn = dendrogram(Z, labels=leaf_labels, ax=ax,
+                     link_color_func=lambda k: _TICK_COL)
+    for line in ax.get_lines():
+        line.set_linewidth(2.2)
+        line.set_alpha(0.95)
+    ax.tick_params(axis="x", labelbottom=False, length=0)
     ax.tick_params(axis="y", colors=_TICK_COL)
+
+    # Leaf identity: colored dot + "C{n} (n=...)" label stacked below the
+    # axis, using scipy's own fixed leaf-spacing formula (5, 15, 25, ...)
+    # directly -- NOT ax.get_xmajorticklabels(), which comes back EMPTY
+    # once labelbottom=False is set above (matplotlib drops those Text
+    # objects from that accessor entirely, not just their visibility).
+    y0, y1 = ax.get_ylim()
+    yr = y1 - y0
+    n_leaves = len(dn["leaves"])
+    leaf_x = 5.0 + 10.0 * np.arange(n_leaves)
+    for x, leaf_idx in zip(leaf_x, dn["leaves"]):
+        c = uniq[leaf_idx]
+        col = _cmap(c)
+        ax.scatter([x], [y0 - 0.045 * yr], s=100, color=col,
+                   edgecolor=_BG, linewidth=1.0, zorder=6, clip_on=False)
+        ax.text(x, y0 - 0.09 * yr, f"C{c}\n(n={sizes[c]})", color=col,
+                fontsize=8, fontweight="bold", ha="center", va="top",
+                linespacing=1.3, clip_on=False)
+    ax.set_ylim(y0 - 0.24 * yr, y1)
+
     ax.set_ylabel(f"{linkage_method.title()} linkage distance (feature space)",
                   color=_TEXT_COL)
     ax.set_title(f"Cluster hierarchy ({len(uniq)} clusters, feature-space centroids)",
@@ -7000,7 +7526,7 @@ class BSoidEngine:
                                         # compat_mode="legacy_v2" restores the old 0.0.)
         umap_random_state     = 42,     # reproducibility seed
         hdbscan_metric        = "euclidean",  # (pub. default)
-        hdbscan_method        = "eom",        # excess-of-mass (pub. default)
+        hdbscan_method        = "both",       # tries eom + leaf, DBCV picks best
         mlp_hidden            = "100,50",     # 2-layer MLP (pub. default)
         mlp_max_iter          = 1000,
         mlp_confidence_thresh = 0.0,    # 0 = always assign; >0 = low-confidence
@@ -7011,7 +7537,7 @@ class BSoidEngine:
         # ── Cluster count guidance ────────────────────────────────────────────
         target_n_clusters     = 0,    # 0 = auto; >0 = user-requested cluster count
         preferred_clusters_lo = 12,   # auto-mode: prefer cluster count ≥ this
-        preferred_clusters_hi = 30,   # auto-mode: prefer cluster count ≤ this
+        preferred_clusters_hi = 20,   # auto-mode: prefer cluster count ≤ this
         # ── Rare-cluster pruning ──────────────────────────────────────────────
         # Clusters whose share of total analysis time is below this threshold
         # are merged into noise before MLP training.  Prevents fragment clusters
@@ -7076,7 +7602,7 @@ class BSoidEngine:
         save_labeled_video    = True,
         delete_labeled_videos = True,   # delete labeled_videos/ folder after run
         # ── Plot appearance ───────────────────────────────────────────────────
-        plot_theme            = "dark",   # "dark" or "light"
+        plot_theme            = "light",  # "dark" or "light"
         # ── HMM post-hoc smoothing ────────────────────────────────────────────
         hmm_enabled           = True,    # wrap MLP output with Multinomial HMM
         hmm_n_states          = 0,       # 0/None → n_clusters (smoothing-only mode)
@@ -7130,12 +7656,35 @@ class BSoidEngine:
         #   0 = off. Default 6 -- adds runtime but stability is worth checking
         #   on every run rather than only when the user remembers to enable it.
         seed_sweep_n          = 6,
-        # seed_sweep_n_jobs: parallel dispatch of seed_sweep_stability()'s
-        #   per-seed UMAP+HDBSCAN(+refinement) fits via joblib (thread-based
-        #   pool, same choice as hdbscan_split_n_jobs).  1 = today's exact
-        #   sequential behaviour (default).  >1 or -1 = parallel across that
-        #   many worker threads.  T1.P, ARI-stability plan Aug 2026.
+        # seed_sweep_n_jobs: dispatch of seed_sweep_stability()'s per-seed
+        #   UMAP+HDBSCAN(+refinement) fits via joblib (thread-based pool,
+        #   same choice as hdbscan_split_n_jobs). Default 1 (sequential)
+        #   since Aug 2026, after a real run hit a Windows heap-corruption
+        #   fault (0xc0000374, inside ntdll.dll's allocator -- not
+        #   reproducible on demand, so a safety margin rather than a
+        #   pinned-down fix). Measured cost of going sequential: none --
+        #   the per-worker numba/BLAS single-threading already in effect
+        #   (see _numba_single_thread/_blas_single_thread_for_dispatch)
+        #   left little real parallel throughput to lose; a real 6-seed
+        #   sweep timed marginally FASTER sequential (490s) than parallel
+        #   (503s). -1 = auto-managed (System Resources block below);
+        #   >1 = pin an exact worker count.
         seed_sweep_n_jobs      = 1,
+        # seed_sweep_min_valid_clusters: a per-seed partition with fewer than
+        #   this many real clusters is treated as degenerate (a collapsed/
+        #   under-fit fit, not a meaningful partition to compare against
+        #   others) and excluded from the mean pairwise ARI in BOTH
+        #   seed_sweep_stability() and consensus_cluster()'s own per-seed
+        #   stability stats. Comparing a degenerate partition (e.g. 1
+        #   cluster) against a well-formed one is guaranteed near-zero ARI
+        #   regardless of whether the genuine structure is actually stable,
+        #   so leaving them in systematically drags the mean down and can
+        #   spuriously trip consensus_auto_threshold. Default 6 (a partition
+        #   with fewer than 6 clusters is not a trustworthy comparison point
+        #   for datasets in this pipeline's typical 8-30 preferred-cluster
+        #   range). Degenerate seeds are still logged and counted, just
+        #   excluded from the ARI mean itself.
+        seed_sweep_min_valid_clusters = 6,
         # ── Consensus/co-association clustering (opt-in, Aug 2026) ────────────
         # consensus_clustering_enabled: False (default) = current behavior,
         #   the primary run_hdbscan() fit on umap_random_state's single seed
@@ -7149,12 +7698,21 @@ class BSoidEngine:
         # consensus_n_seeds: how many seeds to build the co-association
         #   matrix from. 8 balances a sturdier consensus against runtime;
         #   the validated test used 12.
+        # consensus_n_jobs: dispatch of consensus_cluster()'s per-seed
+        #   UMAP+HDBSCAN fits via joblib (thread-based pool, same choice as
+        #   seed_sweep_n_jobs/hdbscan_split_n_jobs). Default 1 (sequential)
+        #   alongside seed_sweep_n_jobs -- same Aug 2026 safety margin
+        #   (see seed_sweep_n_jobs above for the full rationale). Also
+        #   measured at no real cost: an 8-seed consensus run timed 668s
+        #   sequential vs 692s parallel. -1 = auto-managed (System
+        #   Resources block below); >1 = pin an exact worker count.
         # consensus_linkage: "ward" (default; validated -- gave well-
         #   separated, balanced clusters). "average" and "complete" were
         #   both tested and collapsed to a single giant cluster on real data
         #   (they chain through the noisy co-association matrix) -- avoid.
         consensus_clustering_enabled = False,
         consensus_n_seeds            = 8,
+        consensus_n_jobs             = 1,
         consensus_linkage            = "ward",
         # consensus_max_memory_gb: safety guard on the O(n_training_bins^2)
         #   co-association matrix (float32) -- ~200MB at 7,000 bins, ~1.6GB at
@@ -7163,17 +7721,26 @@ class BSoidEngine:
         #   to the primary single-seed result) instead of burning that
         #   runtime and only then failing at allocation. 0 = no limit.
         consensus_max_memory_gb      = 4.0,
-        # consensus_refine_enabled: off by default (opt-in, matches this
-        #   codebase's "new algorithmic behavior ships off until validated on
-        #   real data" convention). When True, consensus_cluster()'s output
-        #   goes through refine_consensus_clusters() -- split reuses
-        #   split_impure_clusters() unchanged (hdbscan_split_silhouette_thresh/
-        #   recluster_max_iterations, same keys as the primary path); merge
-        #   uses merge_by_coassociation() (consensus_merge_coassoc_thresh)
-        #   instead of merge_similar_clusters() (needs a condensed_tree_,
-        #   which consensus partitions don't have). See consensus_cluster()'s
-        #   docstring (Aug 2026).
-        consensus_refine_enabled     = False,
+        # consensus_refine_enabled: ON by default (Aug 2026) -- when
+        #   consensus clustering runs, the PRIMARY path's split/merge
+        #   refinement pass is unconditionally skipped for its output (its
+        #   split step assumes hdb_clf/embedding come from the same fit as
+        #   the labels being refined, which isn't true for consensus; see
+        #   the _consensus_used branch in run()). Without this on, consensus
+        #   labels get NO impurity screening at all -- confirmed on a real
+        #   run to leave a large (3,142-bin), badly-separated catch-all
+        #   cluster completely unsplit. When True, consensus_cluster()'s
+        #   output instead goes through refine_consensus_clusters() -- split
+        #   reuses split_impure_clusters() unchanged
+        #   (hdbscan_split_silhouette_thresh/recluster_max_iterations, same
+        #   keys as the primary path); merge uses merge_by_coassociation()
+        #   (consensus_merge_coassoc_thresh) instead of
+        #   merge_similar_clusters() (needs a condensed_tree_, which
+        #   consensus partitions don't have). See consensus_cluster()'s
+        #   docstring (Aug 2026). Costs an extra split/merge pass on top of
+        #   consensus's own n_seeds x UMAP+HDBSCAN runtime; set False to
+        #   restore the old "consensus output taken as-is" behavior.
+        consensus_refine_enabled     = True,
         # consensus_merge_coassoc_thresh: mean cross-cluster co-association
         #   (fraction of the n_seeds that grouped two clusters' bins together)
         #   above which merge_by_coassociation() merges them. Only active
@@ -7325,6 +7892,47 @@ class BSoidEngine:
         #   single sustained turn-away.  Not GUI-exposed (validated value);
         #   editable via engine_cfg for advanced use.
         turned_away_merge_gap_s = 0.5,
+        # auto_flag_impure_clusters: OFF by default (Aug 2026) -- deliberately
+        #   opt-in, unlike most refinement passes in this file. After split/
+        #   merge refinement + rare-cluster pruning, when enabled, any real
+        #   cluster whose mean per-bin silhouette (in the primary UMAP
+        #   embedding) is STILL below auto_flag_impure_silhouette_thresh is
+        #   folded into the same reserved "Turned Away" display id as
+        #   exclude_turned_away's confidence-based detector, instead of being
+        #   presented as a real behaviour. Catches the case
+        #   split_impure_clusters can't: a heterogeneous catch-all cluster
+        #   that (a) split was never attempted on -- e.g.
+        #   consensus_clustering_enabled=True with consensus_refine_enabled=
+        #   False skips the whole split/merge pass for consensus labels (see
+        #   the _consensus_used branch above run()) -- or (b) split WAS
+        #   attempted but no stable local sub-partition was found, so the
+        #   impure cluster was left untouched by design (split never forces a
+        #   split).
+        #   Why opt-in: this is a purely GEOMETRIC check (cluster shape in
+        #   the embedding) and cannot distinguish a genuine artifact cluster
+        #   (what it's meant to catch -- e.g. animal turned away but
+        #   paws/tail stay confidently tracked, so the confidence-based
+        #   turned-away detector's Head/Mouth-region likelihood never drops
+        #   enough to trip turned_away_conf_thresh) from a real but
+        #   naturally diverse behaviour that legitimately has a mediocre
+        #   silhouette. Auto-relabeling the latter as "Turned Away" would
+        #   silently discard real data. GUI-exposed under Advanced Settings;
+        #   inspect a flagged cluster's example clips before trusting the
+        #   label. Bins are excluded from the UMAP/transition plots and
+        #   dwell-time stats the same way confidence-based turned-away bins
+        #   are, but are NOT excluded from MLP training (unlike confidence-
+        #   based turned-away bins) -- the cluster stays a real, consistently
+        #   -predicted class internally; only the DISPLAY id is remapped, per
+        #   session, at export time. No-op (and skips the whole pass, with a
+        #   log line) when exclude_turned_away=False, since there is no
+        #   reserved id to route into.
+        auto_flag_impure_clusters = False,
+        # auto_flag_impure_silhouette_thresh: mean-silhouette cutoff for the
+        #   post-hoc flagging pass above. Falls back to
+        #   hdbscan_split_silhouette_thresh (the same quality bar split
+        #   candidacy uses) when left at its default 0 -- set explicitly to
+        #   decouple the two thresholds.
+        auto_flag_impure_silhouette_thresh = 0.0,
         # ── Hierarchical/consensus refinement (issue 4 — bidirectional) ───────
         # hdbscan_merge_thresh: condensed-tree sibling-merge persistence-
         #   fraction cutoff.  0.08 (default, on) merges sibling clusters that
@@ -7404,9 +8012,11 @@ class BSoidEngine:
         #   find 2-3 sub-clusters. hdbscan_method is also forced to "eom"
         #   only for these local sweeps (skips the "leaf" pass).
         # hdbscan_split_n_jobs: parallel workers for the (independent,
-        #   disjoint-point) candidate loop. -1 = all cores; 1 = sequential
-        #   (exact pre-Aug-2026 candidate-processing order, minus the other
-        #   two bounds above).
+        #   disjoint-point) candidate loop. -1 = auto-managed (see System
+        #   Resources block below; falls back to literal "all cores" when
+        #   auto_resource_management is off); 1 = sequential (exact
+        #   pre-Aug-2026 candidate-processing order, minus the other two
+        #   bounds above).
         hdbscan_split_max_candidates    = 10,
         hdbscan_split_candidate_cutoff  = 0,
         hdbscan_split_sweep_n_steps     = 12,
@@ -7417,6 +8027,23 @@ class BSoidEngine:
         #   consolidate resulting fragmentation / pre-existing near-
         #   duplicates.
         recluster_max_iterations = 2,
+
+        # ── System Resources (Aug 2026 perf fix) ───────────────────────────────
+        # The primary HDBSCAN min_cluster_size sweep (run_hdbscan, ~40 steps x
+        # up to 2 methods) used to run as a plain sequential loop -- most cores
+        # sat idle for the majority of a run's wall-clock time. These keys make
+        # it (and hdbscan_split_n_jobs / seed_sweep_n_jobs above/below) adaptive:
+        # -1 on any of those three now means "auto-managed" rather than literal
+        # "all cores" -- resolved once per run via compute_adaptive_n_jobs(),
+        # which targets system_resource_target_pct of logical cores, hard-capped
+        # at system_resource_cap_pct, and shrinks further if RAM is already
+        # under pressure. Explicit non--1 values on those three keys (1 =
+        # sequential, or a user-pinned count) are unaffected -- this only
+        # changes the *default*/auto behaviour.
+        auto_resource_management        = True,
+        system_resource_target_pct      = 0.65,   # ideal sustained (60-70% band)
+        system_resource_cap_pct         = 0.80,   # hard ceiling, never exceeded
+        hdbscan_sweep_n_jobs            = -1,     # primary sweep parallel workers
     )
 
     # Pre-2.1 numeric defaults, restored when cfg["compat_mode"] == "legacy_v2"
@@ -7490,7 +8117,23 @@ class BSoidEngine:
                   self._out_plots, self._out_videos):
             d.mkdir(parents=True, exist_ok=True)
 
-    #   main entry point  
+    def _mem_checkpoint(self, label: str):
+        """gc.collect() + psutil RSS sample at a pipeline stage boundary.
+        Tracks a running peak in self._peak_rss_gb (psutil's RSS captures real
+        process memory including numpy/BLAS/native temporaries, unlike the
+        tracemalloc-based peak_memory_gb metric in run(), which only sees the
+        Python heap). Purely diagnostic + cleanup -- never affects results."""
+        gc.collect()
+        try:
+            import psutil
+            rss_gb = psutil.Process().memory_info().rss / 1e9
+            self._peak_rss_gb = max(getattr(self, "_peak_rss_gb", 0.0), rss_gb)
+            self._log(f"  [MEMORY] {label}: RSS={rss_gb:.2f} GB "
+                      f"(peak {self._peak_rss_gb:.2f} GB)")
+        except Exception:
+            pass
+
+    #   main entry point
 
     def run(self) -> dict:
         """Run the full V2 pipeline. Returns a results dict."""
@@ -7501,11 +8144,40 @@ class BSoidEngine:
         _run_t0 = time.perf_counter()
 
         # Apply plot theme before any figure is drawn (updates _BG/_PANEL/_TEXT_COL/_TICK_COL)
-        _apply_plot_theme(self._cfg.get("plot_theme", "dark"))
+        _apply_plot_theme(self._cfg.get("plot_theme", "light"))
 
         self._log("=" * 64)
         self._log(f"  CUBE Engine  v{VERSION}")
         self._log("=" * 64)
+
+        # ── System resources: detect once, report the resolved parallelism
+        # budget for the HDBSCAN-side stages (sweep/split/seed-sweep). Actual
+        # resolution happens per-call via resolve_n_jobs()/compute_adaptive_
+        # n_jobs() -- this is a preview so the auto-managed behaviour is
+        # visible rather than silent, and each heavy stage re-checks RAM
+        # pressure independently right before it dispatches.
+        self._peak_rss_gb = 0.0
+        try:
+            _res = detect_system_resources()
+            self._log(f"\n[SYSTEM] {_res['cpu_count']} logical cores  |  "
+                      f"RAM {_res['available_ram_gb']:.1f}/{_res['total_ram_gb']:.1f} GB "
+                      f"available ({_res['ram_used_pct']:.0f}% used)")
+            if bool(self._cfg.get("auto_resource_management", True)):
+                _budget = compute_adaptive_n_jobs(self._cfg, log_fn=self._log)
+                self._log(f"  [SYSTEM] auto-managed parallel budget: {_budget} "
+                          f"worker(s)  (target "
+                          f"{float(self._cfg.get('system_resource_target_pct', 0.65)):.0%}"
+                          f" of cores, cap "
+                          f"{float(self._cfg.get('system_resource_cap_pct', 0.80)):.0%})"
+                          f"  — applies to the HDBSCAN sweep/split/seed-sweep "
+                          f"stages; UMAP embedding stays single-threaded for "
+                          f"reproducibility.")
+            else:
+                self._log("  [SYSTEM] auto_resource_management is OFF — "
+                          "using explicit *_n_jobs cfg values as-is.")
+        except Exception:
+            self._log("  [SYSTEM] resource detection unavailable (psutil "
+                      "missing?) — falling back to explicit *_n_jobs cfg values.")
 
         # ── Faithfulness audit: VERIFY against published reference values ──────
         # Each entry: cfg_key -> (published_value, comparator).  The audit
@@ -8235,6 +8907,7 @@ class BSoidEngine:
                       f"(avg_training_bins={_avg_bins}, {_n_sessions} session(s), "
                       f"formula=clip(avg_bins/20, 30, 90); "
                       f"set umap_n_neighbors>0 to override)")
+        self._mem_checkpoint("3/7 feature extraction done")
         self._log("\n[4/7]  Running UMAP  "
                   f"(n_components={self._cfg['umap_n_components']}, "
                   f"n_neighbors={self._cfg['umap_n_neighbors']})...")
@@ -8245,6 +8918,7 @@ class BSoidEngine:
         umap_model, embedding = run_umap(feats_sc.T, self._cfg)
         self._log(f"  Embedding: {embedding.shape}")
         self._stage("4/7 — UMAP done", f"embedding shape {embedding.shape}")
+        self._mem_checkpoint("4/7 UMAP embedding done")
 
         # Build the full-size embedding (n_bins rows) for umap_embedding.npy so
         # that session_bin_ranges.json slice indices remain valid.  Bins that
@@ -8340,9 +9014,17 @@ class BSoidEngine:
                 _sweep = seed_sweep_stability(
                     feats_sc.T, self._cfg, _n_sweep, log_fn=self._log)
                 if _sweep:
+                    _sc = _sweep.get('stable_counts', _sweep['counts'])
                     self._log(f"  Mean pairwise ARI = {_sweep['mean_ari']:.3f} "
-                              f"(cluster counts {min(_sweep['counts'])}–"
-                              f"{max(_sweep['counts'])})")
+                              f"(cluster counts {min(_sc)}–{max(_sc)} across "
+                              f"seeds used in the mean; full sweep range "
+                              f"{min(_sweep['counts'])}–{max(_sweep['counts'])})")
+                    _dbcv = [d for d in _sweep.get('dbcv', []) if d == d]  # drop NaN
+                    if _dbcv:
+                        self._log(f"  Per-seed DBCV: "
+                                  f"{', '.join(f'{d:.3f}' for d in _dbcv)} "
+                                  f"(mean {np.mean(_dbcv):.3f}, "
+                                  f"range {min(_dbcv):.3f}–{max(_dbcv):.3f})")
             except Exception:
                 self._log(f"  [WARN] seed sweep: {traceback.format_exc()}")
         elif _consensus_forced:
@@ -8426,13 +9108,15 @@ class BSoidEngine:
                 # code path produced it.
                 if _consensus_forced and _sweep is None and "mean_ari" in _cons_quality:
                     _sweep = {k: _cons_quality[k] for k in
-                              ("seeds", "counts", "ari", "mean_ari")
+                              ("seeds", "counts", "ari", "mean_ari", "stable_counts")
                               if k in _cons_quality}
+                    _sc = _sweep.get('stable_counts', _sweep['counts'])
                     self._log(f"  Mean pairwise ARI = {_sweep['mean_ari']:.3f} "
-                              f"(cluster counts {min(_sweep['counts'])}–"
-                              f"{max(_sweep['counts'])}) [derived from "
-                              f"consensus clustering's own per-seed "
-                              f"partitions, unrefined -- not directly "
+                              f"(cluster counts {min(_sc)}–{max(_sc)} across "
+                              f"seeds used in the mean; full sweep range "
+                              f"{min(_sweep['counts'])}–{max(_sweep['counts'])}) "
+                              f"[derived from consensus clustering's own "
+                              f"per-seed partitions, unrefined -- not directly "
                               f"comparable to standalone seed-sweep values]")
             else:
                 self._log("  [WARN] consensus clustering produced no usable "
@@ -8542,6 +9226,76 @@ class BSoidEngine:
                     _comprehensive_remap[_oid] = int(hdb_labels[_pos[0]])
             _hdb_remap = _comprehensive_remap
 
+        # ── Auto-flag unresolved impure clusters ────────────────────────────
+        # Runs on the FINAL (post-refinement, post-pruning) hdb_labels, in the
+        # PRIMARY embedding -- the same embedding/labels split_impure_clusters
+        # itself scores candidates in, so this uses an identical yardstick.
+        # Deliberately does NOT touch hdb_labels/n_cl/_hdb_remap (the cluster
+        # stays real for MLP training) -- see auto_flag_impure_clusters'
+        # DEFAULTS docstring for why this is a display-layer remap, applied
+        # per session below, not a training-time exclusion.
+        _auto_impure_ids: set = set()
+        if bool(self._cfg.get("auto_flag_impure_clusters", True)) and n_cl >= 2:
+            if not _exclude_turned_away:
+                self._log("  [IMPURE] auto_flag_impure_clusters=True but "
+                          "exclude_turned_away=False -- no reserved display id "
+                          "to route into, skipping.")
+            else:
+                _impure_thresh = float(
+                    self._cfg.get("auto_flag_impure_silhouette_thresh", 0.0) or 0.0)
+                if _impure_thresh <= 0:
+                    _impure_thresh = float(
+                        self._cfg.get("hdbscan_split_silhouette_thresh", 0.0) or 0.0)
+                if _impure_thresh > 0:
+                    _, _impure_sil_means = _mean_silhouette_per_cluster(
+                        embedding, hdb_labels)
+                    # Worst-first: sorted by silhouette ascending, so a
+                    # forced cap below (the <2-real-clusters safety margin)
+                    # keeps the WORST offenders and spares the least-bad
+                    # ones, rather than an arbitrary id-order truncation.
+                    _candidates = sorted(
+                        (c for c, m in _impure_sil_means.items() if m < _impure_thresh),
+                        key=lambda c: _impure_sil_means[c])
+                    # Never flag away every real cluster (or down to fewer
+                    # than 2) -- leaves the MLP with < 2 classes to train on,
+                    # a hard failure elsewhere in run(). Same safety margin
+                    # as the "< 2 clusters" guards already used around
+                    # HDBSCAN/consensus. Cap to the worst offenders instead
+                    # of skipping the whole pass when ALL candidates would
+                    # breach the floor -- e.g. 3 clusters, 2 flagged as
+                    # impure: flag just the worse of the two rather than
+                    # flagging neither.
+                    _max_flaggable = max(0, n_cl - 2)
+                    if _candidates and _max_flaggable == 0:
+                        self._log(
+                            f"  [WARN] {len(_candidates)} cluster(s) below the "
+                            f"impure-cluster threshold, but this run only has "
+                            f"{n_cl} real cluster(s) total -- flagging any "
+                            f"would leave < 2 real clusters, skipping "
+                            f"auto-flag entirely for this run.")
+                    elif _candidates:
+                        _capped = len(_candidates) > _max_flaggable
+                        if _capped:
+                            self._log(
+                                f"  [WARN] {len(_candidates)} cluster(s) below "
+                                f"the impure-cluster threshold, but flagging "
+                                f"all of them would leave < 2 real clusters -- "
+                                f"flagging only the worst {_max_flaggable} "
+                                f"(by silhouette) and leaving the rest as real "
+                                f"clusters.")
+                        _flag_ids = _candidates[:_max_flaggable]
+                        _auto_impure_ids = set(_flag_ids)
+                        self._log(
+                            f"  [IMPURE] cluster(s) "
+                            f"{', '.join(f'#{c} (silhouette={_impure_sil_means[c]:.3f})' for c in _flag_ids)} "
+                            f"remain below the impure-cluster threshold "
+                            f"({_impure_thresh}) after refinement -- auto-"
+                            f"flagging as low-quality and folding into the "
+                            f"'Turned Away' display bucket "
+                            f"(auto_flag_impure_clusters=True). These stay "
+                            f"real classes in the trained MLP; only the "
+                            f"per-session CSV/plot labels are remapped.")
+
         # Feature-space DBCV/silhouette (Aug 2026): computed on the FINAL
         # (post-refinement, post-pruning) hdb_labels -- matches
         # consensus_cluster()'s own feature-space scoring, which (as of this
@@ -8609,14 +9363,27 @@ class BSoidEngine:
                           f"{traceback.format_exc()}")
 
             if self._cfg.get("cluster_hierarchy_enabled", True):
+                # Always save BOTH theme variants regardless of this run's
+                # active plot_theme -- unlike every other plot in the suite
+                # (which only ever needs to match the GUI's current theme),
+                # this one is meant to be pulled into external docs/talks in
+                # whichever theme fits the destination, so it saves both up
+                # front rather than requiring a full re-run to get the other.
+                _hierarchy_theme_before = str(self._cfg.get("plot_theme", "dark"))
                 try:
-                    plot_cluster_hierarchy(
-                        feats_sc.T, hdb_labels, self._out_plots / "cluster_hierarchy.png",
-                        linkage_method=str(self._cfg.get("cluster_hierarchy_linkage", "ward")))
-                    self._log("  [PLOT] cluster_hierarchy.png saved")
+                    for _theme_name in ("dark", "light"):
+                        _apply_plot_theme(_theme_name)
+                        plot_cluster_hierarchy(
+                            feats_sc.T, hdb_labels,
+                            self._out_plots / f"cluster_hierarchy_{_theme_name}.png",
+                            linkage_method=str(self._cfg.get("cluster_hierarchy_linkage", "ward")))
+                    self._log("  [PLOT] cluster_hierarchy_dark.png + "
+                              "cluster_hierarchy_light.png saved")
                 except Exception:
                     self._log(f"  [WARN] cluster_hierarchy plot: "
                               f"{traceback.format_exc()}")
+                finally:
+                    _apply_plot_theme(_hierarchy_theme_before)
 
             # Split/merge before/after diagnostic — only when refinement
             # actually changed something (skip a no-op plot when the pass
@@ -8646,6 +9413,8 @@ class BSoidEngine:
                         "pass" if _sweep["mean_ari"] >= 0.7 else "warn",
                     "mean_ari": round(_sweep["mean_ari"], 4),
                     "cluster_counts": _sweep["counts"],
+                    "dbcv_scores": [round(d, 4) if d == d else None
+                                    for d in _sweep.get("dbcv", [])],
                     "warnings": ([] if _sweep["mean_ari"] >= 0.7 else
                                  [f"Mean ARI {_sweep['mean_ari']:.3f} < 0.7: "
                                   "cluster partition is seed-sensitive."
@@ -8701,6 +9470,7 @@ class BSoidEngine:
         # to-median-duration (see attach_centroid_distance / create_example_clips
         # below), and reused by the merge pass above.
         _cluster_centroids = compute_cluster_centroids(embedding_save, hdb_labels_all)
+        self._mem_checkpoint("5/7 HDBSCAN clustering done")
 
         # 6. MLP
         self._log("\n[6/7]  Training MLP classifier  "
@@ -8777,6 +9547,8 @@ class BSoidEngine:
                             pca_n_components=(int(pca_model.n_components_)
                                               if pca_model is not None else None)),
                        indent=2))
+
+        self._mem_checkpoint("6/7 MLP training + model save done")
 
         # 7. Predict & export
         self._log("\n[7/7]  Predicting & exporting...")
@@ -8901,20 +9673,52 @@ class BSoidEngine:
             _ta_frame_mask = _expand_bin_mask_to_frames(
                 _ta_bin_mask, file_fps, xy.shape[0])
             _display_labels = frame_labels.copy()
+            # turned_away_reason: per-frame provenance for WHY a frame was
+            # relabeled into the reserved Turned-Away id, so it's still
+            # possible to tell "genuinely occluded/turned away" apart from
+            # "auto-flagged impure cluster" after the fact -- both currently
+            # share one reserved display id, but the underlying cause
+            # matters for anyone auditing an auto-flag decision later.
+            _reason = np.full(len(_display_labels), "", dtype=object)
             if _exclude_turned_away and _ta_frame_mask.any():
                 _display_labels[_ta_frame_mask] = _ta_id
+                _reason[_ta_frame_mask] = "confidence"
+            # Auto-flagged impure clusters (see auto_flag_impure_clusters
+            # above) fold into the same reserved id -- frame_labels (the raw
+            # MLP prediction, untouched) still carries the real cluster id,
+            # so this only ever affects the DISPLAY copy, same guarantee as
+            # the confidence-based override just above.
+            if _auto_impure_ids:
+                _impure_mask = np.isin(frame_labels, sorted(_auto_impure_ids))
+                if _impure_mask.any():
+                    _display_labels[_impure_mask] = _ta_id
+                    _reason[_impure_mask] = "auto_impure_cluster"
 
-            # Bout CSV (exact B-SOiD GUI format)
+            # Bout CSV (exact B-SOiD GUI format -- fixed 3-column schema,
+            # no raw-label/reason columns here since one bout can span
+            # frames whose ORIGINAL cluster/reason differ once merged into
+            # the same Turned-Away run; see the frame-label CSV instead for
+            # per-frame provenance).
             bout_df = labels_to_bouts(_display_labels)
             bout_p  = self._out_bouts / f"{name}_bout_lengths.csv"
             bout_df.to_csv(str(bout_p), index=False)
             bout_paths.append(bout_p)
 
-            # Frame-label CSV
+            # Frame-label CSV. raw_label preserves the real, un-relabeled
+            # predicted cluster id for EVERY frame (identical to `label`
+            # except where a Turned-Away override fired) -- so cube_analyser.py
+            # or any future stage can still recover which real cluster a
+            # given Turned-Away frame originally came from, filter it back
+            # in, or audit an auto-flag decision, without needing to rerun
+            # the pipeline. turned_away_reason is "" for frames never
+            # overridden, "confidence" for the existing likelihood-based
+            # detector, "auto_impure_cluster" for auto_flag_impure_clusters.
             frame_df = pd.DataFrame({
-                "frame":  np.arange(len(_display_labels)),
-                "time_s": np.arange(len(_display_labels)) / file_fps,
-                "label":  _display_labels,
+                "frame":               np.arange(len(_display_labels)),
+                "time_s":              np.arange(len(_display_labels)) / file_fps,
+                "label":               _display_labels,
+                "raw_label":           frame_labels,
+                "turned_away_reason":  _reason,
             })
             frame_p = self._out_bouts / f"{name}_frame_labels.csv"
             frame_df.to_csv(str(frame_p), index=False)
@@ -8941,6 +9745,34 @@ class BSoidEngine:
                 str(self._out_bouts / f"{name}_epoch_stats.csv"), index=False)
             all_epochs.append((epochs, name))
 
+            # Clip-generation epochs use a SEPARATE label array that skips
+            # the auto-impure-cluster override (confidence-based turned-away
+            # still applies) -- example clips are for VISUAL review, and
+            # folding an auto-flagged cluster's clips into the same
+            # cluster_{n_cl} "Turned Away" folder as genuine turned-away
+            # clips in the video explorer would make it impossible to
+            # eyeball whether the auto-flag call was actually correct. Real
+            # cluster ids stay real here; the bout/frame CSVs, ethogram, and
+            # all quantitative exports above/below are unaffected (still use
+            # `epochs`/`_display_labels`).
+            if _auto_impure_ids:
+                _clip_labels = frame_labels.copy()
+                if _exclude_turned_away and _ta_frame_mask.any():
+                    _clip_labels[_ta_frame_mask] = _ta_id
+                _clip_epochs = bouts_to_epochs(
+                    labels_to_bouts(_clip_labels), file_fps,
+                    min_dur=float(self._cfg["min_epoch_dur_s"]),
+                    max_dur=float(self._cfg["max_epoch_dur_s"]))
+                try:
+                    _bin_offset = int(_sbr.get(name, [0])[0])
+                    _clip_epochs = attach_centroid_distance(
+                        _clip_epochs, embedding_save, hdb_labels_all,
+                        _cluster_centroids, bin_offset=_bin_offset, win=win)
+                except Exception:
+                    pass
+            else:
+                _clip_epochs = epochs
+
             _ta_names = {_ta_id: "Turned Away"} if _exclude_turned_away else None
             if self._cfg["save_plots"] and not epochs.empty:
                 try:
@@ -8958,17 +9790,31 @@ class BSoidEngine:
                     pass
 
             if vp and self._cfg["save_videos"]:
-                if self._cfg["save_example_clips"] and not epochs.empty:
+                if self._cfg["save_example_clips"] and not _clip_epochs.empty:
                     # Defer clip writing; process all animals together after the
                     # loop so clips can be shuffled for a cross-animal mix.
+                    # Uses _clip_epochs (real cluster ids for auto-flagged
+                    # clusters), NOT `epochs` -- see its construction above.
                     _clip_tasks.append(
-                        (vp, epochs.copy(), file_fps, Path(vp).stem))
+                        (vp, _clip_epochs.copy(), file_fps, Path(vp).stem))
                 if self._cfg["save_labeled_video"]:
                     try:
+                        # Fold auto-impure frames into the same banner mask
+                        # as confidence-based turned-away, so the labeled
+                        # video's overlay stays consistent with the CSV
+                        # export: the "C{lbl}" box still shows the TRUE raw
+                        # cluster id either way (create_labeled_video always
+                        # labels off `frame_labels`, never `_display_labels`)
+                        # -- this only affects whether the amber banner also
+                        # appears.
+                        _banner_mask = _ta_frame_mask
+                        if _auto_impure_ids:
+                            _banner_mask = _banner_mask | np.isin(
+                                frame_labels, sorted(_auto_impure_ids))
                         create_labeled_video(
                             vp, frame_labels, self._out_videos, file_fps,
                             output_fps=int(self._cfg["output_fps"]),
-                            turned_away_frame_mask=_ta_frame_mask)
+                            turned_away_frame_mask=_banner_mask)
                     except Exception:
                         self._log(f"  [WARN] Labeled video: "
                                   f"{traceback.format_exc()}")
@@ -9171,16 +10017,32 @@ class BSoidEngine:
                     _hmm_ta_frame_mask = _expand_bin_mask_to_frames(
                         _hmm_ta_bin_mask, _file_fps, len(_hmm_labels))
                     _hmm_display = _hmm_labels.copy()
+                    _hmm_reason = np.full(len(_hmm_display), "", dtype=object)
                     if _exclude_turned_away and _hmm_ta_frame_mask.any():
                         _hmm_display[_hmm_ta_frame_mask] = int(n_cl)
+                        _hmm_reason[_hmm_ta_frame_mask] = "confidence"
+                    # Auto-flagged impure clusters (see auto_flag_impure_clusters
+                    # above) must be folded in here too -- cube_analyser.py's
+                    # _prefer_hmm() loads these *_hmm files over the raw ones
+                    # whenever HMM smoothing is on (the default), so without
+                    # this an auto-flagged cluster would still show up as a
+                    # real behaviour in exactly the files the analyser
+                    # actually reads, defeating the whole point of flagging it.
+                    if _auto_impure_ids:
+                        _hmm_impure_mask = np.isin(_hmm_labels, sorted(_auto_impure_ids))
+                        if _hmm_impure_mask.any():
+                            _hmm_display[_hmm_impure_mask] = int(n_cl)
+                            _hmm_reason[_hmm_impure_mask] = "auto_impure_cluster"
                     _bout_hmm = labels_to_bouts(_hmm_display)
                     _bout_hmm.to_csv(
                         str(self._out_bouts / f"{_name}_bout_lengths_hmm.csv"),
                         index=False)
                     pd.DataFrame({
-                        "frame":  np.arange(len(_hmm_display)),
-                        "time_s": np.arange(len(_hmm_display)) / _file_fps,
-                        "label":  _hmm_display,
+                        "frame":               np.arange(len(_hmm_display)),
+                        "time_s":              np.arange(len(_hmm_display)) / _file_fps,
+                        "label":               _hmm_display,
+                        "raw_label":           _hmm_labels,
+                        "turned_away_reason":  _hmm_reason,
                     }).to_csv(
                         str(self._out_bouts / f"{_name}_frame_labels_hmm.csv"),
                         index=False)
@@ -9201,6 +10063,8 @@ class BSoidEngine:
             except Exception:
                 self._log(f"  [WARN] HMM smoothing failed:\n"
                           f"{traceback.format_exc()}")
+
+        self._mem_checkpoint("7/7 per-session prediction + export done")
 
         # Example clips — written in shuffled animal order so each cluster's
         # quota is filled from a random mix of animals rather than exhausted
@@ -9310,19 +10174,28 @@ class BSoidEngine:
         # not count a transition into/out of a turned-away frame. No-op when
         # exclude_turned_away=False.
         _transition_frame_labels = all_frame_labels
-        if _exclude_turned_away and all_turned_away and all_frame_labels:
+        if _exclude_turned_away and (all_turned_away or _auto_impure_ids) and all_frame_labels:
             _seg_trans = []
             for _hi in range(len(all_frame_labels)):
                 _ta_frame_m = _ta_frame_mask_for(
                     _hi, all_fps_list[_hi], len(all_frame_labels[_hi]))
+                # Auto-flagged impure clusters (see auto_flag_impure_clusters)
+                # are just as behaviourally meaningless for transition
+                # counting as confidence-based turned-away bins -- fold their
+                # frames into the same exclusion mask so neither shows up as
+                # a phantom source/target in transition_matrix.png or the
+                # umap_3d.html transition overlay.
+                if _auto_impure_ids:
+                    _ta_frame_m = _ta_frame_m | np.isin(
+                        all_frame_labels[_hi], sorted(_auto_impure_ids))
                 _seg_trans.extend(
                     _mask_out_segments(all_frame_labels[_hi], _ta_frame_m))
             if _seg_trans:
                 _transition_frame_labels = _seg_trans
             else:
-                self._log("  [WARN] turned-away exclusion left no frames for "
-                          "transition-matrix/UMAP-transition plots (entire "
-                          "dataset flagged turned-away?) -- falling back to "
+                self._log("  [WARN] turned-away/impure-cluster exclusion left "
+                          "no frames for transition-matrix/UMAP-transition "
+                          "plots (entire dataset flagged?) -- falling back to "
                           "the unsegmented sequences.")
 
         if self._cfg["save_plots"] and all_frame_labels:
@@ -9569,12 +10442,18 @@ class BSoidEngine:
             pass
         _runtime_min = (_run_elapsed / 60.0) / max(1.0, _total_vid_min or 1.0)
 
+        self._mem_checkpoint("run complete")
         _pub_metrics = dict(
             silhouette      = _validation.get("clustering",  {}).get("silhouette_score"),
             trustworthiness = _validation.get("umap_trustworthiness", {}).get("trustworthiness"),
             mean_ari        = _validation.get("cluster_stability", {}).get("mean_ari"),
             runtime_min     = round(_runtime_min, 4),
+            # peak_memory_gb: tracemalloc-based, Python-heap allocations only.
+            # peak_rss_gb: psutil-based process RSS, also covers numpy/BLAS/
+            # native temporaries (the majority of real usage in this pipeline)
+            # -- see _mem_checkpoint(). Both reported; neither replaces the other.
             peak_memory_gb  = round(_peak_mem_gb, 3),
+            peak_rss_gb     = round(getattr(self, "_peak_rss_gb", 0.0), 3),
             total_runtime_s = round(_run_elapsed, 1),
             total_video_min = round(_total_vid_min, 2) if _total_vid_min else None,
         )
@@ -9582,7 +10461,8 @@ class BSoidEngine:
                   f"Trust={_pub_metrics['trustworthiness']}  "
                   f"ARI={_pub_metrics['mean_ari']}  "
                   f"Runtime={_pub_metrics['runtime_min']:.3f} min/min  "
-                  f"RAM={_pub_metrics['peak_memory_gb']:.2f} GB")
+                  f"RAM={_pub_metrics['peak_memory_gb']:.2f} GB "
+                  f"(peak RSS {_pub_metrics['peak_rss_gb']:.2f} GB)")
 
         (self.output_dir / "publication_metrics.json").write_text(
             json.dumps(_pub_metrics, indent=2))
@@ -9612,6 +10492,16 @@ class BSoidEngine:
             # it out of dwell-time/transition/reclustering analysis at load
             # time. None when exclude_turned_away=False (no reserved id used).
             turned_away_cluster_id = int(n_cl) if _exclude_turned_away else None,
+            # auto_flagged_impure_cluster_ids: real HDBSCAN/consensus cluster
+            # ids (in the pre-Turned-Away-remap id space) that
+            # auto_flag_impure_clusters folded into turned_away_cluster_id
+            # this run -- see the [IMPURE] log line for each one's silhouette.
+            # Empty list when the pass didn't fire (disabled, no candidates,
+            # or the "don't leave <2 real clusters" guard tripped). Recorded
+            # here (not just logged) since the decision isn't reproducible
+            # from the saved model alone -- predict_from_saved_model() does
+            # NOT re-derive or re-apply it for later inference-only runs.
+            auto_flagged_impure_cluster_ids = sorted(int(c) for c in _auto_impure_ids),
             cv_accuracy   = float(cv_scores.mean()) if mlp_clf else None,
             cfg           = self._cfg,
             output_dir    = str(self.output_dir),

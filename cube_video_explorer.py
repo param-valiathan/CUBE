@@ -7,7 +7,7 @@ Created on Fri May 15 03:18:44 2026
 
 #!/usr/bin/env python3
 """
-BSOID Behavioural Cluster Annotator  v2
+BSOID Behavioural Cluster Annotator  v5
 =========================================
 Requirements:
     pip install pillow opencv-python-headless

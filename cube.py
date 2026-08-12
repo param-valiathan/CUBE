@@ -52,6 +52,16 @@ for _k_env in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
 # code run concurrently across threads. Single-threading above does not
 # prevent this; only disabling the duplicate-runtime abort does.
 _os_env.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+# DO NOT set NUMBA_THREADING_LAYER=workqueue here (tried and reverted, Aug
+# 2026): it was meant to fix a video-export crash later traced to an
+# unrelated pynndescent bug (see _patch_pynndescent_thread_safety() in
+# cube_core.py), but workqueue itself is documented as unsafe under
+# concurrent access from multiple threads -- and this codebase's nested
+# dispatch (seed_sweep_stability/consensus_cluster/split_impure_clusters)
+# does exactly that, reproducibly crashing with "Numba workqueue threading
+# layer is terminating: Concurrent access has been detected." numba's own
+# default (TBB) is the thread-safe choice here; leave it unset.
 del _os_env, _k_env
 
 #  " "  stdlib  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
@@ -84,6 +94,63 @@ find_dlc_files = peek_dlc_bodyparts = group_bodyparts_by_region = None
 
 #  " "   optional companion scripts  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
 HERE = Path(__file__).resolve().parent
+
+#  " "   crash diagnostics  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+# Two real hard crashes in one session (Aug 2026) left no usable forensics:
+# the first was a native access-violation inside python312.dll itself (found
+# only via Windows Event Viewer, after the fact); the second left NO trace
+# anywhere -- no WER report, no System-log entry, no Reliability Monitor
+# entry -- python.exe just stopped existing. Neither is a catchable Python
+# exception, so ordinary try/except logging around the pipeline stages can
+# never see them. Two complementary safety nets, installed once, as early as
+# possible, before any heavy numeric/native code runs:
+#
+#   1. faulthandler -- a stdlib fault handler that intercepts fatal native
+#      signals (SIGSEGV/access-violation, SIGABRT, SIGFPE, SIGILL) and, unlike
+#      WER, prints exactly which Python thread and source line was executing
+#      at the moment of the fault. This is the only way to localise a crash
+#      that happens inside a compiled extension (MKL/numba/HDBSCAN/OpenCV)
+#      to an actual pipeline stage.
+#   2. sys.excepthook / threading.excepthook -- covers the other failure
+#      mode: a plain uncaught Python exception that exits the process
+#      without ever reaching a dialog (e.g. raised in a background thread,
+#      whose default behaviour is to print to stderr and vanish with no
+#      GUI trace at all).
+#
+# Both write to a single persistent, append-only log (survives across runs
+# and app restarts, unlike the per-run PipelineLogger file) so a crash that
+# kills the process mid-write is still captured on disk immediately before.
+_CRASH_LOG_DIR = HERE / "CUBE_logs"
+_CRASH_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_crash_fh = open(_CRASH_LOG_DIR / "crash_diagnostics.log", "a", buffering=1,
+                  encoding="utf-8")
+_crash_fh.write(
+    f"\n{'='*78}\n[{datetime.now():%Y-%m-%d %H:%M:%S}] CUBE session start "
+    f"(pid={os.getpid()}, python={sys.version.split()[0]})\n{'='*78}\n")
+
+import faulthandler as _faulthandler
+_faulthandler.enable(file=_crash_fh, all_threads=True)
+
+def _crash_log_exception(exc_type, exc_value, exc_tb, thread_name="MainThread"):
+    _crash_fh.write(
+        f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] UNCAUGHT EXCEPTION "
+        f"(thread: {thread_name})\n")
+    traceback.print_exception(exc_type, exc_value, exc_tb, file=_crash_fh)
+    _crash_fh.flush()
+
+def _sys_excepthook(exc_type, exc_value, exc_tb):
+    _crash_log_exception(exc_type, exc_value, exc_tb, "MainThread")
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+def _threading_excepthook(args):
+    _crash_log_exception(
+        args.exc_type, args.exc_value, args.exc_traceback,
+        args.thread.name if args.thread is not None else "unknown")
+
+sys.excepthook = _sys_excepthook
+threading.excepthook = _threading_excepthook
+sys._cube_crash_diag_installed = True
+del _CRASH_LOG_DIR
 
 # Global (cross-project) sidecar for the last-applied Body-Region Weights, so
 # a brand-new project starts from the user's last customisation instead of
@@ -599,11 +666,7 @@ class SettingsPanel(tk.Frame):
          ["median","mean"], "median",
          "median resists brief occlusion dropouts (single-view cameras)"),
         ("bsoid_min_sess_frac","BP keep if passes ≥","float",(0.1,1.0,0.1),0.85,
-         "Keep a bodypart if it passes in >= this fraction of sessions (not all). "
-         "Raised 0.6->0.85 (Aug 2026): with the pooled cross-group conservation "
-         "fix, 0.6 let in bodyparts bad enough (up to 71% bad frames in some "
-         "sessions) to measurably hurt DBCV/stability on real data -- 0.85 "
-         "excluded exactly those and recovered DBCV 0.164->0.370."),
+         "Keep a bodypart if it passes in ≥ this fraction of sessions"),
         ("bsoid_min_keep",   "Min bodyparts kept",  "int",  (2,40,1), 6,
          "Floor: fall back to top-N by confidence if fewer pass"),
         ("ntfy_topic",       "Notification Topic",  "str",  None, "",
@@ -3091,8 +3154,7 @@ class AdvancedDLCWindow(tk.Toplevel):
                  font=("Segoe UI", 12, "bold"),
                  bg=C["bg"], fg=C["green"]).pack(anchor="w", padx=10, pady=(10, 4))
         tk.Label(p,
-                 text="  Basic settings (resolution, adapt, filter) are in the\n"
-                      "  main DLC & Prep panel. These control the underlying model.",
+                 text="  Basic settings live in the main DLC & Prep panel — these control the model.",
                  font=("Segoe UI", 8), bg=C["bg"], fg=C["dim"],
                  justify="left").pack(anchor="w", padx=10, pady=(0, 4))
 
@@ -3381,7 +3443,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
         hdbscan_methods_to_try = "eom,leaf",
         target_n_clusters     = 0,
         preferred_clusters_lo = 5,
-        preferred_clusters_hi = 30,
+        preferred_clusters_hi = 20,
         hdbscan_selection_mode    = "floor_soft_cap",
         hdbscan_overshoot_penalty = 0.01,
         cluster_hierarchy_enabled = True,
@@ -3486,8 +3548,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  font=("Segoe UI", 12, "bold"),
                  bg=C["bg"], fg=C["purple"]).pack(anchor="w", padx=10, pady=(10, 2))
         tk.Label(p,
-                 text="  Publication defaults are pre-set. Only change these if\n"
-                      "  you have a specific reason (e.g. high-fps data, noisy DLC).",
+                 text="  Publication defaults are pre-set — change only for a specific reason.",
                  font=("Segoe UI", 8), bg=C["bg"], fg=C["dim"],
                  justify="left").pack(anchor="w", padx=10, pady=(0, 4))
 
@@ -3534,42 +3595,34 @@ class AdvancedCUBEWindow(tk.Toplevel):
         _adv_row(s, "Body normalisation",
                  lambda r: _check(r, "body_normalise", False))
         tk.Label(s,
-                 text="    Divide all distances by nose-to-tailbase spine length.\n"
-                      "    Requires 'nose' and 'tailbase' bodypart names in DLC output.",
+                 text="    Divide distances by nose-to-tailbase length (needs those bodyparts).",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s, "PCA pre-reduction",
                  lambda r: _combo(r, "pca_pre_reduce",
                                   ["auto", "on", "off"], "auto"))
         tk.Label(s,
-                 text="    auto = reduce when features ≥ samples/5  |  on = always  |  off = never\n"
-                      "    Reduces dimensionality before UMAP when features ≈ samples.",
+                 text="    auto = reduce when features ≥ samples/5  |  on = always  |  off = never",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s, "PCA pre-UMAP (inner)",
                  lambda r: _combo(r, "pca_n_components",
                                   ["auto", "off", "30", "50", "100"], "auto"))
         tk.Label(s,
-                 text="    Separate, inner PCA gate applied inside run_umap() itself -- also\n"
-                      "    used by the seed-stability sweep and consensus clustering, which\n"
-                      "    call run_umap() directly. auto = triggers when samples/features < 5\n"
-                      "    and features > 50; off = disabled; 30/50/100 = fixed component count.\n"
-                      "    Independent of 'PCA pre-reduction' above (that one runs once, before\n"
-                      "    any of these calls); leave at auto unless you know you need both.",
+                 text="    Separate inner PCA gate used by run_umap() itself. Independent of\n"
+                      "    'PCA pre-reduction' above — leave at auto unless you need both.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s, "Long lag drift (2-3 s)",
                  lambda r: _check(r, "long_lag_drift", False))
         tk.Label(s,
-                 text="    Adds 20- and 30-bin lag-offset features -- primary signal for\n"
-                      "    sustained states (freezing, guarding). Off by default.",
+                 text="    Lag-offset features for sustained states (freezing, guarding). Off by default.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s, "Long scale bins (500ms/1s)",
                  lambda r: _check(r, "long_scale_bins", False))
         tk.Label(s,
-                 text="    Adds 500-ms and 1000-ms coarse temporal bins for slow sustained\n"
-                      "    behaviours, alongside the standard 100/200-ms bins. Off by default.",
+                 text="    Coarse temporal bins for slow sustained behaviours. Off by default.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s, "Likelihood threshold",
@@ -3579,35 +3632,38 @@ class AdvancedCUBEWindow(tk.Toplevel):
         _adv_row(s, "Adaptive visibility features",
                  lambda r: _check(r, "visibility_features_enabled", True))
         tk.Label(s,
-                 text="    ON (default) adds per-bin occlusion/visibility columns so frames\n"
-                      "    where the animal is turned away form their own cluster instead of\n"
-                      "    polluting real behaviours.  OFF reproduces the pre-2.2 feature layout.",
+                 text="    ON: turned-away frames form their own cluster instead of polluting real behaviours.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s, "Visibility adaptive percentile",
                  lambda r: _spin_f(r, "visibility_adaptive_pct", 1.0, 50.0, 1.0, 10.0))
         tk.Label(s,
-                 text="    Per-bodypart/per-session low-confidence percentile floor, layered\n"
-                      "    on top of 'Likelihood threshold'.  Only used when the visibility\n"
-                      "    feature block above is enabled.",
+                 text="    Per-bodypart low-confidence floor, layered on 'Likelihood threshold'.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s, "Exclude turned-away frames from clustering",
                  lambda r: _check(r, "exclude_turned_away", True))
         tk.Label(s,
-                 text="    ON (default) excludes bins where the animal is judged turned away\n"
-                      "    from the camera (Head/Mouth + nose confidence, validated v3) from\n"
-                      "    UMAP/HDBSCAN training, and labels them 'Turned Away' instead of\n"
-                      "    force-classifying into a real behaviour.  OFF falls back to the\n"
-                      "    visibility-feature-only handling above (no forced exclusion/label).",
+                 text="    ON: excludes turned-away bins from training and labels them 'Turned Away'.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s, "Turned-away confidence threshold",
                  lambda r: _spin_f(r, "turned_away_conf_thresh", 0.0, 1.0, 0.05, 0.30))
         tk.Label(s,
-                 text="    Head/Mouth region low-confidence fraction above which a bin becomes\n"
-                      "    a turned-away candidate (subject to nose-corroboration + debouncing).\n"
-                      "    0.30 is the session-validated default.",
+                 text="    Low-confidence fraction that flags a bin as turned-away. 0.30 = validated default.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s, "Auto-flag impure clusters  (opt-in)",
+                 lambda r: _check(r, "auto_flag_impure_clusters", False))
+        tk.Label(s,
+                 text="    OFF by default. Folds low-silhouette clusters into 'Turned Away' — always\n"
+                      "    check example clips before trusting a flagged cluster.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s, "Impure-cluster silhouette threshold  (0 = same as split)",
+                 lambda r: _spin_f(r, "auto_flag_impure_silhouette_thresh", 0.0, 1.0, 0.05, 0.0))
+        tk.Label(s,
+                 text="    0 reuses 'Split silhouette thresh' below (0.20 default).",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         self._bpw_status = tk.Label(s, text="Body-region weighting: disabled (uniform)",
@@ -3624,8 +3680,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
         _adv_row(s2, "Full-data threshold",
                  lambda r: _spin_i(r, "umap_full_thresh", 1000, 100_000, 1000, 10_000))
         tk.Label(s2,
-                 text="    Use all bins for UMAP when total bins ≤ this value.\n"
-                      "    Subsamples at 'Train fraction' only for larger recordings.",
+                 text="    Below this bin count, use all bins; larger recordings subsample at 'Train fraction'.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s2, "Train fraction",
@@ -3633,8 +3688,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
         _adv_row(s2, "n_neighbors  (0 = auto)",
                  lambda r: _spin_i(r, "umap_n_neighbors", 0, 300, 5, 0))
         tk.Label(s2,
-                 text="    0 = auto: scales with recording length, clip(n_bins/25, 15, 60).\n"
-                      "    Set a positive value to fix it (B-SOiD reference = 60).",
+                 text="    0 = auto (scales with recording length). B-SOiD reference = 60.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s2, "n_components",
@@ -3642,9 +3696,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
         _adv_row(s2, "min_dist",
                  lambda r: _spin_f(r, "umap_min_dist", 0.0, 1.0, 0.05, 0.10))
         tk.Label(s2,
-                 text="    Recommended: 0.1.  Values < 0.05 pack UMAP points so tightly\n"
-                      "    that HDBSCAN's density graph degenerates (DBCV becomes non-finite)\n"
-                      "    and noise fraction rises sharply.  Use 0.0 only with legacy_v2.",
+                 text="    Recommended 0.1 — below 0.05 can destabilise HDBSCAN's density graph.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 4))
         _adv_row(s2, "Random seed",
@@ -3660,10 +3712,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  lambda r: _combo(r, "hdbscan_method",
                                   ["both", "eom", "leaf"], "both"))
         tk.Label(s3,
-                 text="    both = tries eom and leaf at every step; DBCV score picks best.\n"
-                      "    eom  = larger, more stable clusters (overlapping densities).\n"
-                      "    leaf = finer, denser clusters (stereotyped/brief events).\n"
-                      "    min_cluster_size is swept adaptively (anchored to clustered points).",
+                 text="    both = tries eom + leaf, DBCV picks best  |  eom = larger clusters  |  leaf = finer",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
 
@@ -3672,9 +3721,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
         _adv_row(s3b, "Target cluster count",
                  lambda r: _spin_i(r, "target_n_clusters", 0, 200, 1, 0))
         tk.Label(s3b,
-                 text="    0 = auto (prefers 8–30 clusters by default).\n"
-                      "    Set to a positive number to re-run Step 3 and steer the\n"
-                      "    analysis toward that cluster count while keeping DBCV quality.",
+                 text="    0 = auto (prefers 8–30 clusters). >0 steers Step 3 toward that count.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s3b, "Preferred range — low",
@@ -3682,30 +3729,21 @@ class AdvancedCUBEWindow(tk.Toplevel):
         _adv_row(s3b, "Preferred range — high",
                  lambda r: _spin_i(r, "preferred_clusters_hi", 2, 200, 1, 30))
         tk.Label(s3b,
-                 text="    Auto-mode selects the best DBCV solution inside this range.\n"
-                      "    Ignored when Target cluster count > 0.",
+                 text="    Auto-mode picks the best DBCV solution in this range. Ignored if target > 0.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s3b, "Selection mode",
                  lambda r: _combo(r, "hdbscan_selection_mode",
                                   ["legacy", "floor_soft_cap"], "floor_soft_cap"))
         tk.Label(s3b,
-                 text="    floor_soft_cap (default, promoted Aug 2026) = never selects below\n"
-                      "    the low bound if avoidable; counts above the high bound are only\n"
-                      "    lightly penalised, not excluded. Real 3-group seed-sweep testing\n"
-                      "    eliminated catastrophic low-cluster-count collapses (5/8 -> 0/8\n"
-                      "    seeds) vs. the old rule.\n"
-                      "    legacy = pre-Aug-2026 rule: prefers the range above, falls back to\n"
-                      "    the closest-to-boundary solution when nothing qualifies (could\n"
-                      "    discontinuously collapse to very few clusters). Ignored when\n"
-                      "    Target cluster count > 0.",
+                 text="    floor_soft_cap (default): avoids the low bound, lightly penalises overshoot.\n"
+                      "    legacy: pre-Aug-2026 rule, can collapse to very few clusters.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s3b, "Overshoot penalty",
                  lambda r: _spin_f(r, "hdbscan_overshoot_penalty", 0.0, 1.0, 0.01, 0.01))
         tk.Label(s3b,
-                 text="    Only used when Selection mode = floor_soft_cap. Score penalty\n"
-                      "    per cluster above the high bound. 0 = no ceiling at all.",
+                 text="    Score penalty per cluster above the high bound (floor_soft_cap only).",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s3b, "Cluster hierarchy plot",
@@ -3714,16 +3752,13 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  lambda r: _combo(r, "cluster_hierarchy_linkage",
                                   ["ward", "average", "complete"], "ward"))
         tk.Label(s3b,
-                 text="    Saves plots/cluster_hierarchy.png -- a dendrogram of the final\n"
-                      "    clusters' feature-space centroids, to guide manual merging.",
+                 text="    Saves a dendrogram (plots/cluster_hierarchy.png) to guide manual merging.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s3b, "Min cluster frequency (%)",
                  lambda r: _spin_f(r, "min_cluster_freq", 0.0, 10.0, 0.1, 0.5))
         tk.Label(s3b,
-                 text="    Clusters whose share of total analysis time is below this\n"
-                      "    percentage are removed before MLP training (reassigned to noise).\n"
-                      "    0.2 % = default.  Set to 0 to disable pruning.",
+                 text="    Clusters below this share of total time are pruned before MLP training.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
 
@@ -3732,53 +3767,43 @@ class AdvancedCUBEWindow(tk.Toplevel):
         _adv_row(s3c, "Merge threshold  (0 = off)",
                  lambda r: _spin_f(r, "hdbscan_merge_thresh", 0.0, 1.0, 0.01, 0.0))
         tk.Label(s3c,
-                 text="    Condensed-tree sibling-merge persistence-fraction cutoff.\n"
-                      "    0 = merge pass fully disabled. >0 merges clusters that only just\n"
-                      "    barely separated from a shared parent (classic over-split signature).",
+                 text="    0 = merge pass off. >0 merges clusters only weakly split from a shared parent.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s3c, "Leaf method bonus",
                  lambda r: _spin_f(r, "hdbscan_leaf_bonus", 0.0, 0.5, 0.01, 0.03))
         tk.Label(s3c,
-                 text="    Added to leaf-method candidate scores ONLY when merge threshold > 0\n"
-                      "    (leaf's extra fragmentation is then self-corrected by the merge pass).",
+                 text="    Boosts leaf-method scores when merge threshold > 0 (merge then cleans up).",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s3c, "Fine-partition bias",
                  lambda r: _spin_f(r, "hdbscan_fine_bias", 0.0, 0.5, 0.01, 0.05))
         tk.Label(s3c,
-                 text="    Nudges initial cluster-count selection toward the finer end of the\n"
-                      "    preferred range ONLY when merge threshold > 0 -- generates enough\n"
-                      "    clusters to separate behaviours, trusting merge to consolidate.",
+                 text="    Nudges cluster count finer when merge threshold > 0, trusting merge to consolidate.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s3c, "Split silhouette thresh  (0 = off)",
                  lambda r: _spin_f(r, "hdbscan_split_silhouette_thresh", -1.0, 1.0, 0.05, 0.0))
         tk.Label(s3c,
-                 text="    Clusters with mean silhouette below this are candidates for local\n"
-                      "    re-clustering (impurity fix).  0 = split pass fully disabled.",
+                 text="    Clusters below this mean silhouette are candidates for local re-clustering.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s3c, "Max sub-clusters per split",
                  lambda r: _spin_i(r, "hdbscan_split_max_subclusters", 2, 20, 1, 3))
         tk.Label(s3c,
-                 text="    Hard cap on how many pieces one impure cluster may split into in a\n"
-                      "    single pass -- a split should resolve a handful of genuinely distinct\n"
-                      "    sub-behaviours, not fragment extensively.",
+                 text="    Cap on pieces one impure cluster may split into per pass.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s3c, "Min points to attempt a split",
                  lambda r: _spin_i(r, "hdbscan_split_min_points", 20, 2000, 10, 250))
         tk.Label(s3c,
-                 text="    A candidate cluster smaller than this is left untouched -- too few\n"
-                      "    points relative to the feature space to trust a local re-embedding.",
+                 text="    Smaller candidate clusters are left untouched (too few points to re-embed).",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s3c, "Max refine iterations",
                  lambda r: _spin_i(r, "recluster_max_iterations", 0, 10, 1, 2))
         tk.Label(s3c,
-                 text="    Cap on the split -> merge -> repeat loop.  Ignored unless at least\n"
-                      "    one of the two thresholds above is enabled.",
+                 text="    Cap on the split → merge → repeat loop.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
 
@@ -3813,10 +3838,8 @@ class AdvancedCUBEWindow(tk.Toplevel):
         _adv_row(s_hmm, "Min edge prob (syntax graph)",
                  lambda r: _spin_f(r, "hmm_min_prob", 0.01, 0.50, 0.01, 0.05))
         tk.Label(s_hmm,
-                 text="    Wraps B-SOiD MLP output with a Multinomial HMM (Baum-Welch + Viterbi).\n"
-                      "    Eliminates single-frame state flickers due to tracking jitter.\n"
-                      "    States = 0 uses n_clusters from HDBSCAN (smoothing-only mode).\n"
-                      "    States < n_clusters groups motifs into behavioral macro-states.",
+                 text="    Smooths MLP output with an HMM, removing single-frame flicker from jitter.\n"
+                      "    States = 0 uses n_clusters (smoothing only); fewer states = macro-behaviours.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
 
@@ -3826,49 +3849,71 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  lambda r: _combo(r, "compat_mode",
                                   ["current", "legacy_v2"], "current"))
         tk.Label(s_rep,
-                 text="    current = v2.1 corrected behaviour (recommended).\n"
-                      "    legacy_v2 = reproduce pre-2.1 runs exactly (min_dist=0,\n"
-                      "    full-dataset mcs anchor, evenly-spaced angular fallback).",
+                 text="    current = v2.1 corrected behaviour (recommended)  |  legacy_v2 = reproduce pre-2.1 runs",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s_rep, "Cluster-stability seed sweep  (0 = off, default 6)",
                  lambda r: _spin_i(r, "seed_sweep_n", 0, 50, 1, 6))
         tk.Label(s_rep,
-                 text="    >0 re-runs UMAP+HDBSCAN over this many seeds to measure\n"
-                      "    cluster-count / partition stability (plots cluster_stability.png).\n"
-                      "    Adds runtime proportional to the number of seeds.",
+                 text="    >0 re-runs over this many seeds to measure partition stability. Adds runtime.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _cpu_n = os.cpu_count() or 32
         _adv_row(s_rep, "Seed sweep parallel jobs",
-                 lambda r: _spin_i(r, "seed_sweep_n_jobs", -1, _cpu_n, 1, 1))
+                 lambda r: _spin_i(r, "seed_sweep_n_jobs", -1, _cpu_n, 1, -1))
         tk.Label(s_rep,
-                 text=f"    1 = sequential (safest, default).  >1 = dispatch that many seeds'\n"
-                      f"    UMAP+HDBSCAN fits in parallel worker processes (joblib/loky).\n"
-                      f"    -1 = all {_cpu_n} logical cores. Higher values speed up the seed sweep\n"
-                      f"    but increase peak memory and make it harder to diagnose which\n"
-                      f"    seed triggered a crash, if one ever occurred (T1.P, ARI-stability plan).",
+                 text="    -1 = auto-managed (default, see System Resources below)  |  1 = sequential (safest)  |  N = pin exact count.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s_rep, "Consensus auto-trigger threshold  (0 = off, default 0.55)",
                  lambda r: _spin_f(r, "consensus_auto_threshold", 0.0, 1.0, 0.01, 0.55))
         tk.Label(s_rep,
-                 text="    If the seed sweep's mean pairwise ARI falls below this value, the\n"
-                      "    partition is judged seed-unstable and consensus clustering\n"
-                      "    (co-association across consensus_n_seeds seeds, ~Nx runtime) is\n"
-                      "    auto-enabled for this run. Set to 0 to disable auto-triggering\n"
-                      "    entirely (consensus stays available manually below). Ignored if\n"
-                      "    'Enable consensus clustering' is checked or explicitly unchecked --\n"
-                      "    a deliberate manual choice always overrides the auto-trigger.",
+                 text="    Below this seed-sweep ARI, consensus clustering auto-enables. 0 = never auto.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s_rep, "Enable consensus clustering  (force on)",
                  lambda r: _check(r, "consensus_clustering_enabled", False))
         tk.Label(s_rep,
-                 text="    Manual override: always use the consensus partition regardless of\n"
-                      "    the auto-trigger threshold above. Leave unchecked to let the\n"
-                      "    threshold decide (or to always use the primary single-seed fit\n"
-                      "    when the threshold is 0).",
+                 text="    Manual override — always use consensus, regardless of the threshold above.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+
+        # ── System resources ────────────────────────────────────────────────────
+        # The primary HDBSCAN min_cluster_size sweep used to run sequentially
+        # regardless of core count — most cores sat idle for most of a run's
+        # wall-clock time. These settings let the engine detect this machine's
+        # cores/RAM at run start and size its own parallelism within a safe
+        # band, re-checking RAM before each heavy stage so it only ever shrinks
+        # under memory pressure, never risks an OOM crash.
+        s_sys = _adv_section(p, "SYSTEM RESOURCES", C["green"])
+        _adv_row(s_sys, "Auto-manage CPU/memory usage",
+                 lambda r: _check(r, "auto_resource_management", True))
+        tk.Label(s_sys,
+                 text="    Detects cores/RAM at run start; re-checks before each heavy stage. Recommended on.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s_sys, "Target utilization  (fraction of cores, default 0.65)",
+                 lambda r: _spin_f(r, "system_resource_target_pct", 0.50, 0.70, 0.01, 0.65))
+        tk.Label(s_sys,
+                 text="    Ideal sustained load during the HDBSCAN sweep — the 60-70% band.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s_sys, "Hard cap  (fraction of cores, default 0.80)",
+                 lambda r: _spin_f(r, "system_resource_cap_pct", 0.70, 0.90, 0.01, 0.80))
+        tk.Label(s_sys,
+                 text="    Never exceeded regardless of core count, even under auto-management.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s_sys, "HDBSCAN sweep parallel jobs",
+                 lambda r: _spin_i(r, "hdbscan_sweep_n_jobs", -1, _cpu_n, 1, -1))
+        tk.Label(s_sys,
+                 text="    -1 = auto-managed (recommended)  |  1 = sequential (safest)  |  N = pin exact worker count.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _adv_row(s_sys, "Recluster split parallel jobs",
+                 lambda r: _spin_i(r, "hdbscan_split_n_jobs", -1, _cpu_n, 1, -1))
+        tk.Label(s_sys,
+                 text="    Same -1/1/N semantics, for the impure-cluster re-split pass.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
 
@@ -3885,14 +3930,13 @@ class AdvancedCUBEWindow(tk.Toplevel):
         _adv_row(s5, "UMAP evolution videos  (0 = off)",
                  lambda r: _spin_i(r, "umap_evolution_n", 0, 50, 1, 1))
         tk.Label(s5,
-                 text="    Auto-export this many side-by-side evolution videos\n"
-                      "    at the end of Step 3.  Sessions are chosen randomly.",
+                 text="    Auto-exports this many random evolution videos at the end of Step 3.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s5, "Plot theme",
-                 lambda r: _combo(r, "plot_theme", ["dark", "light"], "dark"))
+                 lambda r: _combo(r, "plot_theme", ["dark", "light"], "light"))
         tk.Label(s5,
-                 text="    dark = white-on-black figures  |  light = publication-ready white background",
+                 text="    dark = white-on-black figures  |  light = publication-ready background",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
 
@@ -3955,12 +3999,27 @@ class AdvancedCUBEWindow(tk.Toplevel):
                     pass
 
     def _apply(self):
+        # Only persist keys whose value differs from the effective default
+        # (same {baseline, then BSoidEngine.DEFAULTS} merge _load() seeds the
+        # widgets from). Previously every widget was written unconditionally,
+        # so engine_cfg always contained all ~80 keys -- including untouched
+        # ones like consensus_clustering_enabled=False -- which made
+        # BSoidEngine's self._explicit_cfg_keys (used by the consensus
+        # auto-trigger's opt-out check) treat every default as "the user
+        # deliberately set this," permanently defeating that auto-trigger.
+        try:
+            effective = {**self._BASELINE, **dict(BSoidEngine.DEFAULTS)}
+        except Exception:
+            effective = dict(self._BASELINE)
         cfg = {}
         for k, var in self._vars.items():
             try:
-                cfg[k] = var.get()
+                val = var.get()
             except Exception:
-                pass
+                continue
+            default = effective.get(k, val)
+            if default is None or val != default:
+                cfg[k] = val
         cfg["bodypart_weights"] = getattr(self, "_bodypart_weights", {}) or {}
         self._session["engine_cfg"] = cfg
         self.destroy()
@@ -4020,9 +4079,8 @@ class BodyPartWeightWindow(tk.Toplevel):
                  font=("Segoe UI", 12, "bold"),
                  bg=C["bg"], fg=C["cyan"]).pack(anchor="w", padx=10, pady=(10, 2))
         tk.Label(self,
-                 text="  Up-weight or down-weight anatomical regions in the pairwise-distance /\n"
-                      "  velocity / acceleration features before UMAP.  Move a slider off 1.0 to\n"
-                      "  customise that region; leave it at 1.0 for uniform (default) weighting.",
+                 text="  Weight anatomical regions in the feature set before UMAP.\n"
+                      "  Move a slider off 1.0 to customise; 1.0 = uniform (default).",
                  font=("Segoe UI", 8), bg=C["bg"], fg=C["subtext"],
                  justify="left").pack(anchor="w", padx=10, pady=(0, 8))
 
@@ -5914,7 +5972,7 @@ class PipelineApp(tk.Tk):
                         pass
                     break
 
-        _plot_theme = self._session.get("engine_cfg", {}).get("plot_theme", "dark")
+        _plot_theme = self._session.get("engine_cfg", {}).get("plot_theme", "light")
 
         def _run():
             try:

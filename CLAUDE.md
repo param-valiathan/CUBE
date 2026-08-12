@@ -70,7 +70,7 @@ The entire analysis is one class, `BSoidEngine` (line ~3955). Its `run()` method
 
 1. **DLC file discovery** — `find_dlc_files` / `pair_files` match H5/CSV files to videos by stem, prefix, or `YYYYMMDD_HHMMSS` timestamp.
 2. **Load & smooth** — `load_dlc_file` normalises any DLC MultiIndex to 3-level `(scorer, bodyparts, coords)`, interpolates low-likelihood frames, then `smooth_boxcar` applies a centred moving average.
-3. **Feature extraction** — `extract_features_v2` produces multi-scale (100/200 ms windows) pairwise distances + velocities + optional body-normalised angular features. Output shape: `(n_features, n_bins)` where one bin = 100 ms.
+3. **Feature extraction** — `extract_features_v2` produces fps-adaptive multi-scale features: 100 ms + 200 ms bins always present; 50 ms fine-scale bin added at ≥ 60 fps (at 30 fps 50 ms = 1.5 frames — DLC jitter, not real movement). Within-bin positional variance is always computed and captures sub-100 ms tremor, flinching, and oscillatory motion. Features: pairwise distances + velocity + smoothed acceleration + optional body-normalised angular features. Output shape: `(n_features, n_bins)` where one bin = 100 ms. For 3D pose data, `extract_features_3d` is used instead (100 ms + 200 ms bins, temporal lag drift at 5- and 10-bin offsets, no within-bin variance).
 4. **UMAP** — `run_umap` with adaptive `n_neighbors`. Auto-triggers PCA pre-reduction when `n_features >= n_samples / 5`.
 5. **HDBSCAN sweep** — `run_hdbscan` sweeps `min_cluster_size` across 40 steps, tries both `eom` and `leaf` methods, and selects by DBCV (`relative_validity_`). Rare clusters (<0.2% of bins) are pruned before MLP training.
 6. **MLP classifier** — `train_mlp` trains a scikit-learn `MLPClassifier` on HDBSCAN-labelled bins. Cross-validated accuracy is recorded.
@@ -199,7 +199,7 @@ CUBE's documentation lives in three markdown files that must stay current. After
 
 | File | What it covers | Update when... |
 |---|---|---|
-| `README.md` | v4 feature summary, architecture, quick start, output layout | New feature, changed behaviour, new output file, new Advanced Setting, bug fix that changes user-visible output |
+| `README.md` | v5 feature summary, architecture, quick start, output layout | New feature, changed behaviour, new output file, new Advanced Setting, bug fix that changes user-visible output |
 | `CUBE_GUIDE.md` | Full user guide — all steps, all settings, troubleshooting | Any step workflow changes, new/removed settings, new error scenarios |
 | `GROUP_PREDICTOR_REFERENCE.md` | Complete Group Predictor reference | Any change to `cube_analyser.py` Group Predictor tab logic, new controls, new figures, changed algorithm |
 

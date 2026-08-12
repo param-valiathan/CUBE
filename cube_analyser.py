@@ -59,6 +59,15 @@ for _k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
 # the duplicate-runtime abort does.
 _os_early.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+# NOTE (reverted, Aug 2026): this block previously also forced
+# NUMBA_THREADING_LAYER=workqueue here -- see the matching comment in
+# cube.py for why that theory was wrong and the override actively harmful
+# (numba's workqueue layer is not thread-safe under concurrent access,
+# which this codebase's nested parallel dispatch does routinely). Reverted
+# to numba's own default (TBB on this machine), which IS thread-safe under
+# concurrent access. The real fix for that crash class lives in
+# cube_core.py's _patch_pynndescent_thread_safety().
+
 # When run from a desktop shortcut without `conda activate`, the conda env's
 # DLL directory is absent from PATH.  Loky workers are spawned fresh on Windows
 # (spawn, not fork) and inherit this truncated PATH, so `import numpy` inside
@@ -124,9 +133,50 @@ try:
 except ImportError:
     SK_OK = False
 
-#  
+#  " "   crash diagnostics  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
+# Same safety net as cube.py (see its module-level comment for the full
+# rationale: two real crashes left no Python traceback, and one left no OS
+# crash record at all). Guarded on a sys-module flag so loading this file as
+# a submodule of cube.py (via importlib, same process) never double-installs
+# faulthandler or clobbers cube.py's already-open crash log handle.
+if not getattr(sys, "_cube_crash_diag_installed", False):
+    import os as _os_crash
+    import threading as _threading_crash
+    import faulthandler as _faulthandler
+
+    _crash_log_dir = pathlib.Path(__file__).resolve().parent / "CUBE_logs"
+    _crash_log_dir.mkdir(parents=True, exist_ok=True)
+    _crash_fh = open(_crash_log_dir / "crash_diagnostics.log", "a",
+                      buffering=1, encoding="utf-8")
+    _crash_fh.write(
+        f"\n{'='*78}\n[{datetime.now():%Y-%m-%d %H:%M:%S}] CUBE Analyser "
+        f"standalone session start (pid={_os_crash.getpid()})\n{'='*78}\n")
+
+    _faulthandler.enable(file=_crash_fh, all_threads=True)
+
+    def _crash_log_exception(exc_type, exc_value, exc_tb, thread_name="MainThread"):
+        _crash_fh.write(
+            f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] UNCAUGHT EXCEPTION "
+            f"(thread: {thread_name})\n")
+        traceback.print_exception(exc_type, exc_value, exc_tb, file=_crash_fh)
+        _crash_fh.flush()
+
+    def _sys_excepthook(exc_type, exc_value, exc_tb):
+        _crash_log_exception(exc_type, exc_value, exc_tb, "MainThread")
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    def _threading_excepthook(args):
+        _crash_log_exception(
+            args.exc_type, args.exc_value, args.exc_traceback,
+            args.thread.name if args.thread is not None else "unknown")
+
+    sys.excepthook = _sys_excepthook
+    _threading_crash.excepthook = _threading_excepthook
+    sys._cube_crash_diag_installed = True
+
+#
 # CONSTANTS
-#  
+#
 DEFAULT_FPS    = 30
 APP_TITLE      = "CUBE Behavioral Analysis Suite"
 BSOID_SUBDIR   = "BSOID"
