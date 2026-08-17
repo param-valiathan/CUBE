@@ -18424,8 +18424,15 @@ class ParadigmResultsPanel(ctk.CTkFrame):
     # ── Shared helpers used by every sub-view ───────────────────────────
 
     def _eg_color_map(self, sessions: list) -> dict:
+        # Alphabetical fallback order, matching build_heatmap_figure's
+        # animals_sorted-by-exp_group convention -- eg_colors only carries
+        # explicit entries once a user opens "Experimental Group Colors" in
+        # the Group Editor (AnimalListPanel._eg_colors), so until then every
+        # panel's PALETTE[i % len(PALETTE)] fallback must iterate groups in
+        # the SAME order everywhere, or the same group gets a different
+        # fallback color in this panel than in Unbiased Analytics.
         override = self._get_eg_colors() or {}
-        egs = list(dict.fromkeys(s["exp_group"] for s in sessions))
+        egs = sorted(dict.fromkeys(s["exp_group"] for s in sessions))
         return {eg: override.get(eg, PALETTE[i % len(PALETTE)])
                 for i, eg in enumerate(egs)}
 
@@ -18510,8 +18517,15 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         cl_rows = self._crosstab_rows_by_cluster(sessions)
         cl_agg = aggregate_region_time_by_label(cl_rows, region_names)
         if cl_agg:
+            # _cluster_identity_color: the same deterministic cid -> color
+            # mapping used app-wide (cube_analyser.py ~L3623, mirrors
+            # cube_core.py's _cmap) -- NOT an order-dependent PALETTE index,
+            # so a cluster's color here matches Unbiased Analytics/Cluster
+            # Hierarchy for the same loaded session.
+            cl_color_map = {cid: _cluster_identity_color(cid) for cid in cl_agg}
             figs.append(build_region_crosstab_figure(
-                cl_agg, region_names, t=t, legend_title="Cluster",
+                cl_agg, region_names, color_map=cl_color_map, t=t,
+                legend_title="Cluster",
                 title="Cluster-by-region occupancy (% time)"))
         grp_rows = self._crosstab_rows_by_group(sessions)
         grp_agg = aggregate_region_time_by_label(grp_rows, region_names)
