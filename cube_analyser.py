@@ -17979,6 +17979,79 @@ def build_occupancy_heatmap_figure(xy_list: list, outlines: "list | None" = None
     return fig
 
 
+def build_approach_avoid_trajectory_figure(events_with_xy: list, outlines: "list | None" = None,
+                                            t: "dict | None" = None,
+                                            title: str = "") -> "plt.Figure":
+    """Trajectory plot with flagged approach/avoid sequences overlaid as
+    start->end arrows, color-coded by classification (approach=green,
+    avoid=red) and annotated by target -- the plan's specified spatial plot
+    for the Approach/Avoid Events sub-view (distinct from the generic
+    occupancy density heatmap every other sub-view uses).
+
+    events_with_xy : list of (x0, y0, x1, y1, classification, target) tuples,
+      one per detected event, already resolved to pixel positions by the
+      caller (frame/bin -> centroid_x/centroid_y lookup).
+    """
+    if t is None:
+        t = T()
+    edge_color = "white" if t.get("mpl_style") == "dark_background" else "black"
+    _STYLE_BY_KIND = {"boundary": ("-", 2.0), "region": ("--", 1.4), "object": (":", 1.8)}
+    class_colors = {"approach": "#59A14F", "avoid": "#E15759"}
+
+    with plt.style.context(t["mpl_style"]):
+        fig, ax = plt.subplots(figsize=(7.2, 6.2), facecolor=t["fig_bg"])
+        ax.set_facecolor(t["ax_bg"])
+        for name, kind, verts in (outlines or []):
+            if len(verts) < 3:
+                continue
+            ls, lw = _STYLE_BY_KIND.get(kind, ("-", 1.0))
+            poly = mpatches.Polygon(verts, closed=True, fill=False,
+                                     edgecolor=edge_color, linestyle=ls, linewidth=lw)
+            ax.add_patch(poly)
+            vxs = [v[0] for v in verts]; vys = [v[1] for v in verts]
+            ax.annotate(name, (float(np.mean(vxs)), float(np.mean(vys))),
+                        color=t["tick"], fontsize=8, ha="center", va="center",
+                        path_effects=[_pe.withStroke(linewidth=2, foreground=t["ax_bg"])])
+        if events_with_xy:
+            for x0, y0, x1, y1, cls, _tgt in events_with_xy:
+                ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                            arrowprops=dict(arrowstyle="->", color=class_colors.get(cls, t["tick"]),
+                                            lw=1.6, alpha=0.85, shrinkA=0, shrinkB=0))
+            # ax.annotate's arrows don't participate in matplotlib's
+            # autoscale_view() the way ax.plot/scatter artists do -- without
+            # this, the axes stay at the default [0,1]x[0,1] and every
+            # arrow renders off-screen (found via direct PNG inspection).
+            all_xs = [v for x0, y0, x1, y1, _c, _t in events_with_xy for v in (x0, x1)]
+            all_ys = [v for x0, y0, x1, y1, _c, _t in events_with_xy for v in (y0, y1)]
+            for _n, _k, verts in (outlines or []):
+                all_xs.extend(v[0] for v in verts)
+                all_ys.extend(v[1] for v in verts)
+            if all_xs and all_ys:
+                pad_x = max((max(all_xs) - min(all_xs)) * 0.1, 1.0)
+                pad_y = max((max(all_ys) - min(all_ys)) * 0.1, 1.0)
+                ax.set_xlim(min(all_xs) - pad_x, max(all_xs) + pad_x)
+                ax.set_ylim(min(all_ys) - pad_y, max(all_ys) + pad_y)
+            handles = [mpatches.Patch(color=c, label=lbl)
+                       for lbl, c in (("approach", class_colors["approach"]),
+                                      ("avoid", class_colors["avoid"]))]
+            leg = ax.legend(handles=handles, fontsize=9, facecolor=t["card"], edgecolor=t["border"])
+            for txt_ in leg.get_texts():
+                txt_.set_color(t["tick"])
+        else:
+            ax.text(0.5, 0.5, "No event positions resolved", ha="center", va="center",
+                    color=t["muted"], transform=ax.transAxes)
+        ax.set_title(title, color=t["tick"], fontsize=12)
+        ax.tick_params(colors=t["tick"])
+        for spine in ax.spines.values():
+            spine.set_color(t["spine"])
+        try:
+            ax.set_aspect("equal", adjustable="box")
+        except Exception:
+            pass
+        fig.tight_layout()
+    return fig
+
+
 # ── Shared arena/region cluster-and-group cross-tab ─────────────────────────
 
 def aggregate_region_time_by_label(rows: list, region_names: list) -> dict:
@@ -18599,6 +18672,37 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                 sessions, _time_in_region_total, "Total time in traced regions (s)",
                 "Region time (activity control)", t)
             figs.append(fig)
+        # open_field-specific mandatory controls (plan's literature-check
+        # table): total distance traveled (from the kinematics enriched
+        # sidecar's path_length_px, summed across bouts) and center-zone
+        # entry frequency -- separate from center-time %, as an
+        # activity/thigmotaxis control. "Center" has no formal role tag
+        # under open_field's ENV_PARADIGM_ROLE_VOCAB (roles are None for
+        # both regions/objects there), so this looks for a traced region
+        # literally named containing "center" (case-insensitive) as a
+        # naming-convention heuristic -- skipped gracefully, not faked, if
+        # no such region was traced.
+        if any((s["env_ctx"].get("paradigm") == "open_field") for s in sessions):
+            def _total_distance(s):
+                df = s["enriched"]
+                if df is None or df.empty or "path_length_px" not in df.columns:
+                    return None
+                return float(df["path_length_px"].sum())
+            if any(_total_distance(s) is not None for s in sessions):
+                fig, _ = self._index_bar_fig(
+                    sessions, _total_distance, "Total distance traveled (px)",
+                    "Open Field: total distance (activity control)", t)
+                figs.append(fig)
+            center_names = [rn for rn in region_names if "center" in rn.lower()]
+            if center_names:
+                def _center_entries(s):
+                    counts = (s["env_ctx"].get("summary", {})
+                              .get("region_entries_count", {}) or {})
+                    return sum(counts.get(rn, 0) for rn in center_names)
+                fig, _ = self._index_bar_fig(
+                    sessions, _center_entries, "Center-zone entries",
+                    "Open Field: center-zone entry frequency (thigmotaxis control)", t)
+                figs.append(fig)
         figs.extend(self._region_crosstab_figs(sessions, t))
         self._show_figures(figs)
 
@@ -18709,7 +18813,13 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                     _compute_fn=_scalar_metric_compute_fn("preference_index"))
                 if not paired_df.empty:
                     r = paired_df.iloc[0]
-                    txt = (f"Paired pre/post test (n={r.get('n_present_total', '?')} matched "
+                    # run_cluster_statistics's repeated-design "n_present_total"
+                    # is n_subjects * n_levels (data points), not subject count
+                    # -- divide back out so the note reports the actual number
+                    # of matched animals, not an inflated total.
+                    n_levels = len({a["exp_group"] for a in paired_animals}) or 1
+                    n_subj = int(r.get("n_present_total", 0)) // n_levels
+                    txt = (f"Paired pre/post test (n={n_subj} matched "
                           f"subjects): stat={r['stat_kw']:.3g}, p={r['pval_kw']:.3g}")
                 else:
                     txt = ("Not enough matched pre/post subjects (need Label 3 / "
@@ -18744,16 +18854,38 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                 "env_features_enabled, and at least one detected event).\n\n"
                 + PARADIGM_METRIC_DOC["Approach/Avoid Events"])
             return
-        figs = [build_occupancy_heatmap_figure(
-            self._pooled_xy(sessions), outlines=self._region_outlines(sessions),
-            t=t, title="Approach/avoid trajectory context")]
+        events_xy = []
+        for s in with_events:
+            pb = (s["env_ctx"] or {}).get("per_bin", {})
+            cx, cy = pb.get("centroid_x"), pb.get("centroid_y")
+            if not (cx and cy):
+                continue
+            bin_ms = (s["env_ctx"] or {}).get("bin_ms", 100.0)
+            fps = s["fps"] or 30
+            frames_per_bin = max(1, int(round(float(fps) * (bin_ms / 1000.0))))
+            n_bins = len(cx)
+            for _, r in s["approach"].iterrows():
+                b0 = min(max(int(r["start_frame"]) // frames_per_bin, 0), n_bins - 1)
+                b1 = min(max(int(r["end_frame"]) // frames_per_bin, 0), n_bins - 1)
+                tgt = r.get("target_object") if pd.notna(r.get("target_object")) and r.get("target_object") \
+                    else (r.get("target_region") if pd.notna(r.get("target_region")) else None)
+                events_xy.append((cx[b0], cy[b0], cx[b1], cy[b1],
+                                  r.get("classification", "approach"), tgt))
+        figs = [build_approach_avoid_trajectory_figure(
+            events_xy, outlines=self._region_outlines(sessions),
+            t=t, title="Approach/avoid trajectories (start→end per event)")]
 
         def _event_rate(s):
             df = s["approach"]
             if df is None or df.empty or not s["fps"]:
                 return None
-            n_frames = (s["df"]["Run lengths"].sum() if s["df"] is not None
-                       and "Run lengths" in getattr(s["df"], "columns", []) else None)
+            # s["df"] comes from AnimalListPanel.get_animals(), which always
+            # returns load_csv()'s RENAMED schema (run_len, not the raw
+            # "Run lengths" bout-CSV column name) -- checking for "Run
+            # lengths" here always failed silently, permanently falling back
+            # to a raw event count instead of an actual rate.
+            n_frames = (s["df"]["run_len"].sum() if s["df"] is not None
+                       and "run_len" in getattr(s["df"], "columns", []) else None)
             if not n_frames:
                 return float(len(df))
             duration_min = float(n_frames) / float(s["fps"]) / 60.0
@@ -18765,8 +18897,21 @@ class ParadigmResultsPanel(ctk.CTkFrame):
 
         with plt.style.context(t["mpl_style"]):
             all_events = pd.concat([s["approach"] for s in with_events], ignore_index=True)
-            targets = all_events.apply(
-                lambda r: r.get("target_object") or r.get("target_region") or "(none)", axis=1)
+
+            def _pick_target(r):
+                # NaN (a real, documented case -- "target_region and/or
+                # target_object may be None when only one resolved",
+                # loaded back from CSV as float NaN, not None) is truthy in
+                # Python, so a plain `or` chain here would return the
+                # literal string "nan" instead of falling through.
+                to = r.get("target_object")
+                if pd.notna(to) and to:
+                    return to
+                tr = r.get("target_region")
+                if pd.notna(tr) and tr:
+                    return tr
+                return "(none)"
+            targets = all_events.apply(_pick_target, axis=1)
             counts = (pd.DataFrame({"target": targets,
                                     "classification": all_events.get("classification", "approach")})
                      .value_counts().reset_index(name="count"))
