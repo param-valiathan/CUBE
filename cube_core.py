@@ -9534,9 +9534,14 @@ class BSoidEngine:
         # traced shapes (env_arena_cfg unset or no reference_shapes) -- the
         # flag-on-but-empty no-op case produces an (almost) empty JSON file,
         # not a crash and not a skipped write.
+        # _env_ctx is defined unconditionally (empty dict) so Step 6's bout-
+        # enrichment loop further below can safely look it up per session
+        # regardless of env_features_enabled -- when the flag is False this
+        # stays {} and compute_session_env_context() is never called, per
+        # the opt-in guarantee.
+        _env_ctx: dict = {}
         if bool(self._cfg.get("env_features_enabled", False)):
             try:
-                _env_ctx: dict = {}
                 for _nm, _xy_k, _fps_k, _envcfg in zip(
                         all_names, all_xy, all_fps_list, all_env_cfg):
                     _env_ctx[_nm] = compute_session_env_context(
@@ -10782,6 +10787,7 @@ class BSoidEngine:
                     # kinematic directedness metrics, written as a SEPARATE
                     # file so the canonical 3-column bout CSV above is never
                     # touched. See kinematic_directedness_enabled in DEFAULTS.
+                    _bout_hmm_enriched = None
                     if bool(self._cfg.get("kinematic_directedness_enabled", False)):
                         try:
                             _xy_k = all_xy[_hi]
@@ -10790,14 +10796,78 @@ class BSoidEngine:
                                 _xy_k[:, 1::2].mean(axis=1)])
                             _bout_hmm_enriched = compute_bout_directedness(
                                 _bout_hmm, _centroid_xy, _file_fps)
-                            _bout_hmm_enriched.to_csv(
-                                str(self._out_bouts /
-                                    f"{_name}_bout_lengths_hmm_enriched.csv"),
-                                index=False)
                         except Exception:
                             self._log(
                                 f"  [WARN] kinematic directedness sidecar "
                                 f"({_name}): {traceback.format_exc()}")
+                            _bout_hmm_enriched = None
+                    # v6 part 2 (Environmental_Context_v6_Implementation_Plan.md
+                    # Step 6): bout-CSV enrichment, pure reuse of
+                    # enrich_bouts_from_bin_source() -- no new join logic here,
+                    # just a different source/aggregator set. Shares the same
+                    # *_bout_lengths_hmm_enriched.csv sidecar as the kinematics
+                    # plan's Step 4 (append if that block already created it
+                    # this iteration, else create fresh with just these
+                    # columns). Skipped entirely (no file, no crash) whenever
+                    # env_features_enabled is False or this session has no
+                    # per-bin env-context data (empty/None env_arena_cfg).
+                    _env_sec = _env_ctx.get(_name) or {}
+                    _env_pb  = _env_sec.get("per_bin") or {}
+                    if bool(self._cfg.get("env_features_enabled", False)) and _env_pb:
+                        try:
+                            _thresh = float(
+                                (_env_sec.get("summary") or {}).get(
+                                    "interaction_threshold_px", 0.0))
+                            _win_bin = max(1, int(round(
+                                _file_fps * (_env_sec.get("bin_ms", 100.0) / 1000.0))))
+                            _src: dict = {}
+                            _agg: dict = {}
+                            _names_out: dict = {}
+
+                            _cur_region = np.array(
+                                _env_pb.get("current_region") or [], dtype=object)
+                            for _rn in sorted(
+                                    ((_env_sec.get("summary") or {})
+                                     .get("time_in_region_sec") or {}).keys()):
+                                _k = f"region__{_rn}"
+                                _src[_k] = (_cur_region == _rn).astype(float)
+                                _agg[_k] = np.nanmean
+                                _names_out[_k] = f"pct_time_in_region_{_rn}"
+
+                            _nose_d = _env_pb.get("dist_to_nearest_object_nose") or {}
+                            _paw_d  = _env_pb.get("dist_to_nearest_object_paw") or {}
+                            for _on in _nose_d.keys():
+                                _nd = np.array(_nose_d.get(_on, []), dtype=float)
+                                _pd_ = np.array(_paw_d.get(_on, []), dtype=float)
+                                if _nd.size and _pd_.size:
+                                    _k = f"objcontact__{_on}"
+                                    _src[_k] = ((_nd <= _thresh) | (_pd_ <= _thresh)).astype(float)
+                                    _agg[_k] = np.nanmean
+                                    _names_out[_k] = f"pct_time_near_object_{_on}"
+
+                            for _on, _hseries in (_env_pb.get(
+                                    "heading_angle_to_nearest_object") or {}).items():
+                                _k = f"heading__{_on}"
+                                _src[_k] = np.array(_hseries, dtype=float)
+                                _agg[_k] = np.nanmean
+                                _names_out[_k] = f"mean_heading_angle_to_object_{_on}"
+
+                            if _src:
+                                _base_df = (_bout_hmm_enriched
+                                            if _bout_hmm_enriched is not None
+                                            else _bout_hmm)
+                                _bout_hmm_enriched = enrich_bouts_from_bin_source(
+                                    _base_df, _src, bin_offset=0, win=_win_bin,
+                                    agg_fns=_agg, out_col_names=_names_out)
+                        except Exception:
+                            self._log(
+                                f"  [WARN] environmental-context bout "
+                                f"enrichment ({_name}): {traceback.format_exc()}")
+                    if _bout_hmm_enriched is not None:
+                        _bout_hmm_enriched.to_csv(
+                            str(self._out_bouts /
+                                f"{_name}_bout_lengths_hmm_enriched.csv"),
+                            index=False)
                     pd.DataFrame({
                         "frame":               np.arange(len(_hmm_display)),
                         "time_s":              np.arange(len(_hmm_display)) / _file_fps,
@@ -11372,17 +11442,68 @@ class BSoidEngine:
             # at all (predict_from_saved_model skips HMM smoothing), so the
             # enriched sidecar pairs with the raw bout CSV above --
             # "<stem>_bout_lengths_enriched.csv", not "..._hmm_enriched.csv".
+            _bd_enriched = None
             if bool(_mcfg.get("kinematic_directedness_enabled", False)):
                 try:
                     _centroid_xy = np.column_stack([
                         xy[:, 0::2].mean(axis=1), xy[:, 1::2].mean(axis=1)])
                     _bd_enriched = compute_bout_directedness(bd, _centroid_xy, fps)
-                    _bd_enriched.to_csv(
-                        str(engine._out_bouts / f"{fp.stem}_bout_lengths_enriched.csv"),
-                        index=False)
                 except Exception:
                     log(f"  [WARN] kinematic directedness sidecar "
                         f"({fp.stem}): {traceback.format_exc()}")
+                    _bd_enriched = None
+            # v6 part 2 consistency (Environmental_Context_v6_Implementation
+            # _Plan.md Step 6): same "<stem>_bout_lengths_enriched.csv" pairing
+            # rule as above -- reads the SAVED model's own env_features_enabled/
+            # env_arena_cfg (_mcfg), not any fresh cfg passed to this call.
+            if bool(_mcfg.get("env_features_enabled", False)) and _mcfg.get("env_arena_cfg"):
+                try:
+                    _env_sec = compute_session_env_context(
+                        _mcfg.get("env_arena_cfg"), fp.stem,
+                        xy[:, 0::2], xy[:, 1::2], m.get("bodyparts") or [], fps,
+                        interaction_threshold=_mcfg.get("env_interaction_threshold"))
+                    _env_pb = _env_sec.get("per_bin") or {}
+                    if _env_pb:
+                        _thresh = float((_env_sec.get("summary") or {}).get(
+                            "interaction_threshold_px", 0.0))
+                        _win_bin = max(1, int(round(
+                            fps * (_env_sec.get("bin_ms", 100.0) / 1000.0))))
+                        _src, _agg, _names_out = {}, {}, {}
+                        _cur_region = np.array(_env_pb.get("current_region") or [], dtype=object)
+                        for _rn in sorted(((_env_sec.get("summary") or {})
+                                           .get("time_in_region_sec") or {}).keys()):
+                            _k = f"region__{_rn}"
+                            _src[_k] = (_cur_region == _rn).astype(float)
+                            _agg[_k] = np.nanmean
+                            _names_out[_k] = f"pct_time_in_region_{_rn}"
+                        _nose_d = _env_pb.get("dist_to_nearest_object_nose") or {}
+                        _paw_d  = _env_pb.get("dist_to_nearest_object_paw") or {}
+                        for _on in _nose_d.keys():
+                            _nd = np.array(_nose_d.get(_on, []), dtype=float)
+                            _pd_ = np.array(_paw_d.get(_on, []), dtype=float)
+                            if _nd.size and _pd_.size:
+                                _k = f"objcontact__{_on}"
+                                _src[_k] = ((_nd <= _thresh) | (_pd_ <= _thresh)).astype(float)
+                                _agg[_k] = np.nanmean
+                                _names_out[_k] = f"pct_time_near_object_{_on}"
+                        for _on, _hseries in (_env_pb.get(
+                                "heading_angle_to_nearest_object") or {}).items():
+                            _k = f"heading__{_on}"
+                            _src[_k] = np.array(_hseries, dtype=float)
+                            _agg[_k] = np.nanmean
+                            _names_out[_k] = f"mean_heading_angle_to_object_{_on}"
+                        if _src:
+                            _base_df = _bd_enriched if _bd_enriched is not None else bd
+                            _bd_enriched = enrich_bouts_from_bin_source(
+                                _base_df, _src, bin_offset=0, win=_win_bin,
+                                agg_fns=_agg, out_col_names=_names_out)
+                except Exception:
+                    log(f"  [WARN] environmental-context bout enrichment "
+                        f"({fp.stem}): {traceback.format_exc()}")
+            if _bd_enriched is not None:
+                _bd_enriched.to_csv(
+                    str(engine._out_bouts / f"{fp.stem}_bout_lengths_enriched.csv"),
+                    index=False)
             fd    = pd.DataFrame({"frame": np.arange(len(fl)),
                                   "time_s": np.arange(len(fl)) / fps,
                                   "label": fl})
