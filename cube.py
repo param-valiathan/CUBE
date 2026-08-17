@@ -4236,6 +4236,886 @@ class AdvancedCUBEWindow(tk.Toplevel):
 
 
 #
+#  ENVIRONMENTAL CONTEXT & OBJECT INTERACTION WINDOW  (v6 part 2)
+#
+
+_ENV_PARADIGM_LABELS = {
+    "open_field":         "Open Field",
+    "novel_object":       "Novel Object / Animal Recognition",
+    "y_maze":             "Y-Maze",
+    "elevated_plus_maze": "Elevated Plus Maze",
+    "three_chamber":      "Three-Chamber Test",
+    "place_preference":   "Place Preference / CPP",
+    "custom":             "Custom / Other Arena",
+}
+# Primary tool(s) shown expanded by default; the other tool is tucked under
+# an "Advanced" toggle (still fully usable, never hidden). "both" = neither
+# is secondary (three_chamber, custom).
+_ENV_PRIMARY_TOOL = {
+    "open_field": "region", "novel_object": "object", "y_maze": "region",
+    "elevated_plus_maze": "region", "three_chamber": "both",
+    "place_preference": "region", "custom": "both",
+}
+_ENV_NAME_SUGGESTIONS = {
+    "open_field":         {"region": ["Center"], "object": []},
+    "novel_object":       {"region": [], "object": ["Object A", "Object B"]},
+    "y_maze":             {"region": ["Arm A", "Arm B", "Arm C", "Center"], "object": []},
+    "elevated_plus_maze": {"region": ["Open Arm A", "Open Arm B", "Closed Arm A",
+                                       "Closed Arm B", "Center"], "object": []},
+    "three_chamber":      {"region": ["Left Chamber", "Center Chamber", "Right Chamber"],
+                            "object": ["Cup A", "Cup B"]},
+    "place_preference":   {"region": ["Chamber A", "Chamber B", "Middle/Neutral"], "object": []},
+    "custom":             {"region": [], "object": []},
+}
+_ENV_BOUNDARY_HINT = {
+    "open_field": "circle (typical open-field arena)",
+    "y_maze": "polygon (angular multi-arm footprint)",
+    "elevated_plus_maze": "polygon (angular multi-arm footprint)",
+    "three_chamber": "polygon (angular multi-chamber footprint)",
+    "place_preference": "polygon (angular multi-chamber footprint)",
+    "novel_object": "circle or polygon -- whatever matches your arena",
+    "custom": "circle or polygon -- whatever matches your arena",
+}
+_ENV_VIDEO_EXTS = {".avi", ".mp4", ".mov", ".mkv", ".wmv"}
+
+
+class EnvContextWindow(tk.Toplevel):
+    """
+    Step 2 (Environmental_Context_v6_Implementation_Plan.md): paradigm-first,
+    progressively-disclosed arena/region/object tracing window. Opened from
+    AdvancedCUBEWindow, gated on the env_features_enabled checkbox.
+
+    Leads with a mandatory paradigm choice (_build_paradigm_screen); once
+    chosen, Tab 1 ("Define Reference Arena") lets the user trace a boundary/
+    regions/objects on a reference video frame, and Tab 2 ("Apply to Other
+    Videos") lets them align those reference shapes (translate, or a full
+    per-shape override) onto every other paired video.
+
+    Coordinate-space note (ground rule 8 / user-confirmed design decision,
+    see cube_core.compute_session_env_context's docstring): frames are read
+    here through the SAME dlc_crop_x/y/w/h rectangle DLC tracked on (see
+    _load_frame_for), so traced vertices land in the same pixel coordinate
+    space as the pose data by construction -- this window IS the structural
+    correctness guarantee, not a runtime assertion elsewhere.
+
+    Scope trims relative to the plan's full interaction spec (documented
+    explicitly, not silent): shapes are traced by clicking vertices in order
+    then clicking "Finish Shape" (no free-hand drag-drawing); the Tab 2
+    "Edit individual shapes" override mode supports independently
+    click-dragging each whole shape (translate per shape) rather than
+    per-vertex handle reshaping. Both are real, working interactions -- the
+    trim is in interaction richness, not in whether the feature works.
+    """
+
+    def __init__(self, parent, session: "SessionState", initial_cfg: "dict | None"):
+        super().__init__(parent)
+        self.title("Environmental Context & Object Interaction")
+        self.configure(bg=C["bg"])
+        self.geometry("1100x800")
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+        self.result = None
+
+        self._session = session
+        self._cfg: "dict | None" = self._clone_cfg(initial_cfg) if initial_cfg else None
+
+        # Tab 1 canvas/drawing state
+        self._ref_frame_img = None      # PIL.Image, crop-applied, full-res
+        self._photo = None
+        self._scale = 1.0
+        self._canvas_offset = (0, 0)
+        self._drawing_kind = None       # None | "boundary" | "region" | "object"
+        self._draw_points: list = []    # original-pixel-space points while drawing
+        self._advanced_shown = False
+        self._selected_shape_key = None  # ("boundary"|"regions"|"objects", index)
+
+        # Tab 2 state
+        self._other_videos: list = []   # [(stem, path), ...]
+        self._active_video_stem = None
+        self._tab2_photo = None
+        self._tab2_editing_shapes = False
+        self._tab2_drag_last = None
+        self._tab2_drag_shape_idx = None  # (list_key, idx) when dragging one shape in override mode
+
+        self._tabs_built = False
+
+        if self._cfg and self._cfg.get("paradigm"):
+            self._build_main_ui()
+        else:
+            self._build_paradigm_screen()
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _clone_cfg(cfg: dict) -> dict:
+        import copy
+        return copy.deepcopy(cfg)
+
+    def _new_cfg(self, paradigm: str, reference_stem: str) -> dict:
+        return {
+            "schema_version": 3,
+            "paradigm": paradigm,
+            "reference_stem": reference_stem,
+            "coord_space": "post_crop",
+            "reference_shapes": {"boundary": None, "regions": [], "objects": []},
+            "per_video": {},
+        }
+
+    def _dlc_crop_rect(self):
+        adv = self._session.get("dlc_advanced_cfg", {}) or {}
+        rx, ry = int(adv.get("dlc_crop_x", 0)), int(adv.get("dlc_crop_y", 0))
+        rw, rh = int(adv.get("dlc_crop_w", 0)), int(adv.get("dlc_crop_h", 0))
+        return rx, ry, rw, rh
+
+    def _list_videos(self):
+        folders = self._session.get("video_folders", [])
+        out = []
+        seen = set()
+        for root_folder in folders:
+            for sub, dirs, files in os.walk(root_folder):
+                dirs[:] = [d for d in dirs if not d.endswith("_results")]
+                if Path(sub).name.endswith("_results"):
+                    continue
+                for fname in sorted(files):
+                    if fname.startswith("resized_"):
+                        continue
+                    p = Path(fname)
+                    if p.suffix.lower() in _ENV_VIDEO_EXTS:
+                        stem = p.stem
+                        if stem not in seen:
+                            seen.add(stem)
+                            out.append((stem, os.path.join(sub, fname)))
+        return out
+
+    def _load_frame_for(self, video_path: str):
+        """Read one representative frame, CROP-APPLIED (dlc_crop_x/y/w/h) so
+        pixel (0,0) here matches DLC's own tracked coordinate origin -- the
+        structural coordinate-space guarantee this window is responsible for.
+        Returns a PIL.Image or None."""
+        try:
+            import cv2
+            from PIL import Image
+        except ImportError:
+            return None
+        cap = cv2.VideoCapture(str(video_path))
+        try:
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            idx = max(0, total // 3) if total > 0 else 0
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if not ret:
+                return None
+        finally:
+            cap.release()
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        rx, ry, rw, rh = self._dlc_crop_rect()
+        if rw > 0 and rh > 0:
+            img = img.crop((rx, ry, min(rx + rw, img.width), min(ry + rh, img.height)))
+        return img
+
+    # ── paradigm screen ─────────────────────────────────────────────────────
+
+    def _build_paradigm_screen(self):
+        for w in self.winfo_children():
+            w.destroy()
+        tk.Label(self, text="  Choose the behavioral paradigm for this project",
+                 font=("Segoe UI", 13, "bold"), bg=C["bg"], fg=C["cyan"]
+                 ).pack(anchor="w", padx=10, pady=(16, 4))
+        tk.Label(self,
+                 text="  Only one paradigm is configured per project -- this determines which\n"
+                      "  drawing tools, naming prompts, and derived metrics are available below.\n"
+                      "  A batch mixing experiment types needs separate CUBE projects.",
+                 font=("Segoe UI", 9), bg=C["bg"], fg=C["subtext"]
+                 ).pack(anchor="w", padx=10, pady=(0, 12))
+
+        card = tk.Frame(self, bg=C["card"])
+        card.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        var = tk.StringVar(value="open_field")
+        for key in ENV_PARADIGMS or list(_ENV_PARADIGM_LABELS.keys()):
+            row = tk.Frame(card, bg=C["card"])
+            row.pack(anchor="w", fill="x", padx=12, pady=4)
+            tk.Radiobutton(row, text=_ENV_PARADIGM_LABELS.get(key, key), variable=var,
+                           value=key, bg=C["card"], fg=C["text"],
+                           selectcolor=C["card2"], activebackground=C["card"],
+                           font=("Segoe UI", 10)).pack(side="left")
+
+        others = self._list_videos()
+        ref_stem = others[0][0] if others else "reference"
+
+        def _confirm():
+            self._cfg = self._new_cfg(var.get(), ref_stem)
+            self._build_main_ui()
+
+        btn_f = tk.Frame(self, bg=C["bg"])
+        btn_f.pack(side="bottom", fill="x", padx=16, pady=10)
+        tk.Button(btn_f, text="Cancel", font=("Segoe UI", 9),
+                  bg=C["btn"], fg=C["btn_fg"], relief="flat", padx=10, pady=5,
+                  cursor="hand2", command=self.destroy).pack(side="left")
+        tk.Button(btn_f, text="Continue  ->", font=("Segoe UI", 10, "bold"),
+                  bg=C["green"], fg="white", relief="flat", padx=16, pady=5,
+                  cursor="hand2", command=_confirm).pack(side="right")
+
+    def _change_paradigm(self):
+        if messagebox.askyesno(
+                "Change Paradigm",
+                "Switching paradigms does not delete anything already traced -- "
+                "it only changes which shapes/tools are shown and which derived "
+                "metrics are computed. Continue?"):
+            self._build_paradigm_screen()
+
+    # ── main UI (paradigm chosen) ───────────────────────────────────────────
+
+    def _build_main_ui(self):
+        for w in self.winfo_children():
+            w.destroy()
+        paradigm = self._cfg.get("paradigm", "custom")
+
+        header = tk.Frame(self, bg=C["bg"])
+        header.pack(fill="x", padx=10, pady=(8, 0))
+        tk.Label(header, text=f"  {_ENV_PARADIGM_LABELS.get(paradigm, paradigm)} session",
+                 font=("Segoe UI", 11, "bold"), bg=C["bg"], fg=C["yellow"]).pack(side="left")
+        tk.Button(header, text="Change Paradigm", font=("Segoe UI", 8),
+                  bg=C["btn"], fg=C["btn_fg"], relief="flat", padx=8, pady=2,
+                  cursor="hand2", command=self._change_paradigm).pack(side="left", padx=10)
+
+        tabbar = tk.Frame(self, bg=C["bg"])
+        tabbar.pack(fill="x", padx=10, pady=(6, 0))
+        self._tab1_btn = tk.Button(tabbar, text="1. Define Reference Arena",
+                                    font=("Segoe UI", 9, "bold"), relief="flat",
+                                    padx=10, pady=5, cursor="hand2",
+                                    command=lambda: self._show_tab(1))
+        self._tab2_btn = tk.Button(tabbar, text="2. Apply to Other Videos",
+                                    font=("Segoe UI", 9, "bold"), relief="flat",
+                                    padx=10, pady=5, cursor="hand2",
+                                    command=lambda: self._show_tab(2))
+        self._tab1_btn.pack(side="left", padx=(0, 4))
+        self._tab2_btn.pack(side="left")
+
+        body = tk.Frame(self, bg=C["bg"])
+        body.pack(fill="both", expand=True, padx=10, pady=(6, 0))
+        self._tab1_frame = tk.Frame(body, bg=C["bg"])
+        self._tab2_frame = tk.Frame(body, bg=C["bg"])
+
+        btn_f = tk.Frame(self, bg=C["bg"])
+        btn_f.pack(side="bottom", fill="x", padx=16, pady=10)
+        tk.Button(btn_f, text="Cancel", font=("Segoe UI", 9),
+                  bg=C["btn"], fg=C["btn_fg"], relief="flat", padx=10, pady=5,
+                  cursor="hand2", command=self.destroy).pack(side="left")
+        tk.Button(btn_f, text="Save as Template...", font=("Segoe UI", 9),
+                  bg=C["btn"], fg=C["yellow"], relief="flat", padx=10, pady=5,
+                  cursor="hand2", command=self._save_template).pack(side="left", padx=6)
+        tk.Button(btn_f, text="Load Template...", font=("Segoe UI", 9),
+                  bg=C["btn"], fg=C["yellow"], relief="flat", padx=10, pady=5,
+                  cursor="hand2", command=self._load_template).pack(side="left", padx=6)
+        tk.Button(btn_f, text="  Apply  ", font=("Segoe UI", 10, "bold"),
+                  bg=C["green"], fg="white", relief="flat", padx=16, pady=5,
+                  cursor="hand2", command=self._apply_and_close).pack(side="right")
+
+        self._build_tab1(self._tab1_frame)
+        self._build_tab2(self._tab2_frame)
+        self._show_tab(1)
+
+    def _show_tab(self, n: int):
+        self._tab1_frame.pack_forget()
+        self._tab2_frame.pack_forget()
+        active, inactive = (C["green"], C["btn"])
+        if n == 1:
+            self._tab1_frame.pack(fill="both", expand=True)
+            self._tab1_btn.configure(bg=active, fg="white")
+            self._tab2_btn.configure(bg=inactive, fg=C["btn_fg"])
+        else:
+            self._tab2_frame.pack(fill="both", expand=True)
+            self._tab2_btn.configure(bg=active, fg="white")
+            self._tab1_btn.configure(bg=inactive, fg=C["btn_fg"])
+            self._refresh_tab2_list()
+
+    # ── Tab 1: Define Reference Arena ───────────────────────────────────────
+
+    def _build_tab1(self, parent):
+        left = tk.Frame(parent, bg=C["bg"])
+        left.pack(side="left", fill="both", expand=True)
+        right = tk.Frame(parent, bg=C["card"], width=260)
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+
+        paradigm = self._cfg.get("paradigm", "custom")
+        primary = _ENV_PRIMARY_TOOL.get(paradigm, "both")
+        boundary_hint = _ENV_BOUNDARY_HINT.get(paradigm, "circle or polygon")
+
+        toolbar = tk.Frame(left, bg=C["bg"])
+        toolbar.pack(fill="x", pady=(0, 4))
+        tk.Button(toolbar, text="Add Boundary", font=("Segoe UI", 9),
+                  bg=C["btn"], fg=C["cyan"], relief="flat", padx=8, pady=4,
+                  cursor="hand2", command=lambda: self._start_drawing("boundary")
+                  ).pack(side="left", padx=(0, 4))
+        tk.Label(toolbar, text=f"(suggested: {boundary_hint})",
+                 font=("Segoe UI", 7), bg=C["bg"], fg=C["dim"]).pack(side="left", padx=(0, 10))
+
+        self._primary_btn_frame = tk.Frame(toolbar, bg=C["bg"])
+        self._primary_btn_frame.pack(side="left")
+
+        def _mk_tool_btn(f, kind, label):
+            tk.Button(f, text=label, font=("Segoe UI", 9),
+                      bg=C["btn"], fg=C["green"], relief="flat", padx=8, pady=4,
+                      cursor="hand2", command=lambda: self._start_drawing(kind)
+                      ).pack(side="left", padx=(0, 4))
+
+        if primary in ("region", "both"):
+            _mk_tool_btn(self._primary_btn_frame, "region", "Add Region")
+        if primary in ("object", "both"):
+            _mk_tool_btn(self._primary_btn_frame, "object", "Add Object")
+
+        self._adv_toggle_btn = None
+        self._adv_btn_frame = tk.Frame(toolbar, bg=C["bg"])
+        if primary not in ("both",):
+            self._adv_toggle_btn = tk.Button(
+                toolbar, text="Advanced ▾", font=("Segoe UI", 8),
+                bg=C["bg"], fg=C["subtext"], relief="flat", padx=6, pady=4,
+                cursor="hand2", command=self._toggle_advanced)
+            self._adv_toggle_btn.pack(side="left", padx=(6, 0))
+            self._adv_btn_frame.pack(side="left")
+            secondary = "object" if primary == "region" else "region"
+            _mk_tool_btn(self._adv_btn_frame, secondary,
+                         f"Add {'Object' if secondary == 'object' else 'Region'}")
+            self._adv_btn_frame.pack_forget()
+
+        finish_row = tk.Frame(left, bg=C["bg"])
+        finish_row.pack(fill="x")
+        self._draw_status = tk.Label(finish_row, text="", font=("Segoe UI", 8),
+                                      bg=C["bg"], fg=C["yellow"])
+        self._draw_status.pack(side="left")
+        tk.Button(finish_row, text="Finish Shape", font=("Segoe UI", 8),
+                  bg=C["btn"], fg=C["btn_fg"], relief="flat", padx=6, pady=2,
+                  cursor="hand2", command=self._finish_shape).pack(side="left", padx=6)
+        tk.Button(finish_row, text="Cancel Drawing", font=("Segoe UI", 8),
+                  bg=C["btn"], fg=C["btn_fg"], relief="flat", padx=6, pady=2,
+                  cursor="hand2", command=self._cancel_drawing).pack(side="left")
+
+        self._tab1_canvas = tk.Canvas(left, bg="black", highlightthickness=0)
+        self._tab1_canvas.pack(fill="both", expand=True, pady=(4, 0))
+        self._tab1_canvas.bind("<Configure>", lambda e: self._refresh_tab1_canvas())
+        self._tab1_canvas.bind("<Button-1>", self._on_tab1_click)
+
+        others = self._list_videos()
+        ref_video = next((p for s, p in others if s == self._cfg.get("reference_stem")),
+                          others[0][1] if others else None)
+        self._ref_frame_img = self._load_frame_for(ref_video) if ref_video else None
+
+        tk.Label(right, text="Traced Shapes", font=("Segoe UI", 10, "bold"),
+                 bg=C["card"], fg=C["cyan"]).pack(anchor="w", padx=8, pady=(8, 4))
+        self._sidebar_canvas = tk.Canvas(right, bg=C["card"], highlightthickness=0)
+        _sb_scroll = tk.Scrollbar(right, orient="vertical", command=self._sidebar_canvas.yview)
+        self._sidebar_inner = tk.Frame(self._sidebar_canvas, bg=C["card"])
+        self._sidebar_canvas.configure(yscrollcommand=_sb_scroll.set)
+        self._sidebar_canvas.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        _sb_scroll.pack(side="right", fill="y")
+        self._sidebar_canvas.create_window((0, 0), window=self._sidebar_inner, anchor="nw")
+        self._sidebar_inner.bind(
+            "<Configure>",
+            lambda e: self._sidebar_canvas.configure(scrollregion=self._sidebar_canvas.bbox("all")))
+
+        self._refresh_sidebar()
+        self._refresh_tab1_canvas()
+
+    def _toggle_advanced(self):
+        self._advanced_shown = not self._advanced_shown
+        if self._advanced_shown:
+            self._adv_btn_frame.pack(side="left")
+            self._adv_toggle_btn.configure(text="Advanced ▴")
+        else:
+            self._adv_btn_frame.pack_forget()
+            self._adv_toggle_btn.configure(text="Advanced ▾")
+
+    def _start_drawing(self, kind: str):
+        if kind == "boundary" and self._cfg["reference_shapes"].get("boundary"):
+            if not messagebox.askyesno("Replace Boundary",
+                                        "A boundary is already traced. Replace it?"):
+                return
+        self._drawing_kind = kind
+        self._draw_points = []
+        self._draw_status.configure(
+            text=f"Drawing {kind}: click points on the frame, then 'Finish Shape' "
+                 f"(need >= 3 points).")
+        self._refresh_tab1_canvas()
+
+    def _cancel_drawing(self):
+        self._drawing_kind = None
+        self._draw_points = []
+        self._draw_status.configure(text="")
+        self._refresh_tab1_canvas()
+
+    def _canvas_to_orig(self, cx, cy):
+        ox, oy = self._canvas_offset
+        s = self._scale or 1.0
+        return (cx - ox) / s, (cy - oy) / s
+
+    def _orig_to_canvas(self, x, y):
+        ox, oy = self._canvas_offset
+        s = self._scale or 1.0
+        return x * s + ox, y * s + oy
+
+    def _on_tab1_click(self, event):
+        if not self._drawing_kind or self._ref_frame_img is None:
+            return
+        ox, oy = self._canvas_to_orig(event.x, event.y)
+        self._draw_points.append((ox, oy))
+        self._refresh_tab1_canvas()
+
+    def _suggested_name(self, kind: str) -> str:
+        paradigm = self._cfg.get("paradigm", "custom")
+        existing = {s["name"] for s in (self._cfg["reference_shapes"].get(
+            "regions" if kind == "region" else "objects") or [])}
+        suggestions = _ENV_NAME_SUGGESTIONS.get(paradigm, {}).get(kind, [])
+        for s in suggestions:
+            if s not in existing:
+                return s
+        return f"{'Region' if kind == 'region' else 'Object'} {len(existing) + 1}"
+
+    def _role_vocab(self, kind: str):
+        paradigm = self._cfg.get("paradigm", "custom")
+        vocab = (ENV_PARADIGM_ROLE_VOCAB or {}).get(paradigm, {})
+        key = "regions" if kind == "region" else "objects"
+        return vocab.get(key)
+
+    def _finish_shape(self):
+        if not self._drawing_kind:
+            return
+        if len(self._draw_points) < (2 if self._drawing_kind == "boundary" else 3):
+            messagebox.showwarning("Finish Shape", "Need at least 3 points (a boundary needs at least 2).")
+            return
+        kind = self._drawing_kind
+        default_name = ("Arena" if kind == "boundary" else self._suggested_name(kind))
+        role_vocab = self._role_vocab(kind) if kind != "boundary" else None
+        name, role = self._ask_name_role(default_name, role_vocab)
+        if name is None:
+            return
+        shape = {"name": name, "kind": kind, "vertices": list(self._draw_points), "role": role}
+        rs = self._cfg["reference_shapes"]
+        if kind == "boundary":
+            rs["boundary"] = shape
+        elif kind == "region":
+            rs["regions"].append(shape)
+        else:
+            rs["objects"].append(shape)
+        self._drawing_kind = None
+        self._draw_points = []
+        self._draw_status.configure(text="")
+        self._refresh_sidebar()
+        self._refresh_tab1_canvas()
+
+    def _ask_name_role(self, default_name: str, role_vocab):
+        dlg = tk.Toplevel(self)
+        dlg.title("Name Shape")
+        dlg.configure(bg=C["bg"])
+        dlg.transient(self)
+        dlg.grab_set()
+        result = {"name": None, "role": None}
+
+        tk.Label(dlg, text="Name:", bg=C["bg"], fg=C["text"],
+                 font=("Segoe UI", 9)).grid(row=0, column=0, padx=8, pady=8, sticky="w")
+        name_var = tk.StringVar(value=default_name)
+        tk.Entry(dlg, textvariable=name_var, width=24, bg=C["card2"], fg=C["text"],
+                 font=("Segoe UI", 9)).grid(row=0, column=1, padx=8, pady=8)
+
+        role_var = tk.StringVar(value=(role_vocab[0] if role_vocab else ""))
+        if role_vocab:
+            tk.Label(dlg, text="Role:", bg=C["bg"], fg=C["text"],
+                     font=("Segoe UI", 9)).grid(row=1, column=0, padx=8, pady=(0, 8), sticky="w")
+            ttk.Combobox(dlg, textvariable=role_var, values=list(role_vocab),
+                         state="readonly", width=22).grid(row=1, column=1, padx=8, pady=(0, 8))
+
+        def _ok():
+            result["name"] = name_var.get().strip() or default_name
+            result["role"] = role_var.get() if role_vocab else None
+            dlg.destroy()
+
+        def _cancel():
+            dlg.destroy()
+
+        btn_row = tk.Frame(dlg, bg=C["bg"])
+        btn_row.grid(row=2, column=0, columnspan=2, pady=(0, 8))
+        tk.Button(btn_row, text="Cancel", command=_cancel, bg=C["btn"], fg=C["btn_fg"],
+                  relief="flat", padx=8, pady=3).pack(side="left", padx=4)
+        tk.Button(btn_row, text="OK", command=_ok, bg=C["green"], fg="white",
+                  relief="flat", padx=8, pady=3).pack(side="left", padx=4)
+        dlg.wait_window()
+        return result["name"], result["role"]
+
+    def _refresh_tab1_canvas(self):
+        cv = getattr(self, "_tab1_canvas", None)
+        if cv is None:
+            return
+        try:
+            from PIL import ImageTk, ImageDraw
+        except ImportError:
+            return
+        cw = max(1, cv.winfo_width())
+        ch = max(1, cv.winfo_height())
+        cv.delete("all")
+        if self._ref_frame_img is None:
+            cv.create_text(cw // 2, ch // 2, text="No reference video frame available.",
+                            fill="white", font=("Segoe UI", 10))
+            return
+        ow, oh = self._ref_frame_img.width, self._ref_frame_img.height
+        scale = min(cw / ow, ch / oh, 1.0) or 1.0
+        dw, dh = max(1, int(ow * scale)), max(1, int(oh * scale))
+        off_x, off_y = (cw - dw) // 2, (ch - dh) // 2
+        self._scale = scale
+        self._canvas_offset = (off_x, off_y)
+
+        from PIL import Image
+        disp = self._ref_frame_img.resize((dw, dh), Image.LANCZOS).convert("RGB")
+        draw = ImageDraw.Draw(disp)
+
+        def _dp(x, y):
+            return (x * scale, y * scale)
+
+        rs = self._cfg["reference_shapes"]
+        _COLORS = {"boundary": "#00E5FF", "region": "#4CAF50", "object": "#FF9800"}
+        if rs.get("boundary"):
+            pts = [_dp(*p) for p in rs["boundary"]["vertices"]]
+            if len(pts) >= 2:
+                draw.line(pts + [pts[0]], fill=_COLORS["boundary"], width=2)
+        for s in rs.get("regions") or []:
+            pts = [_dp(*p) for p in s["vertices"]]
+            if len(pts) >= 3:
+                draw.polygon(pts, outline=_COLORS["region"], width=2)
+        for s in rs.get("objects") or []:
+            pts = [_dp(*p) for p in s["vertices"]]
+            if len(pts) >= 3:
+                draw.polygon(pts, outline=_COLORS["object"], width=2)
+
+        if self._drawing_kind and self._draw_points:
+            pts = [_dp(*p) for p in self._draw_points]
+            col = _COLORS.get(self._drawing_kind, "#FFFFFF")
+            for px, py in pts:
+                draw.ellipse([px - 3, py - 3, px + 3, py + 3], fill=col)
+            if len(pts) >= 2:
+                draw.line(pts, fill=col, width=2)
+
+        self._photo = ImageTk.PhotoImage(disp)
+        cv.create_image(off_x, off_y, anchor="nw", image=self._photo)
+
+    def _refresh_sidebar(self):
+        for w in self._sidebar_inner.winfo_children():
+            w.destroy()
+        rs = self._cfg["reference_shapes"]
+        role_vocab_r = self._role_vocab("region")
+        role_vocab_o = self._role_vocab("object")
+
+        def _shape_row(shape, on_delete, role_vocab, on_role_change):
+            row = tk.Frame(self._sidebar_inner, bg=C["card2"])
+            row.pack(fill="x", padx=4, pady=2)
+            tk.Label(row, text=shape["name"], bg=C["card2"], fg=C["text"],
+                     font=("Segoe UI", 8)).pack(side="left", padx=4)
+            if role_vocab:
+                rv = tk.StringVar(value=shape.get("role") or role_vocab[0])
+                cb = ttk.Combobox(row, textvariable=rv, values=list(role_vocab),
+                                   state="readonly", width=10, font=("Segoe UI", 7))
+                cb.pack(side="left", padx=2)
+                cb.bind("<<ComboboxSelected>>", lambda e: on_role_change(rv.get()))
+            tk.Button(row, text="x", font=("Segoe UI", 7), bg=C["card2"], fg=C["red"],
+                      relief="flat", padx=4, cursor="hand2",
+                      command=on_delete).pack(side="right", padx=4)
+
+        if rs.get("boundary"):
+            tk.Label(self._sidebar_inner, text="Boundary", font=("Segoe UI", 8, "bold"),
+                     bg=C["card"], fg=C["cyan"]).pack(anchor="w", padx=4, pady=(6, 0))
+            _shape_row(rs["boundary"], lambda: self._delete_shape("boundary", None),
+                       None, lambda r: None)
+
+        if rs.get("regions"):
+            tk.Label(self._sidebar_inner, text="Regions", font=("Segoe UI", 8, "bold"),
+                     bg=C["card"], fg=C["cyan"]).pack(anchor="w", padx=4, pady=(6, 0))
+            for i, s in enumerate(rs["regions"]):
+                _shape_row(s, (lambda i=i: self._delete_shape("regions", i)),
+                           role_vocab_r,
+                           (lambda role, i=i: self._set_role("regions", i, role)))
+
+        if rs.get("objects"):
+            tk.Label(self._sidebar_inner, text="Objects", font=("Segoe UI", 8, "bold"),
+                     bg=C["card"], fg=C["cyan"]).pack(anchor="w", padx=4, pady=(6, 0))
+            for i, s in enumerate(rs["objects"]):
+                _shape_row(s, (lambda i=i: self._delete_shape("objects", i)),
+                           role_vocab_o,
+                           (lambda role, i=i: self._set_role("objects", i, role)))
+
+        self._refresh_min_shape_warning()
+
+    def _delete_shape(self, key, idx):
+        rs = self._cfg["reference_shapes"]
+        if key == "boundary":
+            rs["boundary"] = None
+        else:
+            del rs[key][idx]
+        self._refresh_sidebar()
+        self._refresh_tab1_canvas()
+
+    def _set_role(self, key, idx, role):
+        self._cfg["reference_shapes"][key][idx]["role"] = role
+        self._refresh_min_shape_warning()
+
+    def _refresh_min_shape_warning(self):
+        # NOTE: self._sidebar_inner's children (including any previous
+        # _warn_label) are destroyed wholesale at the top of _refresh_sidebar
+        # on every call, so a cached widget reference would go stale --
+        # always create a fresh label here rather than caching across calls.
+        self._warn_label = tk.Label(self._sidebar_inner, text="", font=("Segoe UI", 7),
+                                     bg=C["card"], fg=C["yellow"], wraplength=230,
+                                     justify="left")
+        self._warn_label.pack(anchor="w", padx=4, pady=(8, 4))
+        paradigm = self._cfg.get("paradigm", "custom")
+        mins = (ENV_PARADIGM_MIN_ROLES or {}).get(paradigm)
+        if not mins:
+            self._warn_label.configure(text="")
+            return
+        rs = self._cfg["reference_shapes"]
+        all_shapes = (rs.get("regions") or []) + (rs.get("objects") or [])
+        missing = []
+        for role, need in mins.items():
+            have = sum(1 for s in all_shapes if s.get("role") == role)
+            if have < need:
+                missing.append(f"{role} (have {have}, need {need})")
+        if missing:
+            self._warn_label.configure(
+                text="Not enough role-tagged shapes for this paradigm's specialized "
+                     "metric yet -- missing: " + ", ".join(missing) +
+                     ". Generic per-region/per-object output still works.")
+        else:
+            self._warn_label.configure(text="")
+
+    def _save_template(self):
+        path = filedialog.asksaveasfilename(
+            title="Save Arena Template", defaultextension=".json",
+            filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            payload = {"paradigm": self._cfg.get("paradigm"),
+                       "reference_shapes": self._cfg.get("reference_shapes")}
+            Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as e:
+            messagebox.showerror("Save Template", str(e))
+
+    def _load_template(self):
+        path = filedialog.askopenfilename(
+            title="Load Arena Template", filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            self._cfg["paradigm"] = payload.get("paradigm", self._cfg.get("paradigm"))
+            self._cfg["reference_shapes"] = payload.get(
+                "reference_shapes", self._cfg["reference_shapes"])
+            self._build_main_ui()
+        except Exception as e:
+            messagebox.showerror("Load Template", str(e))
+
+    # ── Tab 2: Apply to Other Videos ────────────────────────────────────────
+
+    def _build_tab2(self, parent):
+        left = tk.Frame(parent, bg=C["card"], width=260)
+        left.pack(side="left", fill="y")
+        left.pack_propagate(False)
+        right = tk.Frame(parent, bg=C["bg"])
+        right.pack(side="right", fill="both", expand=True)
+
+        tk.Label(left, text="Other Videos", font=("Segoe UI", 10, "bold"),
+                 bg=C["card"], fg=C["cyan"]).pack(anchor="w", padx=8, pady=(8, 4))
+        self._tab2_list_frame = tk.Frame(left, bg=C["card"])
+        self._tab2_list_frame.pack(fill="both", expand=True, padx=4)
+
+        toolbar2 = tk.Frame(right, bg=C["bg"])
+        toolbar2.pack(fill="x")
+        self._tab2_active_label = tk.Label(toolbar2, text="No video selected",
+                                            font=("Segoe UI", 9, "bold"),
+                                            bg=C["bg"], fg=C["yellow"])
+        self._tab2_active_label.pack(side="left")
+        self._tab2_edit_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(toolbar2, text="Edit individual shapes", variable=self._tab2_edit_var,
+                       bg=C["bg"], fg=C["green"], selectcolor=C["card2"],
+                       activebackground=C["bg"],
+                       command=self._on_tab2_edit_toggle).pack(side="left", padx=10)
+        tk.Button(toolbar2, text="Reset to Reference", font=("Segoe UI", 8),
+                  bg=C["btn"], fg=C["btn_fg"], relief="flat", padx=6, pady=2,
+                  cursor="hand2", command=self._tab2_reset).pack(side="left")
+
+        tk.Label(right, text="Drag anywhere on the frame to nudge the whole overlay "
+                              "(or, with 'Edit individual shapes' on, drag near one "
+                              "shape to move just that shape).",
+                 font=("Segoe UI", 7), bg=C["bg"], fg=C["dim"], wraplength=600,
+                 justify="left").pack(anchor="w", pady=(2, 0))
+
+        self._tab2_canvas = tk.Canvas(right, bg="black", highlightthickness=0)
+        self._tab2_canvas.pack(fill="both", expand=True, pady=(4, 0))
+        self._tab2_canvas.bind("<Configure>", lambda e: self._refresh_tab2_canvas())
+        self._tab2_canvas.bind("<ButtonPress-1>", self._on_tab2_press)
+        self._tab2_canvas.bind("<B1-Motion>", self._on_tab2_drag)
+        self._tab2_canvas.bind("<ButtonRelease-1>", self._on_tab2_release)
+
+    def _refresh_tab2_list(self):
+        for w in self._tab2_list_frame.winfo_children():
+            w.destroy()
+        self._other_videos = [(s, p) for s, p in self._list_videos()
+                               if s != self._cfg.get("reference_stem")]
+        per_video = self._cfg.get("per_video") or {}
+        for stem, path in self._other_videos:
+            status = "Adjusted" if stem in per_video else "Default"
+            colour = C["yellow"] if status == "Adjusted" else C["dim"]
+            row = tk.Frame(self._tab2_list_frame, bg=C["card2"])
+            row.pack(fill="x", pady=1)
+            tk.Button(row, text=stem[:26], font=("Segoe UI", 8), bg=C["card2"],
+                      fg=C["text"], relief="flat", anchor="w", cursor="hand2",
+                      command=lambda s=stem, p=path: self._select_tab2_video(s, p)
+                      ).pack(side="left", fill="x", expand=True, padx=(4, 0))
+            tk.Label(row, text=status, font=("Segoe UI", 7), bg=C["card2"],
+                     fg=colour).pack(side="right", padx=4)
+
+    def _select_tab2_video(self, stem, path):
+        self._active_video_stem = stem
+        self._tab2_active_label.configure(text=stem)
+        self._tab2_frame_img = self._load_frame_for(path)
+        pv = (self._cfg.get("per_video") or {}).get(stem)
+        self._tab2_edit_var.set(bool(pv and pv.get("mode") == "override"))
+        self._refresh_tab2_canvas()
+
+    def _current_tab2_shapes(self):
+        """Effective flat shape list for the active video (mirrors
+        resolve_env_shapes, kept local so Tab 2 can render live drag
+        feedback before it's committed to self._cfg)."""
+        if resolve_env_shapes is not None and self._active_video_stem:
+            return resolve_env_shapes(self._cfg, self._active_video_stem)
+        return []
+
+    def _refresh_tab2_canvas(self):
+        cv = getattr(self, "_tab2_canvas", None)
+        if cv is None:
+            return
+        try:
+            from PIL import ImageTk, ImageDraw, Image
+        except ImportError:
+            return
+        cv.delete("all")
+        img = getattr(self, "_tab2_frame_img", None)
+        cw, ch = max(1, cv.winfo_width()), max(1, cv.winfo_height())
+        if img is None:
+            cv.create_text(cw // 2, ch // 2, text="Select a video on the left.",
+                            fill="white", font=("Segoe UI", 10))
+            return
+        ow, oh = img.width, img.height
+        scale = min(cw / ow, ch / oh, 1.0) or 1.0
+        dw, dh = max(1, int(ow * scale)), max(1, int(oh * scale))
+        off_x, off_y = (cw - dw) // 2, (ch - dh) // 2
+        self._tab2_scale = scale
+        self._tab2_offset = (off_x, off_y)
+        disp = img.resize((dw, dh), Image.LANCZOS).convert("RGB")
+        draw = ImageDraw.Draw(disp)
+        _COLORS = {"boundary": "#00E5FF", "region": "#4CAF50", "object": "#FF9800"}
+        for s in self._current_tab2_shapes():
+            pts = [(x * scale, y * scale) for x, y in s["vertices"]]
+            col = _COLORS.get(s["kind"], "#FFFFFF")
+            if s["kind"] == "boundary" and len(pts) >= 2:
+                draw.line(pts + [pts[0]], fill=col, width=2)
+            elif len(pts) >= 3:
+                draw.polygon(pts, outline=col, width=2)
+        self._tab2_photo = ImageTk.PhotoImage(disp)
+        cv.create_image(off_x, off_y, anchor="nw", image=self._tab2_photo)
+
+    def _tab2_canvas_to_orig(self, cx, cy):
+        ox, oy = getattr(self, "_tab2_offset", (0, 0))
+        s = getattr(self, "_tab2_scale", 1.0) or 1.0
+        return (cx - ox) / s, (cy - oy) / s
+
+    def _on_tab2_edit_toggle(self):
+        if not self._active_video_stem:
+            return
+        stem = self._active_video_stem
+        pv = self._cfg.setdefault("per_video", {})
+        if self._tab2_edit_var.get():
+            # snapshot the CURRENT effective shapes as an independent override set.
+            shapes = resolve_env_shapes(self._cfg, stem) if resolve_env_shapes else []
+            boundary = next((s for s in shapes if s["kind"] == "boundary"), None)
+            regions = [s for s in shapes if s["kind"] == "region"]
+            objects = [s for s in shapes if s["kind"] == "object"]
+            existing_roles = (pv.get(stem, {}) or {}).get("role_overrides")
+            pv[stem] = {"mode": "override",
+                        "shapes": {"boundary": boundary, "regions": regions, "objects": objects},
+                        "role_overrides": existing_roles}
+        else:
+            if stem in pv and pv[stem].get("mode") == "override":
+                del pv[stem]
+        self._refresh_tab2_canvas()
+        self._refresh_tab2_list()
+
+    def _tab2_reset(self):
+        if not self._active_video_stem:
+            return
+        pv = self._cfg.get("per_video") or {}
+        pv.pop(self._active_video_stem, None)
+        self._tab2_edit_var.set(False)
+        self._refresh_tab2_canvas()
+        self._refresh_tab2_list()
+
+    def _on_tab2_press(self, event):
+        if not self._active_video_stem:
+            return
+        self._tab2_drag_last = (event.x, event.y)
+        self._tab2_drag_shape_idx = None
+        if self._tab2_edit_var.get():
+            ox, oy = self._tab2_canvas_to_orig(event.x, event.y)
+            pv = self._cfg.setdefault("per_video", {})
+            entry = pv.get(self._active_video_stem)
+            if not entry or entry.get("mode") != "override":
+                return
+            for key in ("regions", "objects"):
+                for i, s in enumerate(entry["shapes"].get(key) or []):
+                    verts = s["vertices"]
+                    cx = sum(v[0] for v in verts) / len(verts)
+                    cy = sum(v[1] for v in verts) / len(verts)
+                    if abs(cx - ox) < 25 and abs(cy - oy) < 25:
+                        self._tab2_drag_shape_idx = (key, i)
+                        return
+
+    def _on_tab2_drag(self, event):
+        if self._tab2_drag_last is None or not self._active_video_stem:
+            return
+        dx_c = event.x - self._tab2_drag_last[0]
+        dy_c = event.y - self._tab2_drag_last[1]
+        scale = getattr(self, "_tab2_scale", 1.0) or 1.0
+        dx, dy = dx_c / scale, dy_c / scale
+        self._tab2_drag_last = (event.x, event.y)
+        pv = self._cfg.setdefault("per_video", {})
+        stem = self._active_video_stem
+
+        if self._tab2_edit_var.get() and self._tab2_drag_shape_idx:
+            key, i = self._tab2_drag_shape_idx
+            entry = pv.get(stem)
+            if entry and entry.get("mode") == "override":
+                shp = entry["shapes"][key][i]
+                shp["vertices"] = [(x + dx, y + dy) for x, y in shp["vertices"]]
+        elif not self._tab2_edit_var.get():
+            entry = pv.setdefault(stem, {"mode": "transform", "translate": [0, 0],
+                                          "role_overrides": None})
+            if entry.get("mode") != "transform":
+                entry = pv[stem] = {"mode": "transform", "translate": [0, 0],
+                                    "role_overrides": entry.get("role_overrides")}
+            entry["translate"] = [entry["translate"][0] + dx, entry["translate"][1] + dy]
+        self._refresh_tab2_canvas()
+
+    def _on_tab2_release(self, event):
+        self._tab2_drag_last = None
+        self._tab2_drag_shape_idx = None
+        self._refresh_tab2_list()
+
+    # ── finish ───────────────────────────────────────────────────────────────
+
+    def _apply_and_close(self):
+        self.result = self._cfg
+        self.destroy()
+
+
+#
 #  BODY-REGION FEATURE WEIGHTING WINDOW  (issue 1b)
 #
 
