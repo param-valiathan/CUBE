@@ -767,3 +767,21 @@ imageio-ffmpeg    (for quad composite + skeleton video)
 ```
 
 All runtime dependencies are pre-installed in the `CUBE` conda environment. No build step required.
+
+---
+
+## Running Tests
+
+CUBE has an automated `pytest` suite under `tests/` (unit + integration tests for `cube_core.py` and `cube_analyser.py`'s pure logic). Always invoke it through the mandatory `CUBE` conda environment's Python — never bare `pytest`/`python`.
+
+Full suite (includes the slow end-to-end pipeline regression, ~30-60s):
+```bat
+"C:\Users\param\anaconda3\envs\CUBE\python.exe" -m pytest tests\ -v
+```
+
+Fast subset only (excludes the `slow`-marked end-to-end regression, seconds not minutes — use this for day-to-day iteration):
+```bat
+"C:\Users\param\anaconda3\envs\CUBE\python.exe" -m pytest tests\ -v -m "not slow"
+```
+
+`slow` marks the one full `BSoidEngine.run()` regression test (Phase T7); `integration` marks any test exercising multiple pipeline stages together (discovery+loading, config merging, algorithm-stage smoke tests, the full pipeline). Both markers are registered in `pyproject.toml`. See `Automated_Test_Suite_Plan.md` for the full test-suite design rationale and `Test_Suite_Implementation_Report.md` for what's implemented, coverage numbers, and known gaps.

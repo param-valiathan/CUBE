@@ -45,7 +45,21 @@ pip install pillow opencv-python-headless scipy scikit-learn umap-learn customtk
 conda install -c conda-forge hdbscan
 ```
 
-There are no automated tests. Verification is done by running the pipeline against real DLC output files.
+`environment.yml` (repo root) captures this same dependency list (plus `pytest`/`pytest-cov`) for reproducibility and CI — `conda env create -f environment.yml` recreates the `CUBE` environment from scratch.
+
+### Automated tests
+
+An automated `pytest` suite exists under `tests/` (`tests/unit/`, `tests/integration/`, `tests/conftest.py`), purely additive to `cube_core.py`/`cube_analyser.py` — synthetic fixtures only, never real user data or `CUBE_logs/`. Always run it through the mandatory `CUBE` env Python path:
+
+```bat
+rem Full suite (includes the slow end-to-end BSoidEngine.run() regression)
+"C:\Users\param\anaconda3\envs\CUBE\python.exe" -m pytest tests\ -v
+
+rem Fast subset only (excludes the slow-marked regression -- use for iteration)
+"C:\Users\param\anaconda3\envs\CUBE\python.exe" -m pytest tests\ -v -m "not slow"
+```
+
+See `Automated_Test_Suite_Plan.md` for the full design rationale (testing philosophy, fixture strategy, phase-by-phase scope) and `Test_Suite_Implementation_Report.md` for what's implemented, pass/fail counts, coverage numbers, and known gaps/deviations. Verification beyond the automated suite is still done by running the pipeline against real DLC output files where appropriate (e.g. exploratory GUI checks).
 
 ---
 
