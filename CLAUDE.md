@@ -99,9 +99,18 @@ The entire analysis is one class, `BSoidEngine` (line ~3955). Its `run()` method
   bout_lengths/
     <stem>_bout_lengths.csv          # raw MLP bouts
     <stem>_bout_lengths_hmm.csv      # HMM-smoothed bouts  (preferred by analyser)
-    <stem>_bout_lengths_hmm_enriched.csv  # (if kinematic_directedness_enabled, off by default)
-                                           # canonical 3 cols + net_displacement_px, path_length_px,
-                                           # straightness_ratio, mean_speed_px_s, heading_consistency
+    <stem>_bout_lengths_hmm_enriched.csv  # (if kinematic_directedness_enabled and/or
+                                           #  env_features_enabled, both off by default;
+                                           #  a SHARED sidecar -- canonical 3 cols +
+                                           #  whichever flag(s) are on contribute columns)
+                                           # kinematics: net_displacement_px, path_length_px,
+                                           #   straightness_ratio, mean_speed_px_s, heading_consistency
+                                           # env context: pct_time_in_region_<name>,
+                                           #   pct_time_near_object_<name>,
+                                           #   mean_heading_angle_to_object_<name>
+    <stem>_approach_events.csv       # (if BOTH kinematic_directedness_enabled AND
+                                      #  env_features_enabled with traced shapes; only
+                                      #  written when >=1 event detected)
     <stem>_frame_labels.csv          # per-frame: frame,time_s,label
     <stem>_frame_labels_hmm.csv
     <stem>_epochs.csv / _epochs_hmm.csv
@@ -109,6 +118,9 @@ The entire analysis is one class, `BSoidEngine` (line ~3955). Its `run()` method
     bsoid_model.pkl                  # scaler, umap, hdb, mlp, pca, config, etc.
     umap_embedding.npy               # (n_total_bins, n_components)
     session_bin_ranges.json          # {stem: [start, end, video_path]}
+    session_env_context.json         # (if env_features_enabled; not written at all otherwise)
+                                      # {stem: {"per_bin": {...}, "summary": {...},
+                                      #         "derived": {...}, "paradigm": str, "bin_ms": 100.0}}
     hmm_model.pkl
   plots/
     umap_embedding.png
@@ -148,6 +160,10 @@ Loads `*_bout_lengths[_hmm].csv` from a user-selected folder → builds per-anim
 ### Kinematic directedness (v6 K1/K2, opt-in)
 
 `BSoidEngine.DEFAULTS["kinematic_directedness_enabled"] = False`. When `True`, writes the `*_bout_lengths_hmm_enriched.csv` sidecar above per session (via `compute_bout_directedness()` in `cube_core.py`); the canonical `*_bout_lengths_hmm.csv` is never modified in either state. `enrich_bouts_from_bin_source()` (also in `cube_core.py`, a generalization of `attach_centroid_distance`) is the shared per-bin-to-bout join utility this and the environmental-context work build on. `cube_analyser.py` also unconditionally (no flag) joins `cluster_kinematics.csv`'s per-cluster kinematic signatures into `compute_per_cluster_metrics()`'s output, surfaced in the Top-N Bar/Volcano/Heatmap "Metric:" selector. See `Kinematic_Transition_v6_Implementation_Plan.md` and `Kinematics_v6_Implementation_Report.md` for full detail.
+
+### Environmental context & object interaction (v6 part 2, opt-in)
+
+`BSoidEngine.DEFAULTS["env_features_enabled"] = False` (master switch). `env_arena_cfg = None` holds one project-wide traced-arena config (`{"schema_version": 3, "paradigm": ..., "reference_shapes": {...}, "per_video": {...}}` — see `Environmental_Context_v6_Implementation_Plan.md` Step 1 for the full schema and `ENV_PARADIGMS`/`ENV_PARADIGM_ROLE_VOCAB`/`ENV_PARADIGM_MIN_ROLES` in `cube_core.py` for the paradigm/role vocabulary). `env_interaction_threshold = None` auto-derives one body length per session when unset. With the flag off (default), none of this runs — no GUI invitation, no `session_env_context.json`, no bout-CSV columns; output is byte-identical to a pre-this-feature run. Traced in `cube.py`'s `EnvContextWindow` (opened from `AdvancedCUBEWindow`'s "Environmental Context..." button); `resolve_env_shapes()` resolves one session's effective shape list (reference + per-video transform/override + role_overrides); `compute_session_env_context()` computes per-bin region/object time series, session summaries, and paradigm-gated derived metrics (Y-Maze alternation %, EPM anxiety metrics, Novel Object discrimination index, Three-Chamber sociability/social-novelty indices, Place Preference index). `detect_approach_avoid_events()` (Step 7) is a rule-based sequence-plus-tag detector requiring BOTH `env_features_enabled` and `kinematic_directedness_enabled`. Coordinate-space correctness between traced shapes and pose data is a **structural** guarantee (`EnvContextWindow` reads video frames through the same `dlc_crop_x/y/w/h` rectangle DLC tracked on), not a runtime assertion — see `Environmental_Context_v6_Implementation_Report.md` for why. See `Environmental_Context_v6_Implementation_Plan.md` and `Environmental_Context_v6_Implementation_Report.md` for full detail.
 
 ### Planned 3D dual-camera extension
 

@@ -545,6 +545,33 @@ With `auto_bsoid = True`, completing the 3D DLC step automatically triggers Step
   Kinematic_Transition_v6_Implementation_Plan.md's opt-in guarantee) it never auto-enables based on data
   characteristics the way `consensus_clustering_enabled`'s auto-threshold trigger does.
 
+**Environmental context & object interaction (v6 part 2, opt-in — `env_features_enabled`, default `False`)**
+- Trace an arena boundary, named regions, and named objects on a reference video frame, pick one of six
+  behavioral paradigms (Open Field, Novel Object/Animal Recognition, Y-Maze, Elevated Plus Maze,
+  Three-Chamber Test, Place Preference/CPP) or Custom, and CUBE computes region/object time series and
+  paradigm-specific derived metrics per session — spontaneous alternation % (Y-Maze), open-arm time/entry
+  %/latency (Elevated Plus Maze), discrimination index (Novel Object), sociability/social-novelty indices
+  (Three-Chamber), and preference index (Place Preference/CPP). Configured in `cube.py`'s new
+  `EnvContextWindow` (opened from Advanced Settings' "Environmental Context..." button, itself gated on the
+  `env_features_enabled` checkbox).
+- Off by default: with the checkbox unticked, no GUI invitation to configure it, `session_env_context.json`
+  is never written (not even empty), and bout-CSV output is byte-identical to a pre-this-feature run.
+  Turning the flag on without ever tracing shapes is also a near no-op — empty summaries, no crash.
+- Writes `model/session_env_context.json` (per-bin time series + session summaries + paradigm-gated derived
+  metrics per session — see Output Layout above) and appends region/object columns
+  (`pct_time_in_region_<name>`, `pct_time_near_object_<name>`, `mean_heading_angle_to_object_<name>`) to the
+  same `*_bout_lengths_hmm_enriched.csv` sidecar the kinematics feature above uses — if both flags are on,
+  one sidecar carries both plans' columns with no naming collision.
+- With both `env_features_enabled` and `kinematic_directedness_enabled` on, a rule-based approach/avoid
+  detector additionally writes `<stem>_approach_events.csv` (only when at least one event is detected):
+  flags fast, straight-line ("directed locomotion") bouts immediately followed by a slower
+  investigation-type bout, then reports which traced region/object the approach was heading toward.
+- Coordinate-space correctness (traced shapes vs. pose data) is a structural guarantee, not a runtime
+  check: `EnvContextWindow` always reads video frames through the same crop rectangle DLC tracked on, so
+  traced vertices land in the same pixel space as the pose data by construction.
+- See `Environmental_Context_v6_Implementation_Plan.md` and `Environmental_Context_v6_Implementation_Report.md`
+  for the full schema, paradigm/role vocabulary, and verification detail.
+
 **Iterative split/merge cluster refinement (on by default)**
 - After the HDBSCAN sweep, a bidirectional refinement loop (a) locally re-embeds and re-clusters
   low-mean-silhouette ("impure") clusters that mix distinct behaviours (`hdbscan_split_silhouette_thresh`,
@@ -727,16 +754,27 @@ Both Cluster Hierarchy and Guided Merge require `model/cluster_feature_centroids
 <output_dir>/
   bout_lengths/
     <stem>_bout_lengths.csv / _hmm.csv     ← MLP / HMM bouts (preferred: _hmm)
-    <stem>_bout_lengths_hmm_enriched.csv   ← (if kinematic_directedness_enabled) canonical
-                                              3 columns + net_displacement_px, path_length_px,
-                                              straightness_ratio, mean_speed_px_s,
-                                              heading_consistency; never written by default
+    <stem>_bout_lengths_hmm_enriched.csv   ← (if kinematic_directedness_enabled and/or
+                                              env_features_enabled) SHARED sidecar: canonical
+                                              3 columns + kinematics (net_displacement_px,
+                                              path_length_px, straightness_ratio,
+                                              mean_speed_px_s, heading_consistency) and/or env
+                                              context (pct_time_in_region_<name>,
+                                              pct_time_near_object_<name>,
+                                              mean_heading_angle_to_object_<name>) columns,
+                                              whichever flag(s) are on; never written by default
+    <stem>_approach_events.csv             ← (if BOTH kinematic_directedness_enabled and
+                                              env_features_enabled with traced shapes; only
+                                              written when >=1 event detected)
     <stem>_frame_labels.csv / _hmm.csv     ← per-frame labels
     <stem>_epochs.csv / _hmm.csv
   model/
     bsoid_model.pkl                         ← scaler, UMAP, HDBSCAN, MLP, PCA, config
     umap_embedding.npy
     session_bin_ranges.json
+    session_env_context.json                ← (if env_features_enabled) per-session per-bin
+                                              region/object time series + summaries + paradigm-
+                                              gated derived metrics; not written at all otherwise
     hmm_model.pkl
     feature_config.json                     ← feature_version: "v2" or "v3d"
   plots/
