@@ -4326,6 +4326,16 @@ def compute_session_env_context(env_cfg: "dict | None", stem: str,
     bin_ms: bin width in ms; 100.0 matches session_bin_ranges.json's grid
       everywhere else in this pipeline.
 
+    Additive keys (CUBE_Analyser_Paradigm_Reporting_Plan.md follow-up, "more
+    literature-standard plots" pass): summary["region_roles"]/["object_roles"]
+    (name -> role_or_None), summary["object_interaction_bout_lengths_sec"]
+    (name -> [duration_per_bout,...]), per_bin["dist_to_region_boundary_nose"]
+    (nose-point analog of the existing centroid-based
+    dist_to_region_boundary), and per_bin["nose_outside_boundary"] (fraction
+    of each bin's frames with the nose outside the traced boundary -- only
+    present when a boundary shape was traced). All four are purely additive:
+    no existing key's meaning changed, no signature change.
+
     Returns {} for env_cfg=None (flag off) or empty (schema present, master
     switch on, this session has no reference_shapes traced) -- this is the
     documented no-op contract from the plan's "Opt-in guarantee" section,
@@ -4399,17 +4409,25 @@ def compute_session_env_context(env_cfg: "dict | None", stem: str,
 
     regions  = [s for s in shapes if s["kind"] == "region"]
     objects  = [s for s in shapes if s["kind"] == "object"]
+    boundary = next((s for s in shapes if s["kind"] == "boundary"), None)
 
     # current_region: first region (in trace order) containing the centroid,
     # per frame; None if outside every region. Ties (overlapping regions) go
     # to the first-listed region, a documented deterministic tie-break.
     region_membership = np.full(n_frames, None, dtype=object)
     dist_to_region_boundary = {}
+    dist_to_region_boundary_nose = {}
     for r in regions:
         inside = _points_in_polygon(cx, cy, r["vertices"])
         still_unassigned = region_membership == None  # noqa: E711
         region_membership[inside & still_unassigned] = r["name"]
         dist_to_region_boundary[r["name"]] = _bin_agg(_nearest_edge_distances(cx, cy, r["vertices"]))
+        # Nose-point (not centroid) distance to this region's edge -- mirrors
+        # the per-object nose-distance calc below. Lets callers build a
+        # head-dip / "peering past the edge" proxy for regions (e.g. EPM
+        # open-arm platform edges) the same way object exploration already
+        # uses the nose point instead of the whole-body centroid.
+        dist_to_region_boundary_nose[r["name"]] = _bin_agg(_nearest_edge_distances(nose_x, nose_y, r["vertices"]))
 
     dist_to_nearest_object_nose = {}
     dist_to_nearest_object_paw = {}
@@ -4446,16 +4464,23 @@ def compute_session_env_context(env_cfg: "dict | None", stem: str,
 
     object_interaction_bouts = {}
     total_interaction_time_sec = {}
+    object_interaction_bout_lengths_sec = {}
     for o in objects:
         per_bin_flag = _bin_agg(interacting_by_object[o["name"]].astype(float))
         per_bin_bool = [bool(v) and v >= 0.5 for v in per_bin_flag]
         runs = _run_length_sequence(per_bin_bool)
         object_interaction_bouts[o["name"]] = sum(1 for v, _ in runs if v)
         total_interaction_time_sec[o["name"]] = sum(cnt * bin_dur_sec for v, cnt in runs if v)
+        # Individual bout durations (not just the count/sum above) -- powers
+        # bout-duration distribution plots the analyser couldn't otherwise
+        # build, since the run-length list itself was previously discarded
+        # right after being summed/counted.
+        object_interaction_bout_lengths_sec[o["name"]] = [cnt * bin_dur_sec for v, cnt in runs if v]
 
     per_bin = {
         "current_region": current_region_bins,
         "dist_to_region_boundary": dist_to_region_boundary,
+        "dist_to_region_boundary_nose": dist_to_region_boundary_nose,
         "dist_to_nearest_object_nose": dist_to_nearest_object_nose,
         "dist_to_nearest_object_paw": dist_to_nearest_object_paw,
         "heading_angle_to_nearest_object": heading_angle_to_nearest_object,
@@ -4468,12 +4493,29 @@ def compute_session_env_context(env_cfg: "dict | None", stem: str,
         "centroid_x": _bin_agg(cx),
         "centroid_y": _bin_agg(cy),
     }
+    if boundary is not None:
+        # Fraction of each bin's frames where the nose point fell outside
+        # the traced arena boundary while the animal's body stayed on it --
+        # a geometric head-dip / "peering out" proxy (e.g. EPM open-arm
+        # edges), NOT a validated behavioral classifier. Only computed when
+        # a boundary was actually traced; absent otherwise (no fabricated
+        # zero/false-negative signal for untraced arenas).
+        outside = ~_points_in_polygon(nose_x, nose_y, boundary["vertices"])
+        per_bin["nose_outside_boundary"] = _bin_agg(outside.astype(float))
     summary = {
         "time_in_region_sec": time_in_region_sec,
         "region_entries_count": region_entries_count,
         "object_interaction_bouts": object_interaction_bouts,
         "total_interaction_time_sec": total_interaction_time_sec,
+        "object_interaction_bout_lengths_sec": object_interaction_bout_lengths_sec,
         "interaction_threshold_px": float(interaction_threshold),
+        # Role assignments for every traced region/object, mirrored from the
+        # same role data _compute_env_derived_metrics below already trusts --
+        # lets a downstream caller (the analyser) filter/color by role
+        # (open_arm vs. closed_arm, paired vs. unpaired, etc.) without
+        # re-deriving paradigm logic client-side.
+        "region_roles": {r["name"]: r.get("role") for r in regions},
+        "object_roles": {o["name"]: o.get("role") for o in objects},
     }
 
     derived = _compute_env_derived_metrics(

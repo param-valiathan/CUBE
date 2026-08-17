@@ -217,6 +217,106 @@ class TestComputeSessionEnvContext:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+#  compute_session_env_context -- additive keys (Paradigm Results plots
+#  follow-up: region_roles/object_roles, dist_to_region_boundary_nose,
+#  nose_outside_boundary, object_interaction_bout_lengths_sec)
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestComputeSessionEnvContextAdditiveKeys:
+    FPS = 30.0
+    BODYPARTS = ["nose", "tailbase"]
+
+    def _stationary_xy(self, cx, cy, n_frames, bodyparts=None):
+        n_bp = len(bodyparts) if bodyparts is not None else 2
+        xs = np.full((n_frames, n_bp), cx)
+        ys = np.full((n_frames, n_bp), cy)
+        return xs, ys
+
+    def test_region_and_object_roles_match_input(self):
+        cfg = {"schema_version": 3, "paradigm": "elevated_plus_maze", "reference_stem": "s1",
+               "coord_space": "post_crop",
+               "reference_shapes": {
+                   "boundary": None,
+                   "regions": [{"name": "Open 1", "kind": "region",
+                                "vertices": _square(0, 0, 10), "role": "open_arm"},
+                               {"name": "Closed 1", "kind": "region",
+                                "vertices": _square(100, 0, 10), "role": "closed_arm"}],
+                   "objects": [{"name": "O1", "kind": "object",
+                                "vertices": _square(50, 50, 6), "role": "novel"}]},
+               "per_video": {}}
+        xs, ys = self._stationary_xy(5, 5, 30)
+        out = cc.compute_session_env_context(cfg, "s1", xs, ys, self.BODYPARTS, self.FPS)
+        assert out["summary"]["region_roles"] == {"Open 1": "open_arm", "Closed 1": "closed_arm"}
+        assert out["summary"]["object_roles"] == {"O1": "novel"}
+
+    def test_dist_to_region_boundary_nose_uses_nose_not_centroid(self):
+        # nose offset from the other bodypart (tailbase) by a fixed amount,
+        # so centroid != nose position -> the two boundary-distance series
+        # must differ.
+        region = {"name": "R1", "kind": "region", "vertices": _square(0, 0, 20), "role": None}
+        cfg = {"schema_version": 3, "paradigm": "custom", "reference_stem": "s1",
+               "coord_space": "post_crop",
+               "reference_shapes": {"boundary": None, "regions": [region], "objects": []},
+               "per_video": {}}
+        n = 30
+        nose_xy = (5.0, 5.0)
+        tail_xy = (15.0, 15.0)
+        xs = np.column_stack([np.full(n, nose_xy[0]), np.full(n, tail_xy[0])])
+        ys = np.column_stack([np.full(n, nose_xy[1]), np.full(n, tail_xy[1])])
+        out = cc.compute_session_env_context(cfg, "s1", xs, ys, self.BODYPARTS, self.FPS)
+        centroid_d = out["per_bin"]["dist_to_region_boundary"]["R1"][0]
+        nose_d = out["per_bin"]["dist_to_region_boundary_nose"]["R1"][0]
+        assert centroid_d != pytest.approx(nose_d)
+        # nose sits at (5,5) in a 0-20 square -> 5px to the nearest edge.
+        assert nose_d == pytest.approx(5.0)
+
+    def test_object_interaction_bout_lengths_sum_to_total(self):
+        obj = {"name": "O1", "kind": "object", "vertices": _square(0, 0, 6), "role": None}
+        cfg = {"schema_version": 3, "paradigm": "novel_object", "reference_stem": "s1",
+               "coord_space": "post_crop",
+               "reference_shapes": {"boundary": None, "regions": [], "objects": [obj]},
+               "per_video": {}}
+        # 60 frames (2s @ 30fps): investigate for 1s, leave, investigate again
+        # for 0.5s -- two separate bouts.
+        xs_l = [3.0] * 30 + [200.0] * 15 + [3.0] * 15
+        ys_l = [3.0] * 30 + [200.0] * 15 + [3.0] * 15
+        xs = np.column_stack([xs_l, xs_l])
+        ys = np.column_stack([ys_l, ys_l])
+        out = cc.compute_session_env_context(cfg, "s1", xs, ys, self.BODYPARTS, self.FPS)
+        lengths = out["summary"]["object_interaction_bout_lengths_sec"]["O1"]
+        total = out["summary"]["total_interaction_time_sec"]["O1"]
+        assert len(lengths) == out["summary"]["object_interaction_bouts"]["O1"]
+        assert sum(lengths) == pytest.approx(total)
+
+    def test_nose_outside_boundary_absent_without_traced_boundary(self):
+        cfg = {"schema_version": 3, "paradigm": "custom", "reference_stem": "s1",
+               "coord_space": "post_crop",
+               "reference_shapes": {
+                   "boundary": None,
+                   "regions": [{"name": "R1", "kind": "region",
+                                "vertices": _square(0, 0, 20), "role": None}],
+                   "objects": []},
+               "per_video": {}}
+        xs, ys = self._stationary_xy(5, 5, 30)
+        out = cc.compute_session_env_context(cfg, "s1", xs, ys, self.BODYPARTS, self.FPS)
+        assert "nose_outside_boundary" not in out["per_bin"]
+
+    def test_nose_outside_boundary_flags_nose_exiting_traced_boundary(self):
+        boundary = {"name": "Arena", "kind": "boundary", "vertices": _square(0, 0, 20), "role": None}
+        cfg = {"schema_version": 3, "paradigm": "elevated_plus_maze", "reference_stem": "s1",
+               "coord_space": "post_crop",
+               "reference_shapes": {"boundary": boundary, "regions": [], "objects": []},
+               "per_video": {}}
+        # nose (bodypart 0) pokes outside the 0-20 boundary; tailbase
+        # (bodypart 1) stays well inside -- simulates a head dip.
+        n = 30
+        xs = np.column_stack([np.full(n, 25.0), np.full(n, 10.0)])
+        ys = np.column_stack([np.full(n, 10.0), np.full(n, 10.0)])
+        out = cc.compute_session_env_context(cfg, "s1", xs, ys, self.BODYPARTS, self.FPS)
+        assert out["per_bin"]["nose_outside_boundary"][0] == pytest.approx(1.0)
+
+
+# ──────────────────────────────────────────────────────────────────────────
 #  detect_approach_avoid_events (Step 7)
 # ──────────────────────────────────────────────────────────────────────────
 

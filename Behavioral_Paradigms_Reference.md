@@ -70,7 +70,33 @@ derived from the enriched bout sidecar's `pct_time_in_region_<name>` columns (En
 not recomputed from raw position — so their accuracy is bounded by that column's own accuracy, not an
 independent measurement.
 
-### 2.3 Statistical conventions
+### 2.3 Time-course, ethogram, distribution, and paired plots
+
+A second wave of shared components (added after the initial seven-sub-view build), all built from data
+already present in `session_env_context.json` — no pipeline/schema change was needed for most of them, since
+`compute_session_env_context()` already tracked nose-point distance and per-bin centroid position. Four new
+`region_roles`/`object_roles`/`dist_to_region_boundary_nose`/`nose_outside_boundary`/`object_interaction_
+bout_lengths_sec` keys were added additively (existing keys unchanged) to unlock the rest — see
+`Environmental_Context_v6_Implementation_Report.md`'s addendum for the exact schema.
+
+- **Time-course plots** (`build_timecourse_figure`): mean ± SEM line per experimental group, x-axis = % of
+  trial elapsed (not absolute time, so sessions of different duration still align on one shared axis).
+  Used for: Open Field center-zone %, EPM open-arm %, Discrimination Index / Sociability investigation
+  distance to the role-tagged object, and CPP cumulative chamber crossings.
+- **Region ethogram strip** (`build_region_ethogram_figure`): one horizontal row per session, colored by
+  which region the animal occupied over time — the Y-Maze arm-entry sequence view, mirroring the existing
+  behavior-ethogram's broken-barh visual language.
+- **Bout-duration distribution** (`build_distribution_figure`): overlapping per-group histograms + a rug of
+  individual bout durations underneath — each point is one investigation bout, not one animal. Used for
+  Discrimination Index and Sociability's object-interaction bouts, and Open Field's per-animal mean-speed
+  distribution.
+- **Paired pre/post dumbbell** (`build_paired_dumbbell_figure`): one connecting line per matched subject
+  (Repeated Measures design only) — CPP's pre → post preference-index shift, the standard CPP figure showing
+  individual-animal change rather than only a summary delta.
+- All bar charts in this tab (`_index_bar_fig` and the region/group cross-tab) additionally overlay each
+  individual animal's own value as an unfilled ring on top of its group's bar — not just the mean ± SEM.
+
+### 2.4 Statistical conventions
 
 - **Between-group comparisons** (does the metric differ across experimental groups) reuse
   `run_cluster_statistics()` — Kruskal-Wallis omnibus + Dunn's/Mann-Whitney post-hoc for ≥3 groups, both
@@ -106,7 +132,9 @@ region whose name contains "center" (case-insensitive — see §5.2) and read `p
 enriched sidecar (requires `kinematic_directedness_enabled`).
 
 **Graphs:** whole-arena occupancy heatmap; total-time-in-traced-regions bar (activity control); for
-`open_field` specifically, total distance traveled and center-zone entry frequency; cluster/group cross-tabs.
+`open_field` specifically, total distance traveled, center-zone entry frequency, a center-zone %-time-course
+across the trial (thigmotaxis dynamics, §2.3), and a mean-speed distribution across animals; cluster/group
+cross-tabs.
 
 **Use case:** the default view for any session that isn't one of the five named paradigms, or a mixed/pilot
 cohort where no formal paradigm applies yet. Useful as a first-pass spatial sanity check before committing
@@ -129,7 +157,8 @@ distance-traveled control matters for the study design — it is not retroactive
 **Graphs:** per-arm occupancy heatmap; spontaneous alternation % bar (between-group); total arm entries bar
 (mandatory activity control, tested as a **separate** comparison from alternation %, per the field's
 standard practice — an alternation difference confounded by an entries difference is a common review
-objection); cluster/group cross-tabs.
+objection); an arm-entry sequence strip (§2.3), one row per session, colored by which arm (or the hub, shown
+in gray) the animal occupied over time; cluster/group cross-tabs.
 
 **Use case:** spatial working-memory assessment — spontaneous alternation % is the field-standard
 readout, computed from the region-entry sequence with the hub excluded (`_region_entry_sequence`,
@@ -152,7 +181,10 @@ running the pipeline — this cannot be corrected after the fact in the Analyser
 **Graphs:** open- vs. closed-arm occupancy heatmap; % time in open arms, % open-arm entries, and latency to
 first open-arm entry (three separate bars); total arm entries bar (mandatory locomotor control — the single
 most common EPM criticism in review is an anxiolytic-looking effect that is actually a locomotor confound);
-cluster/group cross-tabs.
+an open-arm %-time-course across the trial (§2.3); a "head-dip / peering-out" bar — the mean fraction of
+time the nose point fell outside the traced arena boundary while the body stayed on it (only shown when a
+boundary shape was traced) — a **geometric proxy, not a validated head-dip or stretch-attend-posture
+classifier**, using the new `nose_outside_boundary` per-bin key; cluster/group cross-tabs.
 
 **Use case:** unconditioned anxiety-like behavior assay. All three primary metrics are reported
 independently rather than folded into one index, since the literature does not treat them as
@@ -161,7 +193,11 @@ interchangeable (time, entries, and latency can dissociate).
 **Shortcomings:** same role-tagging dependency as Y-Maze; additionally, the current occupancy heatmap
 approximation (§2.1) is least informative for EPM specifically, since the true arm geometry (narrow,
 elongated, meeting at a central platform) is exactly the kind of non-convex shape a convex hull represents
-poorly.
+poorly. The head-dip/peering-out bar is a cheap geometric proxy (nose crossed the traced boundary edge,
+body didn't) added because nose-point tracking was already available for objects but not applied to region
+boundaries — it is **not** a validated stretch-attend-posture or head-dip behavioral classifier, and full
+posture-based SAP detection remains explicitly out of scope (deferred, along with the Y-Maze novel-arm
+variant).
 
 **Suggestions:** trace open and closed arms as separate, non-overlapping region polygons even though they
 physically share the central platform edge, so entry/exit counting is unambiguous; treat the drawn "(approx.)"
@@ -176,7 +212,10 @@ outline as directional guidance only, not a substitute for reviewing the raw tra
 between-group and one-sample-against-chance (0.0 — the field-standard test, since a discrimination index of
 0 is the null expectation of no preference); total exploration time across both objects (mandatory validity
 control — low total exploration makes the index statistically unreliable regardless of its point estimate,
-and is routinely reported alongside it in the literature); cluster/group cross-tabs.
+and is routinely reported alongside it in the literature); a nose-to-novel-object investigation-distance
+time-course across the trial (§2.3, lower = closer investigation); an investigation bout-duration
+distribution (each point is one bout, not one animal); a latency-to-first-contact bar; cluster/group
+cross-tabs.
 
 **Use case:** recognition-memory assay. The one-sample-vs-chance test is the primary scientific claim this
 paradigm makes ("did this group show discrimination at all") — the between-group test is secondary
@@ -201,7 +240,12 @@ and camera setup before trusting the index.
 **Graphs:** per-chamber occupancy heatmap, one panel per phase (never pooled — pooling phase 1 and phase 2
 together conflates two distinct hypotheses, a design choice made explicitly in the plan); Phase 1
 sociability index and Phase 2 social-novelty index as two **independently** tested bars, each against chance
-(0.0); chamber entry frequency (mandatory activity control); cluster/group cross-tabs.
+(0.0); chamber entry frequency (mandatory activity control); a nose-to-stranger investigation-distance
+time-course across the trial (§2.3) **in place of** a chamber-occupancy time-course — this paradigm's role
+vocabulary is on the traced objects (stranger/empty/novel_stranger), not the chamber regions, so a
+role-filtered %-time-in-chamber-over-time isn't available the way EPM's open/closed-arm time-course is; an
+investigation bout-duration distribution; a latency-to-first-contact-with-stranger bar; cluster/group
+cross-tabs.
 
 **Use case:** social-approach and social-novelty-preference assays, the two classically dissociated
 sub-questions the three-chamber paradigm is designed to separate.
@@ -225,7 +269,9 @@ paradigm-specific tracing error to watch for in this tab.
 preference was uniform across the chamber or concentrated near the paired-side cue); preference index bar,
 tested both one-sample-against-zero (delta/CPP-score) and between-group; when "Experimental Design" is set
 to Repeated Measures with a genuine pre-test phase, an additional paired pre/post comparison
-(`run_cluster_statistics(design="repeated")`); cluster/group cross-tabs.
+(`run_cluster_statistics(design="repeated")`) **and** a paired pre → post dumbbell plot (§2.3, one line per
+matched subject — the standard CPP figure for individual-animal change); a cumulative chamber-crossing
+time-course across the trial (activity control, shown for every design); cluster/group cross-tabs.
 
 **Use case:** conditioned place preference/aversion — the paired pre/post design is the field-standard,
 strongest form of this assay (baseline-corrected, within-subject); the between-group post-test-only
@@ -298,6 +344,16 @@ paradigm:
    paradigm's "stranger" role is a static object/cup, not a second tracked animal — CUBE has no
    dyadic/multi-animal pose tracking (see `Competitive_Positioning_and_Publication_Pathway.md` for how this
    compares to MARS's dedicated social-interaction focus).
+7. **Nose-point tracking reaches region boundaries only through the new, narrow additions above** (EPM's
+   head-dip proxy, `dist_to_region_boundary_nose`) — region/arm *occupancy* itself (which region "counts" as
+   the animal's location, feeding alternation %, time-in-region, entries) remains centroid-based throughout,
+   unchanged by this pass. Only object interaction (discrimination index, sociability index, exploration
+   bout timing) was ever nose-based. Don't read the new EPM head-dip bar as evidence that region membership
+   generally became nose-aware — it didn't.
+8. **Three-Chamber has no chamber-occupancy time-course** (§3.5) — a direct consequence of its role
+   vocabulary living on objects, not regions. This is a data-model constraint discovered while building the
+   time-course plots, not an oversight; the nose-to-stranger investigation-distance time-course is the
+   literature-relevant substitute this paradigm's data actually supports.
 
 ---
 

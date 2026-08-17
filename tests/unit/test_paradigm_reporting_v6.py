@@ -136,6 +136,35 @@ class TestAggregateRegionTimeByLabel:
         assert agg == {0: {}}
 
 
+class TestAggregateRegionTimeByLabelAndAnimal:
+    def test_two_animals_same_label_kept_independent(self):
+        rows = [
+            {"label": "Control", "animal": "M1", "run_length": 100,
+             "pct_time_in_region": {"arm_A": 1.0, "arm_B": 0.0}},
+            {"label": "Control", "animal": "M2", "run_length": 100,
+             "pct_time_in_region": {"arm_A": 0.0, "arm_B": 1.0}},
+        ]
+        out = ca.aggregate_region_time_by_label_and_animal(rows, ["arm_A", "arm_B"])
+        assert out["Control"]["M1"]["arm_A"] == pytest.approx(1.0)
+        assert out["Control"]["M2"]["arm_A"] == pytest.approx(0.0)
+        # per-animal values must NOT be averaged into a single pooled entry --
+        # that's what aggregate_region_time_by_label already does.
+        assert set(out["Control"].keys()) == {"M1", "M2"}
+
+    def test_one_animal_multiple_rows_weighted_mean_matches_pooled(self):
+        rows = [
+            {"label": 0, "animal": "M1", "run_length": 100,
+             "pct_time_in_region": {"arm_A": 1.0}},
+            {"label": 0, "animal": "M1", "run_length": 300,
+             "pct_time_in_region": {"arm_A": 0.0}},
+        ]
+        out = ca.aggregate_region_time_by_label_and_animal(rows, ["arm_A"])
+        assert out[0]["M1"]["arm_A"] == pytest.approx(0.25)
+
+    def test_empty_rows_returns_empty_dict(self):
+        assert ca.aggregate_region_time_by_label_and_animal([], ["arm_A"]) == {}
+
+
 class TestApproximateRegionOutline:
     def test_fewer_than_three_points_returns_empty(self):
         cx = np.array([1.0, 2.0])

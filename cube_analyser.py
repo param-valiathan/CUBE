@@ -17913,8 +17913,9 @@ def approximate_region_outline(cx: np.ndarray, cy: np.ndarray,
 
 
 def build_occupancy_heatmap_figure(xy_list: list, outlines: "list | None" = None,
-                                    bins: int = 40, t: "dict | None" = None,
-                                    title: str = "") -> "plt.Figure":
+                                    bins: int = 60, t: "dict | None" = None,
+                                    title: str = "", smooth_sigma: float = 1.4
+                                    ) -> "plt.Figure":
     """Whole-arena 2D occupancy density heatmap.
 
     xy_list  : list of (x_array, y_array) pairs, pooled into one 2D
@@ -17923,6 +17924,12 @@ def build_occupancy_heatmap_figure(xy_list: list, outlines: "list | None" = None
     outlines : optional list of (name, kind, vertex_list) tuples drawn as
       outline overlays (kind in {"boundary","region","object"} controls
       line style). See module note above re: approximate outlines.
+    smooth_sigma : Gaussian smoothing bandwidth, in histogram-bin units,
+      applied to the raw 2D histogram before rendering. Raw per-bin counts
+      are blocky/noisy at any bin count fine enough to resolve arena
+      structure; smoothing turns that into the gradual density gradient
+      standard in published occupancy plots, without changing the
+      underlying spatial resolution (bins) itself.
     """
     if t is None:
         t = T()
@@ -17945,11 +17952,39 @@ def build_occupancy_heatmap_figure(xy_list: list, outlines: "list | None" = None
         ax.set_facecolor(t["ax_bg"])
         if len(all_x) >= 2 and len(all_y) >= 2:
             h, xedges, yedges = np.histogram2d(all_x, all_y, bins=bins)
-            im = ax.imshow(h.T, origin="lower",
+            h = h.T
+            try:
+                from scipy.ndimage import gaussian_filter as _gfilt
+                h = _gfilt(h, sigma=smooth_sigma, mode="nearest")
+            except ImportError:
+                pass
+            # Express as a probability density (sums to 1) rather than raw
+            # bin counts -- comparable across heatmaps pooling different
+            # numbers of sessions/frames, and a single hot bin no longer
+            # dominates the color scale after smoothing spreads it out.
+            total = h.sum()
+            if total > 0:
+                h = h / total
+            # Clip the color ceiling to a high percentile of the smoothed,
+            # non-zero density rather than its raw max: with Gaussian
+            # smoothing the max is usually one central bin, so scaling to
+            # it compresses the rest of the gradient into a narrow band.
+            nonzero = h[h > 0]
+            vmax = float(np.percentile(nonzero, 99)) if nonzero.size else None
+            im = ax.imshow(h, origin="lower",
                             extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
-                            aspect="auto", cmap="viridis")
+                            aspect="auto", cmap="viridis", vmin=0, vmax=vmax,
+                            interpolation="bilinear")
+            try:
+                levels = np.linspace(0, vmax, 5)[1:] if vmax else None
+                if levels is not None and levels[0] > 0:
+                    ax.contour(h, levels=levels, colors=edge_color, alpha=0.18,
+                               linewidths=0.6,
+                               extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]])
+            except Exception:
+                pass
             cb = fig.colorbar(im, cax=cax)
-            cb.set_label("Relative occupancy (bin count)", color=t["tick"])
+            cb.set_label("Relative occupancy (density)", color=t["tick"])
             cb.ax.yaxis.set_tick_params(color=t["tick"])
             plt.setp(cb.ax.get_yticklabels(), color=t["tick"])
         else:
@@ -18086,10 +18121,42 @@ def aggregate_region_time_by_label(rows: list, region_names: list) -> dict:
     return out
 
 
+def aggregate_region_time_by_label_and_animal(rows: list, region_names: list) -> dict:
+    """Same weighted-mean %-time-in-region computation as
+    aggregate_region_time_by_label, but broken out per animal within each
+    label -- one weighted-mean value per (label, animal) pair, rather than
+    one pooled value per label. Powers the individual-point overlay on
+    build_region_crosstab_figure: each animal contributes one ring per
+    region/label bar instead of the bars showing only a pooled mean with no
+    visible spread.
+
+    rows : same shape as aggregate_region_time_by_label's rows, plus a
+      required "animal" key (an animal/session identifier).
+    Returns {label: {animal: {region_name: weighted_mean_pct}}}.
+    """
+    by_label_animal: dict = {}
+    for r in rows or []:
+        lbl = r.get("label")
+        animal = r.get("animal")
+        by_label_animal.setdefault(lbl, {}).setdefault(animal, []).append(r)
+    out: dict = {}
+    for lbl, animals in by_label_animal.items():
+        out[lbl] = {}
+        for animal, animal_rows in animals.items():
+            agg = aggregate_region_time_by_label(animal_rows, region_names)
+            # animal_rows all share the same "label" by construction, so
+            # aggregate_region_time_by_label collapses to a single entry.
+            per_region = next(iter(agg.values()), None)
+            if per_region is not None:
+                out[lbl][animal] = per_region
+    return out
+
+
 def build_region_crosstab_figure(agg: dict, region_names: list,
                                   color_map: "dict | None" = None,
                                   t: "dict | None" = None, title: str = "",
-                                  legend_title: str = "Cluster") -> "plt.Figure":
+                                  legend_title: str = "Cluster",
+                                  per_animal: "dict | None" = None) -> "plt.Figure":
     """Grouped bar chart: x = region, one bar series per label (cluster id
     or exp_group), y = weighted-mean % time in that region. Shared by every
     sub-view per the plan's "Arena/region-based cluster and group analysis"
@@ -18107,13 +18174,40 @@ def build_region_crosstab_figure(agg: dict, region_names: list,
             n_lbl = len(labels)
             width = 0.8 / n_lbl
             x = np.arange(len(region_names))
+            ax.set_axisbelow(True)
+            ax.grid(axis="y", color=t["spine"], alpha=0.35, linewidth=0.7)
+            rng = np.random.default_rng(7)
+            max_val = 0.0
             for i, lbl in enumerate(labels):
                 vals = [agg[lbl].get(rn, 0.0) for rn in region_names]
-                ax.bar(x + i * width - 0.4 + width / 2, vals, width=width,
-                       color=color_map.get(lbl, PALETTE[i % len(PALETTE)]),
+                bar_x = x + i * width - 0.4 + width / 2
+                ax.bar(bar_x, vals, width=width,
+                       color=color_map.get(lbl, PALETTE[i % len(PALETTE)]), alpha=0.82,
+                       edgecolor=t["ax_bg"], linewidth=0.6,
                        label=str(lbl))
+                max_val = max(max_val, max(vals, default=0.0))
+                # Individual per-animal points (unfilled rings) -- one ring
+                # per animal's own weighted-mean % time in this region, at
+                # this label's bar. Edge is the theme's tick color (not the
+                # group color): a same-hue ring on a same-hue bar has too
+                # little contrast to read as a ring rather than a solid dot
+                # once the point falls below the bar's own height -- found
+                # by rendering this exact case during QA -- so a neutral,
+                # always-contrasting edge is used instead.
+                if per_animal and lbl in per_animal:
+                    for ri, rn in enumerate(region_names):
+                        pts = [av.get(rn) for av in per_animal[lbl].values()
+                               if rn in av]
+                        if not pts:
+                            continue
+                        jit = rng.uniform(-width * 0.3, width * 0.3, len(pts))
+                        ax.scatter(bar_x[ri] + jit, pts, facecolors="none",
+                                   edgecolors=t["tick"], s=18, linewidths=0.7,
+                                   alpha=0.85, zorder=4)
+                        max_val = max(max_val, max(pts, default=0.0))
             ax.set_xticks(x)
             ax.set_xticklabels(region_names, color=t["tick"])
+            ax.set_ylim(top=max_val * 1.15 if max_val > 0 else 1.0)
             leg = ax.legend(title=legend_title, fontsize=8, facecolor=t["card"],
                              edgecolor=t["border"], labelcolor=t["tick"])
             leg.get_title().set_color(t["tick"])
@@ -18123,8 +18217,253 @@ def build_region_crosstab_figure(agg: dict, region_names: list,
         ax.set_ylabel("% time in region", color=t["tick"])
         ax.set_title(title, color=t["tick"], fontsize=12)
         ax.tick_params(colors=t["tick"])
-        for spine in ax.spines.values():
-            spine.set_color(t["spine"])
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(t["spine"])
+        fig.tight_layout()
+    return fig
+
+
+def _run_length_segments(values: list, bin_dur_sec: float):
+    """Collapse a per-bin categorical sequence into (start_sec, dur_sec,
+    value) run segments -- the ethogram-strip analog of cube_core.py's
+    _run_length_sequence (this module has no cross-import on cube_core.py,
+    per the project's file-responsibility split, so this is a small local
+    equivalent rather than a shared import)."""
+    segs = []
+    i, n = 0, len(values)
+    while i < n:
+        v = values[i]
+        j = i + 1
+        while j < n and values[j] == v:
+            j += 1
+        segs.append((i * bin_dur_sec, (j - i) * bin_dur_sec, v))
+        i = j
+    return segs
+
+
+def build_timecourse_figure(series_by_group: dict, xlabel: str, ylabel: str,
+                             t: "dict | None" = None, title: str = "",
+                             color_map: "dict | None" = None) -> "plt.Figure":
+    """Mean +/- SEM line-per-group plot over a shared x-axis (already binned
+    /aggregated by the caller -- e.g. % of trial elapsed). Powers every
+    "X over time" plot in this tab (center/periphery %, open/closed-arm %,
+    chamber %, investigation distance, cumulative crossings) via one shared
+    builder rather than one bespoke function per paradigm.
+
+    series_by_group : {group: (x_array, mean_array, sem_array)}, all three
+      arrays the same length within a group (different groups may have
+      different window counts if callers bin by %-of-trial per session).
+    """
+    if t is None:
+        t = T()
+    groups = list(series_by_group.keys())
+    if color_map is None:
+        color_map = {g: PALETTE[i % len(PALETTE)] for i, g in enumerate(groups)}
+    with plt.style.context(t["mpl_style"]):
+        fig, ax = plt.subplots(figsize=(7.5, 4.8), facecolor=t["fig_bg"])
+        ax.set_facecolor(t["ax_bg"])
+        ax.set_axisbelow(True)
+        ax.grid(axis="y", color=t["spine"], alpha=0.3, linewidth=0.6)
+        y_max = 0.0
+        y_min = 0.0
+        if groups:
+            for g in groups:
+                x, mean, sem = series_by_group[g]
+                x = np.asarray(x, dtype=float)
+                mean = np.asarray(mean, dtype=float)
+                sem = np.asarray(sem, dtype=float)
+                ec = color_map.get(g, PALETTE[0])
+                ax.plot(x, mean, color=ec, lw=1.8, label=str(g), zorder=3)
+                ax.fill_between(x, mean - sem, mean + sem, color=ec, alpha=0.18,
+                                 linewidth=0, zorder=2)
+                if mean.size:
+                    y_max = max(y_max, float(np.nanmax(mean + sem)))
+                    y_min = min(y_min, float(np.nanmin(mean - sem)))
+            span = max(y_max - y_min, 1e-9)
+            # Headroom reserved specifically for the legend, so it never
+            # sits on top of the last few data points (this plot commonly
+            # has its highest values near the trial's end/start).
+            ax.set_ylim(y_min - span * 0.05, y_max + span * 0.35)
+            leg = ax.legend(fontsize=8, facecolor=t["card"], edgecolor=t["border"],
+                             labelcolor=t["tick"], loc="upper right")
+        else:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                    color=t["muted"], transform=ax.transAxes)
+        ax.set_xlabel(xlabel, color=t["tick"])
+        ax.set_ylabel(ylabel, color=t["tick"])
+        ax.set_title(title, color=t["tick"], fontsize=12)
+        ax.tick_params(colors=t["tick"])
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(t["spine"])
+        fig.tight_layout()
+    return fig
+
+
+def build_region_ethogram_figure(rows: list, region_color_map: "dict | None" = None,
+                                  t: "dict | None" = None, title: str = ""
+                                  ) -> "plt.Figure":
+    """Categorical raster (one horizontal row per session), colored by
+    current_region per bin -- mirrors build_combined_ethogram_figure's
+    visual language (~L6843: banded background + broken_barh segments +
+    per-category legend) applied to region membership instead of behavior
+    labels. Powers the Y-Maze arm-entry sequence strip.
+
+    rows : list of {"name": str, "regions": [region_name_or_None, ...],
+                     "bin_dur_sec": float}, one per session.
+    """
+    if t is None:
+        t = T()
+    rows = [r for r in rows if r.get("regions")]
+    if not rows:
+        fig, ax = plt.subplots(figsize=(10, 2), facecolor=t["fig_bg"] if t else "#0d0d1a")
+        ax.text(0.5, 0.5, "No region-sequence data", ha="center", va="center",
+                color=t["muted"], transform=ax.transAxes)
+        _style_ax(ax, t)
+        return fig
+    all_region_names = sorted({rn for r in rows for rn in r["regions"] if rn is not None})
+    if region_color_map is None:
+        region_color_map = {rn: PALETTE[i % len(PALETTE)] for i, rn in enumerate(all_region_names)}
+    n_rows = len(rows)
+    fig_h = max(2.5, n_rows * 0.55 + 1.2)
+    with plt.style.context(t["mpl_style"]):
+        fig, ax = plt.subplots(figsize=(11, fig_h), facecolor=t["fig_bg"])
+        ax.set_facecolor(t["ax_bg"])
+        yticks, ylabels = [], []
+        max_t = 0.0
+        for row_i, r in enumerate(rows):
+            y = n_rows - 1 - row_i
+            segs = _run_length_segments(r["regions"], r["bin_dur_sec"])
+            dur = sum(d for _, d, _ in segs)
+            max_t = max(max_t, dur)
+            ax.barh(y, dur, left=0, height=0.7, color=t["track_bg"], alpha=0.4, zorder=0)
+            for start, d, val in segs:
+                if val is None:
+                    continue
+                ax.broken_barh([(start, d)], (y - 0.32, 0.64),
+                               facecolors=region_color_map.get(val, t["muted"]),
+                               alpha=0.92, zorder=1)
+            yticks.append(y)
+            ylabels.append(r["name"])
+        ax.set_yticks(yticks)
+        ax.set_yticklabels(ylabels, fontsize=8.5, color=t["tick"])
+        ax.set_xlim(0, max(max_t, 1e-9))
+        ax.set_ylim(-0.6, n_rows - 0.4)
+        ax.set_xlabel("Time (s)", color=t["tick"])
+        handles = [mpatches.Patch(color=region_color_map[rn], label=rn) for rn in all_region_names]
+        leg = ax.legend(handles=handles, fontsize=8, facecolor=t["card"],
+                         edgecolor=t["border"], labelcolor=t["tick"],
+                         loc="upper right", framealpha=0.85)
+        ax.set_title(title, color=t["tick"], fontsize=12)
+        ax.tick_params(colors=t["tick"])
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(t["spine"])
+        fig.tight_layout()
+    return fig
+
+
+def build_paired_dumbbell_figure(pairs: list, ylabel: str,
+                                  t: "dict | None" = None, title: str = "",
+                                  color_map: "dict | None" = None) -> "plt.Figure":
+    """One connecting line per matched subject, from a pre-value to a
+    post-value, colored by group -- the standard CPP pre/post figure.
+
+    pairs : list of {"subject_id": str, "group": str, "pre": float,
+                      "post": float}.
+    """
+    if t is None:
+        t = T()
+    pairs = [p for p in pairs if np.isfinite(p.get("pre", np.nan))
+             and np.isfinite(p.get("post", np.nan))]
+    groups = list(dict.fromkeys(p["group"] for p in pairs))
+    if color_map is None:
+        color_map = {g: PALETTE[i % len(PALETTE)] for i, g in enumerate(groups)}
+    with plt.style.context(t["mpl_style"]):
+        fig, ax = plt.subplots(figsize=(5.5, 5.0), facecolor=t["fig_bg"])
+        ax.set_facecolor(t["ax_bg"])
+        ax.set_axisbelow(True)
+        ax.grid(axis="y", color=t["spine"], alpha=0.3, linewidth=0.6)
+        if pairs:
+            all_vals = []
+            for p in pairs:
+                ec = color_map.get(p["group"], PALETTE[0])
+                ax.plot([0, 1], [p["pre"], p["post"]], color=ec, alpha=0.7,
+                         lw=1.3, marker="o", markersize=5,
+                         markerfacecolor=t["ax_bg"], markeredgecolor=ec,
+                         markeredgewidth=1.2, zorder=3)
+                all_vals += [p["pre"], p["post"]]
+            span = max(max(all_vals) - min(all_vals), 1e-9)
+            ax.set_ylim(min(all_vals) - span * 0.08, max(all_vals) + span * 0.3)
+            handles = [mpatches.Patch(color=color_map[g], label=g) for g in groups]
+            ax.legend(handles=handles, fontsize=8, facecolor=t["card"],
+                       edgecolor=t["border"], labelcolor=t["tick"], loc="upper right")
+        else:
+            ax.text(0.5, 0.5, "No matched pre/post subjects", ha="center", va="center",
+                    color=t["muted"], transform=ax.transAxes)
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(["Pre", "Post"], color=t["tick"])
+        ax.set_xlim(-0.3, 1.3)
+        ax.set_ylabel(ylabel, color=t["tick"])
+        ax.set_title(title, color=t["tick"], fontsize=12)
+        ax.tick_params(colors=t["tick"])
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(t["spine"])
+        fig.tight_layout()
+    return fig
+
+
+def build_distribution_figure(values_by_group: dict, xlabel: str,
+                               t: "dict | None" = None, title: str = "",
+                               color_map: "dict | None" = None) -> "plt.Figure":
+    """Overlapping per-group histograms with an individual-value rug strip
+    beneath -- powers object-interaction bout-duration distributions and
+    the open-field speed distribution."""
+    if t is None:
+        t = T()
+    groups = [g for g, vs in values_by_group.items() if vs]
+    if color_map is None:
+        color_map = {g: PALETTE[i % len(PALETTE)] for i, g in enumerate(groups)}
+    with plt.style.context(t["mpl_style"]):
+        fig, ax = plt.subplots(figsize=(7.0, 4.5), facecolor=t["fig_bg"])
+        ax.set_facecolor(t["ax_bg"])
+        ax.set_axisbelow(True)
+        ax.grid(axis="y", color=t["spine"], alpha=0.3, linewidth=0.6)
+        if groups:
+            all_vals = [v for g in groups for v in values_by_group[g]]
+            n_bins = min(20, max(5, int(len(all_vals) ** 0.5) + 3))
+            bin_edges = np.linspace(min(all_vals), max(all_vals), n_bins + 1) \
+                if max(all_vals) > min(all_vals) else 10
+            for g in groups:
+                ec = color_map.get(g, PALETTE[0])
+                ax.hist(values_by_group[g], bins=bin_edges, color=ec, alpha=0.45,
+                         edgecolor=ec, linewidth=1.0, label=str(g), zorder=2)
+            y0, y1 = ax.get_ylim()
+            rug_y = -0.03 * y1
+            for g in groups:
+                ec = color_map.get(g, PALETTE[0])
+                ax.scatter(values_by_group[g], [rug_y] * len(values_by_group[g]),
+                           marker="|", color=ec, alpha=0.8, zorder=3)
+            ax.set_ylim(rug_y * 1.6, y1 * 1.15)
+            ax.legend(fontsize=8, facecolor=t["card"], edgecolor=t["border"],
+                       labelcolor=t["tick"], loc="upper right")
+        else:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                    color=t["muted"], transform=ax.transAxes)
+        ax.set_xlabel(xlabel, color=t["tick"])
+        ax.set_ylabel("Count", color=t["tick"])
+        ax.set_title(title, color=t["tick"], fontsize=12)
+        ax.tick_params(colors=t["tick"])
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(t["spine"])
         fig.tight_layout()
     return fig
 
@@ -18136,37 +18475,69 @@ PARADIGM_METRIC_DOC = {
                 "traced and labeled. Double-check that shape roles (e.g. which "
                 "object is 'novel,' which arm is a choice-arm vs. the center "
                 "hub) were assigned correctly — the calculation trusts your "
-                "labeling and can't detect a mislabeled shape on its own."),
+                "labeling and can't detect a mislabeled shape on its own.\n\n"
+                "Also shown (Open Field): a center-zone %-time-in-center time "
+                "course across the trial (thigmotaxis dynamics, not just a "
+                "single trial-total number) and a mean-speed distribution "
+                "across animals."),
     "Y-Maze Alternation": ("This metric is computed directly from the regions/"
                 "objects you traced and labeled. Double-check that shape roles "
                 "(e.g. which object is 'novel,' which arm is a choice-arm vs. "
                 "the center hub) were assigned correctly — the calculation "
                 "trusts your labeling and can't detect a mislabeled shape on "
-                "its own."),
+                "its own.\n\nAlso shown: an arm-entry sequence strip, one row "
+                "per session, colored by which arm (or the hub, shown in "
+                "gray) the animal occupied over time — a direct look at "
+                "alternation quality, not just the summary %."),
     "Elevated Plus Maze": ("This metric is computed directly from the regions/"
                 "objects you traced and labeled. Double-check that shape roles "
                 "(e.g. which object is 'novel,' which arm is a choice-arm vs. "
                 "the center hub) were assigned correctly — the calculation "
                 "trusts your labeling and can't detect a mislabeled shape on "
-                "its own."),
+                "its own.\n\nAlso shown: an open-arm %-time-course across the "
+                "trial, and a 'head-dip / peering-out' bar — the mean fraction "
+                "of time the nose point fell outside your traced arena "
+                "boundary. This is a GEOMETRIC PROXY only (nose crossed the "
+                "traced edge while the body didn't), not a validated head-dip "
+                "or stretch-attend-posture classifier — treat it as a "
+                "starting point for review, not a confirmed behavioral "
+                "measure, and note it only appears when a boundary shape was "
+                "traced for these sessions."),
     "Discrimination Index": ("This metric is computed directly from the "
                 "regions/objects you traced and labeled. Double-check that "
                 "shape roles (e.g. which object is 'novel,' which arm is a "
                 "choice-arm vs. the center hub) were assigned correctly — the "
                 "calculation trusts your labeling and can't detect a "
-                "mislabeled shape on its own."),
+                "mislabeled shape on its own.\n\nAlso shown: nose-to-novel-"
+                "object distance over time (lower = closer investigation), "
+                "an investigation bout-duration distribution (each point is "
+                "one bout, not one animal), and latency to first contact "
+                "with either object."),
     "Sociability / Social Novelty": ("This metric is computed directly from "
                 "the regions/objects you traced and labeled. Double-check "
                 "that shape roles (e.g. which object is 'novel,' which arm is "
                 "a choice-arm vs. the center hub) were assigned correctly — "
                 "the calculation trusts your labeling and can't detect a "
-                "mislabeled shape on its own."),
+                "mislabeled shape on its own.\n\nAlso shown: nose-to-stranger "
+                "distance over time and an investigation bout-duration "
+                "distribution, in place of a chamber-occupancy time course — "
+                "this paradigm's role vocabulary (stranger/empty/novel_"
+                "stranger) is on the traced OBJECTS, not the chamber regions, "
+                "so a role-filtered %-time-in-chamber-over-time isn't "
+                "available the way it is for EPM's open/closed arms; "
+                "investigation distance is the literature-relevant substitute "
+                "this data model supports. Also shown: latency to first "
+                "contact with the stranger."),
     "Place Preference / CPP": ("This metric is computed directly from the "
                 "regions/objects you traced and labeled. Double-check that "
                 "shape roles (e.g. which object is 'novel,' which arm is a "
                 "choice-arm vs. the center hub) were assigned correctly — the "
                 "calculation trusts your labeling and can't detect a "
-                "mislabeled shape on its own."),
+                "mislabeled shape on its own.\n\nAlso shown (Repeated "
+                "Measures only): a paired pre → post dumbbell plot, one line "
+                "per matched subject — requires Label 3 / Animal ID set "
+                "consistently across both phases. And, for every design: a "
+                "cumulative chamber-crossing time course (activity control)."),
     "Approach/Avoid Events": ("This is an automated, rule-based estimate of "
                 "when the animal appeared to move directly toward a traced "
                 "region or object. It has not yet been validated against "
@@ -18389,9 +18760,11 @@ class ParadigmResultsPanel(ctk.CTkFrame):
     # ── Data loading (checkpoint b) ─────────────────────────────────────
 
     def _group_by_key(self) -> str:
-        return {"Label 1": "label1", "Label 2": "label2",
-                "Label 3 / Animal ID": "label3", "All Labels": "all"}.get(
-            self._group_by_var.get(), "label1")
+        # Reuse the exact same mapping UnbiasedAnalyticsPanel/Behavioral
+        # Explorer use (AnimalListPanel._label_key_to_str), instead of a
+        # second, independent copy of the same dict that could silently
+        # drift from theirs if the label vocabulary ever changes.
+        return AnimalListPanel._label_key_to_str(self._group_by_var.get())
 
     def _load_sessions(self) -> list:
         """Build one dict per loaded animal with every v6 data source
@@ -18561,6 +18934,7 @@ class ParadigmResultsPanel(ctk.CTkFrame):
             for _, r in df.iterrows():
                 pct = {c[len("pct_time_in_region_"):]: r[c] for c in region_cols}
                 rows.append({"label": int(r.get("B-SOiD labels", -1)),
+                             "animal": s["name"],
                              "run_length": float(r.get("Run lengths", 0.0)),
                              "pct_time_in_region": pct})
         return rows
@@ -18575,6 +18949,7 @@ class ParadigmResultsPanel(ctk.CTkFrame):
             for _, r in df.iterrows():
                 pct = {c[len("pct_time_in_region_"):]: r[c] for c in region_cols}
                 rows.append({"label": s["exp_group"],
+                             "animal": s["name"],
                              "run_length": float(r.get("Run lengths", 0.0)),
                              "pct_time_in_region": pct})
         return rows
@@ -18596,18 +18971,301 @@ class ParadigmResultsPanel(ctk.CTkFrame):
             # so a cluster's color here matches Unbiased Analytics/Cluster
             # Hierarchy for the same loaded session.
             cl_color_map = {cid: _cluster_identity_color(cid) for cid in cl_agg}
+            cl_per_animal = aggregate_region_time_by_label_and_animal(cl_rows, region_names)
             figs.append(build_region_crosstab_figure(
                 cl_agg, region_names, color_map=cl_color_map, t=t,
-                legend_title="Cluster",
+                legend_title="Cluster", per_animal=cl_per_animal,
                 title="Cluster-by-region occupancy (% time)"))
         grp_rows = self._crosstab_rows_by_group(sessions)
         grp_agg = aggregate_region_time_by_label(grp_rows, region_names)
         if grp_agg:
+            grp_per_animal = aggregate_region_time_by_label_and_animal(grp_rows, region_names)
             figs.append(build_region_crosstab_figure(
                 grp_agg, region_names, color_map=self._eg_color_map(sessions),
-                t=t, legend_title="Group",
+                t=t, legend_title="Group", per_animal=grp_per_animal,
                 title="Group-by-region occupancy (% time)"))
         return figs
+
+    # ── Data-prep helpers for the new time-course/distribution/paired plots
+    # (analyser-side only -- built entirely from per_bin/summary already in
+    # env_ctx, no cube_core.py involvement beyond the additive keys) ──────
+
+    def _window_bin_edges(self, n_bins: int, n_windows: int) -> list:
+        """n_windows+1 bin-index edges splitting [0, n_bins) into n_windows
+        near-equal chunks -- used to align sessions of different length onto
+        a shared 0-100% of trial x-axis instead of raw bin index."""
+        return [int(round(i * n_bins / n_windows)) for i in range(n_windows + 1)]
+
+    def _timecourse_series_by_group(self, sessions: list, per_session_window_fn,
+                                     n_windows: int = 10) -> dict:
+        """Shared aggregation for every time-course plot: calls
+        per_session_window_fn(session) -> list[float | None] of length
+        n_windows (one value per %-of-trial window, None for a window with
+        no data), groups by exp_group, and returns mean +/- SEM per window
+        as build_timecourse_figure's series_by_group input. x is %-of-trial
+        elapsed (0-100), not absolute time, so sessions of different
+        duration still align."""
+        by_group: dict = {}
+        for s in sessions:
+            vals = per_session_window_fn(s)
+            if vals is None:
+                continue
+            by_group.setdefault(s["exp_group"], []).append(vals)
+        x = [100.0 * (i + 0.5) / n_windows for i in range(n_windows)]
+        out = {}
+        for g, session_vals in by_group.items():
+            means, sems = [], []
+            for w in range(n_windows):
+                col = [v[w] for v in session_vals if v[w] is not None]
+                if col:
+                    means.append(float(np.mean(col)))
+                    sems.append(float(np.std(col, ddof=1) / len(col) ** 0.5) if len(col) > 1 else 0.0)
+                else:
+                    means.append(np.nan)
+                    sems.append(0.0)
+            out[g] = (x, means, sems)
+        return out
+
+    def _region_timecourse_pct(self, sessions: list, role_filter: "set | None" = None,
+                                name_contains: "str | None" = None,
+                                n_windows: int = 10) -> dict:
+        """% of bins in each %-of-trial window where current_region matches
+        role_filter (via the new region_roles key) or, for paradigms with no
+        role vocabulary (open_field), a region-name substring heuristic --
+        the same "region name contains 'center'" convention _render_generic
+        already uses. Returns series_by_group for build_timecourse_figure."""
+        def _per_session(s):
+            pb = (s["env_ctx"] or {}).get("per_bin", {})
+            regions_seq = pb.get("current_region")
+            if not regions_seq:
+                return None
+            if role_filter:
+                roles = (s["env_ctx"] or {}).get("summary", {}).get("region_roles", {}) or {}
+                match_names = {nm for nm, role in roles.items() if role in role_filter}
+            elif name_contains:
+                match_names = {nm for nm in set(regions_seq) if nm and
+                               name_contains.lower() in str(nm).lower()}
+            else:
+                match_names = set()
+            n_bins = len(regions_seq)
+            if n_bins == 0 or not match_names:
+                return None
+            edges = self._window_bin_edges(n_bins, n_windows)
+            out = []
+            for w in range(n_windows):
+                chunk = regions_seq[edges[w]:edges[w + 1]]
+                out.append(100.0 * sum(1 for v in chunk if v in match_names) / len(chunk)
+                           if chunk else None)
+            return out
+        return self._timecourse_series_by_group(sessions, _per_session, n_windows)
+
+    def _speed_timecourse_by_group(self, sessions: list, n_windows: int = 10) -> dict:
+        """Per-bin speed (px/s) from consecutive per_bin centroid_x/y
+        differences -- pure arithmetic on data already in session_env_
+        context.json, no core change needed. Returns series_by_group."""
+        def _per_session(s):
+            env_ctx = s["env_ctx"] or {}
+            pb = env_ctx.get("per_bin", {})
+            cx, cy = pb.get("centroid_x"), pb.get("centroid_y")
+            if not cx or not cy or len(cx) < 2:
+                return None
+            bin_dur = env_ctx.get("bin_ms", 100.0) / 1000.0
+            cx_arr, cy_arr = np.asarray(cx, dtype=float), np.asarray(cy, dtype=float)
+            speed = np.hypot(np.diff(cx_arr), np.diff(cy_arr)) / bin_dur
+            speed = np.concatenate([[speed[0] if speed.size else 0.0], speed])
+            n_bins = len(speed)
+            edges = self._window_bin_edges(n_bins, n_windows)
+            out = []
+            for w in range(n_windows):
+                chunk = speed[edges[w]:edges[w + 1]]
+                finite = chunk[np.isfinite(chunk)]
+                out.append(float(np.mean(finite)) if finite.size else None)
+            return out
+        return self._timecourse_series_by_group(sessions, _per_session, n_windows)
+
+    def _object_distance_timecourse_by_group(self, sessions: list,
+                                              object_role_filter: "set | None" = None,
+                                              n_windows: int = 10) -> dict:
+        """Per-window mean nose-to-nearest-role-matching-object distance
+        (px), by exp_group -- from the existing
+        dist_to_nearest_object_nose per_bin series (no core change needed).
+        Lower = closer investigation. Powers the Discrimination Index and
+        Sociability sub-views' "investigation distance over time" plot."""
+        def _per_session(s):
+            env_ctx = s["env_ctx"] or {}
+            pb = env_ctx.get("per_bin", {})
+            d_nose = pb.get("dist_to_nearest_object_nose", {}) or {}
+            roles = env_ctx.get("summary", {}).get("object_roles", {}) or {}
+            match_names = ({nm for nm, role in roles.items() if role in object_role_filter}
+                          if object_role_filter else set(d_nose.keys()))
+            arrs = [np.asarray(d_nose[nm], dtype=float) for nm in match_names if nm in d_nose]
+            if not arrs:
+                return None
+            n_bins = min(a.size for a in arrs)
+            if n_bins == 0:
+                return None
+            min_dist = np.min(np.column_stack([a[:n_bins] for a in arrs]), axis=1)
+            edges = self._window_bin_edges(n_bins, n_windows)
+            out = []
+            for w in range(n_windows):
+                chunk = min_dist[edges[w]:edges[w + 1]]
+                finite = chunk[np.isfinite(chunk)]
+                out.append(float(np.mean(finite)) if finite.size else None)
+            return out
+        return self._timecourse_series_by_group(sessions, _per_session, n_windows)
+
+    def _mean_speed_values_by_group(self, sessions: list) -> dict:
+        """One overall mean-speed (px/s) value per session, grouped by
+        exp_group -- for the open-field speed distribution plot."""
+        out: dict = {}
+        for s in sessions:
+            env_ctx = s["env_ctx"] or {}
+            pb = env_ctx.get("per_bin", {})
+            cx, cy = pb.get("centroid_x"), pb.get("centroid_y")
+            if not cx or not cy or len(cx) < 2:
+                continue
+            bin_dur = env_ctx.get("bin_ms", 100.0) / 1000.0
+            cx_arr, cy_arr = np.asarray(cx, dtype=float), np.asarray(cy, dtype=float)
+            speed = np.hypot(np.diff(cx_arr), np.diff(cy_arr)) / bin_dur
+            finite = speed[np.isfinite(speed)]
+            if finite.size:
+                out.setdefault(s["exp_group"], []).append(float(np.mean(finite)))
+        return out
+
+    def _crossing_timecourse_by_group(self, sessions: list, n_windows: int = 10) -> dict:
+        """Cumulative count of current_region entries (a bin whose region
+        differs from the previous bin and isn't None) per %-of-trial
+        window -- derived purely from the existing current_region per-bin
+        series, diff-based, no core change needed."""
+        def _per_session(s):
+            pb = (s["env_ctx"] or {}).get("per_bin", {})
+            regions_seq = pb.get("current_region")
+            n_bins = len(regions_seq) if regions_seq else 0
+            if n_bins < 2:
+                return None
+            edges = self._window_bin_edges(n_bins, n_windows)
+            cum = 0
+            out = []
+            for w in range(n_windows):
+                lo, hi = edges[w], edges[w + 1]
+                for i in range(max(lo, 1), hi):
+                    if regions_seq[i] is not None and regions_seq[i] != regions_seq[i - 1]:
+                        cum += 1
+                out.append(float(cum))
+            return out
+        return self._timecourse_series_by_group(sessions, _per_session, n_windows)
+
+    def _bout_duration_values_by_group(self, sessions: list, object_role_filter: "set | None" = None
+                                        ) -> dict:
+        """Pooled individual object-interaction bout durations (seconds),
+        by exp_group, optionally restricted to objects whose role is in
+        object_role_filter -- from the new
+        object_interaction_bout_lengths_sec key. Each point is one bout
+        (not one animal), the natural unit for a duration distribution."""
+        out: dict = {}
+        for s in sessions:
+            summary = (s["env_ctx"] or {}).get("summary", {})
+            lengths_by_obj = summary.get("object_interaction_bout_lengths_sec", {}) or {}
+            roles = summary.get("object_roles", {}) or {}
+            for obj_name, lengths in lengths_by_obj.items():
+                if object_role_filter and roles.get(obj_name) not in object_role_filter:
+                    continue
+                out.setdefault(s["exp_group"], []).extend(float(v) for v in lengths)
+        return out
+
+    def _latency_to_first_contact_fn(self, object_role_filter: "set | None" = None):
+        """Returns a value_fn(session) -> float | None compatible with
+        _index_bar_fig: seconds until the FIRST bin where nose or paw
+        distance to any role-matching object drops to/below
+        interaction_threshold_px -- purely derived from existing per_bin/
+        summary keys, no core change needed."""
+        def _fn(s):
+            env_ctx = s["env_ctx"] or {}
+            pb = env_ctx.get("per_bin", {})
+            summary = env_ctx.get("summary", {})
+            roles = summary.get("object_roles", {}) or {}
+            threshold = summary.get("interaction_threshold_px")
+            d_nose = pb.get("dist_to_nearest_object_nose", {}) or {}
+            d_paw = pb.get("dist_to_nearest_object_paw", {}) or {}
+            if threshold is None:
+                return None
+            bin_dur = env_ctx.get("bin_ms", 100.0) / 1000.0
+            best = None
+            for obj_name in d_nose:
+                if object_role_filter and roles.get(obj_name) not in object_role_filter:
+                    continue
+                nose_arr = np.asarray(d_nose.get(obj_name, []), dtype=float)
+                paw_arr = np.asarray(d_paw.get(obj_name, []), dtype=float)
+                if nose_arr.size == 0:
+                    continue
+                n = min(nose_arr.size, paw_arr.size) if paw_arr.size else nose_arr.size
+                hit = np.where((nose_arr[:n] <= threshold) |
+                               (paw_arr[:n] <= threshold if paw_arr.size else False))[0]
+                if hit.size:
+                    latency = float(hit[0]) * bin_dur
+                    best = latency if best is None else min(best, latency)
+            return best
+        return _fn
+
+    def _paired_pre_post_values(self, sessions: list, metric_fn) -> list:
+        """Matches sessions across exactly two exp_groups (phases, e.g.
+        Pre-test/Post-test) by subject_id -- the SAME pairing convention
+        _render_cpp's existing Repeated-Measures note already uses
+        (grouping by exp_group as phase, matching subject_id), factored out
+        so the paired-test note and the new dumbbell plot share one
+        implementation instead of two. Returns [] if there aren't exactly 2
+        phases present."""
+        phases = sorted(dict.fromkeys(s["exp_group"] for s in sessions))
+        if len(phases) != 2:
+            return []
+        by_subject_a = {s["subject_id"]: s for s in sessions
+                        if s["exp_group"] == phases[0] and s.get("subject_id")}
+        by_subject_b = {s["subject_id"]: s for s in sessions
+                        if s["exp_group"] == phases[1] and s.get("subject_id")}
+        pairs = []
+        for sid in by_subject_a:
+            if sid not in by_subject_b:
+                continue
+            pre_val = metric_fn(by_subject_a[sid])
+            post_val = metric_fn(by_subject_b[sid])
+            if pre_val is None or post_val is None:
+                continue
+            pairs.append({"subject_id": sid, "group": phases[0],
+                          "pre": float(pre_val), "post": float(post_val)})
+        return pairs
+
+    def _region_ethogram_rows(self, sessions: list) -> list:
+        """Per-session current_region sequence + bin duration, for
+        build_region_ethogram_figure."""
+        rows = []
+        for s in sessions:
+            env_ctx = s["env_ctx"] or {}
+            pb = env_ctx.get("per_bin", {})
+            regions_seq = pb.get("current_region")
+            if not regions_seq:
+                continue
+            bin_dur = env_ctx.get("bin_ms", 100.0) / 1000.0
+            rows.append({"name": s["name"], "regions": regions_seq, "bin_dur_sec": bin_dur})
+        return rows
+
+    def _region_role_color_map(self, sessions: list, muted_roles: "set | None" = None) -> dict:
+        """Region name -> color, using region_roles (the new summary key)
+        to give role-distinct regions (e.g. Y-Maze's arm vs. hub) visually
+        distinct colors -- muted_roles (e.g. {"hub"}) get a flat gray rather
+        than a PALETTE slot, so the arm-entry sequence reads clearly."""
+        muted_roles = muted_roles or set()
+        roles: dict = {}
+        for s in sessions:
+            roles.update((s["env_ctx"] or {}).get("summary", {}).get("region_roles", {}) or {})
+        color_map = {}
+        i = 0
+        for name, role in roles.items():
+            if role in muted_roles:
+                color_map[name] = "#8a8a9a"
+            else:
+                color_map[name] = PALETTE[i % len(PALETTE)]
+                i += 1
+        return color_map
 
     def _index_bar_fig(self, sessions: list, value_fn, ylabel: str, title: str,
                         t: dict, one_sample_ref: "float | None" = None,
@@ -18629,30 +19287,65 @@ class ParadigmResultsPanel(ctk.CTkFrame):
             fig, ax = plt.subplots(figsize=(max(4.5, len(egs) * 1.3), 4.5),
                                     facecolor=t["fig_bg"])
             ax.set_facecolor(t["ax_bg"])
+            ax.set_axisbelow(True)
+            ax.grid(axis="y", color=t["spine"], alpha=0.35, linewidth=0.7)
             means = [float(np.mean(group_values[eg])) for eg in egs]
             sems = [float(np.std(group_values[eg], ddof=1) / max(len(group_values[eg]), 1) ** 0.5)
                     if len(group_values[eg]) > 1 else 0.0 for eg in egs]
             ax.bar(range(len(egs)), means, yerr=sems,
-                   color=[eg_colors[eg] for eg in egs], capsize=4)
+                   color=[eg_colors[eg] for eg in egs], alpha=0.82, capsize=4,
+                   edgecolor=t["ax_bg"], linewidth=0.8,
+                   error_kw=dict(ecolor=t["tick"], elinewidth=1.1))
+            # Individual per-animal points as unfilled rings -- same
+            # jittered-overlay convention as Unbiased Analytics'
+            # build_top_n_barplot (~cube_analyser.py:3841-3851), retrofitted
+            # here so it applies tab-wide since every single-metric bar
+            # chart in Paradigm Results goes through this one shared
+            # builder. Edge uses the theme's tick color rather than the
+            # group color: a same-hue ring on a same-hue bar loses contrast
+            # entirely once the point sits below the bar's own height
+            # (found by rendering this exact case during QA) -- a neutral
+            # edge stays visible regardless of what's underneath it.
+            rng = np.random.default_rng(7)
+            for ei, eg in enumerate(egs):
+                pts = group_values[eg]
+                jit = rng.uniform(-0.12, 0.12, len(pts))
+                ax.scatter(ei + jit, pts, facecolors="none", edgecolors=t["tick"],
+                           s=22, linewidths=0.8, alpha=0.95, zorder=4)
             ax.set_xticks(range(len(egs)))
             ax.set_xticklabels(egs, color=t["tick"], rotation=20, ha="right")
             if one_sample_ref is not None:
                 ax.axhline(one_sample_ref, color=t["muted"], linestyle="--", linewidth=1)
-            y_top = max([m + se for m, se in zip(means, sems)] + [1e-9])
+            # Headroom from the ACTUAL data extent (bars+SEM and every
+            # individual point, not just the bars) so the new scatter
+            # overlay above never collides with a sig-bracket, one-sample
+            # marker, or the title.
+            all_pts = [group_values[eg] for eg in egs]
+            data_ceil = max([m + se for m, se in zip(means, sems)]
+                             + [max(pts) for pts in all_pts if pts] + [1e-9])
+            data_floor = min([m - se for m, se in zip(means, sems)]
+                              + [min(pts) for pts in all_pts if pts] + [0.0])
+            span = max(data_ceil - data_floor, 1e-9)
+            bracket_top = data_ceil
             if len(egs) > 1:
-                draw_sig_brackets(ax, egs, [group_values[eg] for eg in egs],
-                                  y_start=y_top * 1.08, y_step=y_top * 0.12,
-                                  tick_color=t["tick"])
+                bracket_top = draw_sig_brackets(
+                    ax, egs, [group_values[eg] for eg in egs],
+                    y_start=data_ceil + span * 0.08, y_step=span * 0.12,
+                    tick_color=t["tick"])
             if one_sample_ref is not None:
                 os_df = run_one_sample_statistics(group_values, ref=one_sample_ref,
                                                    use_wilcoxon=use_wilcoxon)
                 draw_one_sample_markers(ax, egs, os_df,
-                                        [m + se + y_top * 0.03 for m, se in zip(means, sems)])
+                                        [m + se + span * 0.03 for m, se in zip(means, sems)])
+            head_top = max(data_ceil + span * 0.35, bracket_top + span * 0.15)
+            ax.set_ylim(bottom=data_floor - span * 0.08, top=head_top)
             ax.set_ylabel(ylabel, color=t["tick"])
             ax.set_title(title, color=t["tick"], fontsize=12)
             ax.tick_params(colors=t["tick"])
-            for spine in ax.spines.values():
-                spine.set_color(t["spine"])
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+            for side in ("left", "bottom"):
+                ax.spines[side].set_color(t["spine"])
             fig.tight_layout()
         return fig, group_values
 
@@ -18703,6 +19396,18 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                     sessions, _center_entries, "Center-zone entries",
                     "Open Field: center-zone entry frequency (thigmotaxis control)", t)
                 figs.append(fig)
+                center_tc = self._region_timecourse_pct(sessions, name_contains="center")
+                if center_tc:
+                    figs.append(build_timecourse_figure(
+                        center_tc, "% of trial elapsed", "% time in center",
+                        t, "Open Field: center-zone time course (thigmotaxis dynamics)",
+                        color_map=self._eg_color_map(sessions)))
+            speed_vals = self._mean_speed_values_by_group(sessions)
+            if speed_vals:
+                figs.append(build_distribution_figure(
+                    speed_vals, "Mean speed (px/s)", t,
+                    "Open Field: mean-speed distribution",
+                    color_map=self._eg_color_map(sessions)))
         figs.extend(self._region_crosstab_figs(sessions, t))
         self._show_figures(figs)
 
@@ -18724,6 +19429,12 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                                      "Total arm entries",
                                      "Arm entries (activity control)", t)
         figs.append(fig)
+        ethogram_rows = self._region_ethogram_rows(sessions)
+        if ethogram_rows:
+            figs.append(build_region_ethogram_figure(
+                ethogram_rows,
+                region_color_map=self._region_role_color_map(sessions, muted_roles={"hub"}),
+                t=t, title="Arm-entry sequence (per session; hub shown in gray)"))
         figs.extend(self._region_crosstab_figs(sessions, t))
         self._show_figures(figs)
 
@@ -18747,6 +19458,27 @@ class ParadigmResultsPanel(ctk.CTkFrame):
             sessions, _entries_total, "Total arm entries",
             "Arm entries (locomotor control)", t)
         figs.append(fig)
+        open_arm_tc = self._region_timecourse_pct(sessions, role_filter={"open_arm"})
+        if open_arm_tc:
+            figs.append(build_timecourse_figure(
+                open_arm_tc, "% of trial elapsed", "% time in open arms",
+                t, "EPM: open-arm occupancy over time",
+                color_map=self._eg_color_map(sessions)))
+
+        def _mean_nose_outside(s):
+            pb = (s["env_ctx"] or {}).get("per_bin", {})
+            vals = pb.get("nose_outside_boundary")
+            if not vals:
+                return None
+            finite = [v for v in vals if v is not None and np.isfinite(v)]
+            return float(np.mean(finite)) if finite else None
+        if any(_mean_nose_outside(s) is not None for s in sessions):
+            fig, _ = self._index_bar_fig(
+                sessions, _mean_nose_outside,
+                "Mean fraction of bins with nose past the traced boundary",
+                "EPM: head-dip / peering-out proxy (nose beyond traced "
+                "boundary) — geometric proxy, NOT a validated classifier", t)
+            figs.append(fig)
         figs.extend(self._region_crosstab_figs(sessions, t))
         self._show_figures(figs)
 
@@ -18766,6 +19498,24 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         fig, _ = self._index_bar_fig(
             sessions, _total_explore, "Total exploration time, both objects (s)",
             "Total exploration (validity control)", t)
+        figs.append(fig)
+        novel_dist_tc = self._object_distance_timecourse_by_group(
+            sessions, object_role_filter={"novel"})
+        if novel_dist_tc:
+            figs.append(build_timecourse_figure(
+                novel_dist_tc, "% of trial elapsed", "Nose distance to novel object (px)",
+                t, "Novel Object: investigation distance over time (lower = closer)",
+                color_map=self._eg_color_map(sessions)))
+        bout_durs = self._bout_duration_values_by_group(sessions)
+        if bout_durs:
+            figs.append(build_distribution_figure(
+                bout_durs, "Bout duration (s)", t,
+                "Novel Object: investigation bout-duration distribution",
+                color_map=self._eg_color_map(sessions)))
+        fig, _ = self._index_bar_fig(
+            sessions, self._latency_to_first_contact_fn(),
+            "Latency to first contact (s)",
+            "Novel Object: latency to first investigation", t)
         figs.append(fig)
         figs.extend(self._region_crosstab_figs(sessions, t))
         self._show_figures(figs)
@@ -18787,6 +19537,33 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         fig, _ = self._index_bar_fig(
             sessions, _entries_total, "Chamber entry frequency",
             "Chamber entries (activity control)", t)
+        figs.append(fig)
+        # "Chamber" occupancy time-course isn't available: three_chamber's
+        # role vocabulary (stranger/empty/novel_stranger) is on OBJECTS, not
+        # regions (ENV_PARADIGM_ROLE_VOCAB["three_chamber"]["regions"] is
+        # None) -- chamber regions carry no role to filter a %-time-course
+        # by, and there's no naming convention (unlike open_field's
+        # "center") to fall back on. Investigation-distance-to-stranger
+        # over time is the literature-relevant substitute this data model
+        # actually supports; see the implementation report for this
+        # deviation from the plan's "chamber time-course" wording.
+        stranger_dist_tc = self._object_distance_timecourse_by_group(
+            sessions, object_role_filter={"stranger"})
+        if stranger_dist_tc:
+            figs.append(build_timecourse_figure(
+                stranger_dist_tc, "% of trial elapsed", "Nose distance to stranger (px)",
+                t, "Three-Chamber: investigation distance to stranger over time",
+                color_map=self._eg_color_map(sessions)))
+        bout_durs = self._bout_duration_values_by_group(sessions)
+        if bout_durs:
+            figs.append(build_distribution_figure(
+                bout_durs, "Bout duration (s)", t,
+                "Three-Chamber: investigation bout-duration distribution",
+                color_map=self._eg_color_map(sessions)))
+        fig, _ = self._index_bar_fig(
+            sessions, self._latency_to_first_contact_fn(object_role_filter={"stranger"}),
+            "Latency to first contact with stranger (s)",
+            "Three-Chamber: latency to first stranger investigation", t)
         figs.append(fig)
         figs.extend(self._region_crosstab_figs(sessions, t))
         self._show_figures(figs)
@@ -18831,6 +19608,12 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                 ax.axis("off")
                 ax.text(0.02, 0.5, txt, color=t["tick"], fontsize=10, va="center")
             figs.append(note_fig)
+            pairs = self._paired_pre_post_values(
+                sessions, lambda s: s["env_ctx"].get("derived", {}).get("preference_index"))
+            if pairs:
+                figs.append(build_paired_dumbbell_figure(
+                    pairs, "Preference index", t,
+                    "CPP: pre → post preference shift (per matched subject)"))
         else:
             with plt.style.context(t["mpl_style"]):
                 note_fig, ax = plt.subplots(figsize=(6, 1.0), facecolor=t["fig_bg"])
@@ -18841,6 +19624,12 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                        "absolute/delta score above).",
                        color=t["muted"], fontsize=9, va="center", wrap=True)
             figs.append(note_fig)
+        crossing_tc = self._crossing_timecourse_by_group(sessions)
+        if crossing_tc:
+            figs.append(build_timecourse_figure(
+                crossing_tc, "% of trial elapsed", "Cumulative region crossings",
+                t, "CPP: cumulative chamber crossings over time",
+                color_map=self._eg_color_map(sessions)))
         figs.extend(self._region_crosstab_figs(sessions, t))
         self._show_figures(figs)
 

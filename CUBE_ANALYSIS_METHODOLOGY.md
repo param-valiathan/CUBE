@@ -145,9 +145,12 @@ document), and the Analyser's Paradigm Results tab (`ParadigmResultsPanel`, `cub
 series into six literature-standard behavioral-paradigm indices — spontaneous alternation (Y-Maze), open-arm
 time/entries/latency (Elevated Plus Maze), discrimination index (Novel Object Recognition), sociability and
 social-novelty indices (Three-Chamber Test), and preference index (Place/Conditioned Place Preference) —
-plus a paradigm-agnostic rule-based approach/avoid event detector. Full data requirements, per-paradigm use
-cases, and known limitations are in `Behavioral_Paradigms_Reference.md`; this section covers the
-**methodological** choices, in the same register as the clustering methodology above.
+plus a paradigm-agnostic rule-based approach/avoid event detector. A second wave of additions puts those same
+indices in **motion**: %-of-trial time-course plots (not just a single trial-total number), investigation
+bout-duration distributions, an arm-entry ethogram strip, and a paired pre/post dumbbell plot for CPP. Full
+data requirements, per-paradigm use cases, and known limitations are in `Behavioral_Paradigms_Reference.md`;
+this section covers the **methodological** choices, in the same register as the clustering methodology
+above.
 
 **Statistical design.** Two distinct questions recur across every paradigm and are deliberately kept
 statistically and visually separate: "does this index differ between experimental groups" (Kruskal-Wallis +
@@ -183,6 +186,24 @@ or building a parallel testing framework, one small, self-contained one-sample p
 scoping discipline already established in Section 5 — WGCNA's `mergeCloseModules` pattern was adopted
 without adopting WGCNA's full module-detection framework, and the same "borrow the smallest correct
 mechanism" approach applies here.
+
+**Nose-point tracking was already computed for object interaction; the second wave extends it to region
+boundaries, narrowly.** Object-interaction distance (discrimination index, sociability index, exploration
+bout timing) was always based on the nose/paw point, not the whole-body centroid — the field-standard
+definition of "investigation." Region/arm *occupancy itself* (which region "counts" as the animal's
+location — alternation %, time-in-region, entries) remained, and remains, centroid-based; that did not
+change. What was added is a single narrow extension: a nose-point distance to region boundaries
+(`dist_to_region_boundary_nose`) and a nose-outside-traced-boundary flag (`nose_outside_boundary`), enabling
+an EPM head-dip/peering-out proxy. This is explicitly labeled a geometric proxy, not a validated posture
+classifier (no elongation/stretch-attend-posture detection was attempted) — the same "don't ship an
+unvalidated behavioral claim as if it were confirmed" discipline already applied to the approach/avoid
+detector above.
+
+**Three-Chamber has no chamber-occupancy time-course, by data-model constraint, not oversight.** This
+paradigm's role vocabulary (stranger/empty/novel_stranger) lives on the traced *objects*, not the chamber
+*regions* — there is no role to filter a %-time-in-chamber-over-time by, unlike EPM's open/closed arms.
+Investigation-distance-to-stranger-over-time is the literature-relevant substitute this data model actually
+supports, used in its place.
 
 Full parameter reference, per-paradigm tracing requirements, use cases, and shortcomings are in
 `Behavioral_Paradigms_Reference.md`; implementation detail (schema, deviations, verification) is in
