@@ -563,9 +563,13 @@ With `auto_bsoid = True`, completing the 3D DLC step automatically triggers Step
   same `*_bout_lengths_hmm_enriched.csv` sidecar the kinematics feature above uses — if both flags are on,
   one sidecar carries both plans' columns with no naming collision.
 - With both `env_features_enabled` and `kinematic_directedness_enabled` on, a rule-based approach/avoid
-  detector additionally writes `<stem>_approach_events.csv` (only when at least one event is detected):
-  flags fast, straight-line ("directed locomotion") bouts immediately followed by a slower
-  investigation-type bout, then reports which traced region/object the approach was heading toward.
+  detector additionally writes `<stem>_approach_events.csv` (only when at least one event is detected), with
+  a `classification` column of `"approach"` or `"avoid"` — a single directed-locomotion bout can produce
+  either, both, or neither. **Approach**: a fast, straight-line bout immediately followed by a slower
+  investigation-type bout, within `env_interaction_threshold` of a traced region/object by the bout's end.
+  **Avoid**: a fast, straight-line bout that started within `env_interaction_threshold` of a traced
+  object (or inside a traced region) and ended meaningfully farther away from it (or outside it) —
+  no following-bout requirement, since fleeing isn't expected to be followed by investigation.
 - Coordinate-space correctness (traced shapes vs. pose data) is a structural guarantee, not a runtime
   check: `EnvContextWindow` always reads video frames through the same crop rectangle DLC tracked on, so
   traced vertices land in the same pixel space as the pose data by construction.
