@@ -17667,6 +17667,1125 @@ class BehavioralExplorerPanel(ctk.CTkFrame):
 
 
 #
+# PARADIGM RESULTS — v6 part 3 (CUBE_Analyser_Paradigm_Reporting_Plan.md)
+#
+# Surfaces prompt 1/2's kinematic-directedness and environmental-context
+# output (session_env_context.json, the enriched bout sidecar, and
+# approach_events.csv) as a new top-level "Paradigm Results" tab. Additive
+# only -- no existing panel/class above this point is modified.
+#
+
+_BOUT_STEM_RE = re.compile(r"_bout_lengths(_hmm)?$")
+
+
+def _session_stem_from_bout_path(bout_path: "pathlib.Path") -> str:
+    """Recover a session's stem from any bout_lengths CSV path (raw, _hmm,
+    or -- since callers may pass either -- already-stripped)."""
+    return _BOUT_STEM_RE.sub("", pathlib.Path(bout_path).stem)
+
+
+def find_session_env_context(bout_path: "pathlib.Path") -> "pathlib.Path | None":
+    """Locate session_env_context.json for the run a bout_lengths CSV
+    belongs to. Written by BSoidEngine.run() under <output_dir>/model/ --
+    mirrors find_cluster_kinematics's upward-walk pattern for the same
+    output layout. Returns None (never raises) for pre-v6 runs or runs with
+    env_features_enabled=False, which never write this file at all."""
+    bout_path = pathlib.Path(bout_path)
+    try:
+        for ancestor in (bout_path.parent, bout_path.parent.parent,
+                          bout_path.parent.parent.parent):
+            if not ancestor.is_dir():
+                continue
+            candidate = ancestor / "model" / "session_env_context.json"
+            if candidate.is_file():
+                return candidate
+    except Exception:
+        pass
+    return None
+
+
+def load_session_env_context(bout_path: "pathlib.Path") -> "dict | None":
+    """Load this session's own entry from session_env_context.json (a dict
+    keyed by every session's stem -- see Environmental_Context_v6_
+    Implementation_Report.md's confirmed schema). Returns None -- never
+    raises -- when the file is absent, unreadable, or has no entry for this
+    session (including a present-but-empty {} entry, the documented no-op
+    contract for a session with no traced shapes even when the flag is on).
+    Python's json module round-trips the file's occasional literal NaN
+    tokens (undefined heading angle for a stationary animal) without special
+    handling, per that report's finding 5."""
+    p = find_session_env_context(bout_path)
+    if p is None:
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    entry = data.get(_session_stem_from_bout_path(bout_path))
+    return entry or None
+
+
+def find_enriched_bout_sidecar(bout_path: "pathlib.Path") -> "pathlib.Path | None":
+    """Locate the *_bout_lengths_hmm_enriched.csv sidecar (or *_bout_lengths_
+    enriched.csv on the predict-from-saved-model path, which has no HMM bout
+    variant to pair with -- Kinematics_v6_Implementation_Report.md deviation
+    5) next to a given bout CSV. Returns None when absent (pre-v6 runs, or
+    both kinematic_directedness_enabled and env_features_enabled off)."""
+    bout_path = pathlib.Path(bout_path)
+    stem = _session_stem_from_bout_path(bout_path)
+    for suffix in ("_bout_lengths_hmm_enriched.csv", "_bout_lengths_enriched.csv"):
+        candidate = bout_path.parent / f"{stem}{suffix}"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_enriched_bout_sidecar(bout_path: "pathlib.Path") -> "pd.DataFrame | None":
+    p = find_enriched_bout_sidecar(bout_path)
+    if p is None:
+        return None
+    try:
+        return pd.read_csv(p)
+    except Exception:
+        return None
+
+
+def find_approach_events(bout_path: "pathlib.Path") -> "pathlib.Path | None":
+    """Locate <stem>_approach_events.csv -- only ever written when >=1 event
+    was detected (Environmental_Context_v6_Implementation_Plan.md Step 7),
+    so None here can legitimately mean 'ran but found nothing', not just
+    'never ran'; callers should not treat this the same as a hard
+    graceful-degradation case."""
+    bout_path = pathlib.Path(bout_path)
+    stem = _session_stem_from_bout_path(bout_path)
+    candidate = bout_path.parent / f"{stem}_approach_events.csv"
+    return candidate if candidate.is_file() else None
+
+
+def load_approach_events(bout_path: "pathlib.Path") -> "pd.DataFrame | None":
+    p = find_approach_events(bout_path)
+    if p is None:
+        return None
+    try:
+        return pd.read_csv(p)
+    except Exception:
+        return None
+
+
+# ── One-sample-vs-reference statistical primitive ──────────────────────────
+#
+# run_cluster_statistics (above) is built for group-vs-group / level-vs-level
+# comparisons; it has no group-vs-fixed-constant mode. This is the one
+# genuinely new statistical primitive this plan calls for (Novel Object's
+# discrimination-index-vs-chance test, CPP's delta-vs-zero test), wrapped in
+# the same BH-FDR convention as run_cluster_statistics's qval_kw so its
+# output can be read the same way. Kept deliberately separate from
+# run_cluster_statistics rather than folded into it, per ground rule 3.
+
+def one_sample_test(values, ref: float = 0.0, use_wilcoxon: bool = False):
+    """One-sample test of `values` against a fixed reference value: paired
+    Student's t-test by default (ttest_1samp), or a one-sample Wilcoxon
+    signed-rank test against `ref` when use_wilcoxon=True (mirrors
+    run_cluster_statistics's independent/repeated non-parametric option).
+    Returns (stat, pval); (nan, 1.0) when fewer than 2 finite values."""
+    vals = np.asarray(values, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if len(vals) < 2 or not SCIPY_OK:
+        return float("nan"), 1.0
+    try:
+        if use_wilcoxon:
+            diffs = vals - ref
+            if np.allclose(diffs, 0):
+                return 0.0, 1.0
+            stat, p = sp_stats.wilcoxon(diffs)
+        else:
+            stat, p = sp_stats.ttest_1samp(vals, ref)
+        return float(stat), float(p)
+    except Exception:
+        return float("nan"), 1.0
+
+
+def run_one_sample_statistics(group_values: dict, ref: float = 0.0,
+                               use_wilcoxon: bool = False) -> pd.DataFrame:
+    """One-sample test (vs a fixed reference -- chance level for a
+    discrimination/sociability index, zero for a CPP delta score) per
+    experimental group, Benjamini-Hochberg FDR-corrected across groups.
+
+    group_values : {exp_group: [per-animal scalar values]}.
+    Returns a DataFrame (exp_group, n, mean, ref, stat, pval, qval,
+    effect_size_cohens_d, test_type) sorted by qval. Effect size is Cohen's
+    d against the reference (NaN when n<2 or the group has zero variance).
+    An empty/degenerate group_values yields an empty DataFrame with these
+    columns, not a crash.
+    """
+    cols = ["exp_group", "n", "mean", "ref", "stat", "pval",
+            "effect_size_cohens_d", "test_type"]
+    rows = []
+    for eg, vals in (group_values or {}).items():
+        arr = np.asarray([v for v in vals if v is not None], dtype=float)
+        arr = arr[np.isfinite(arr)]
+        n = len(arr)
+        stat, p = one_sample_test(arr, ref, use_wilcoxon) if n >= 2 else (float("nan"), 1.0)
+        mean = float(np.mean(arr)) if n else float("nan")
+        sd = float(np.std(arr, ddof=1)) if n > 1 else float("nan")
+        eff = float((mean - ref) / sd) if (n > 1 and sd and sd > 0) else float("nan")
+        rows.append({
+            "exp_group": eg, "n": n, "mean": mean, "ref": float(ref),
+            "stat": stat, "pval": p, "effect_size_cohens_d": eff,
+            "test_type": "wilcoxon_1samp" if use_wilcoxon else "ttest_1samp",
+        })
+    df = pd.DataFrame(rows, columns=cols)
+    if not df.empty:
+        df["qval"] = benjamini_hochberg(df["pval"].to_numpy())
+    else:
+        df["qval"] = pd.Series(dtype=float)
+    return df.sort_values("qval", na_position="last").reset_index(drop=True)
+
+
+def draw_one_sample_markers(ax, group_names: list, one_sample_df: pd.DataFrame,
+                             y_positions: list, marker_color: str = "#00BCD4"):
+    """Annotate one-sample-vs-reference results with a dagger (†/††/†††)
+    marker in a distinct color from draw_sig_brackets' bracket+star
+    convention (pink/red, used for between-group comparisons) -- so a reader
+    cannot mistake a 'differs from chance/zero' call for a 'differs between
+    groups' call, per the plan's explicit verification requirement.
+    """
+    if one_sample_df is None or one_sample_df.empty:
+        return
+    for i, eg in enumerate(group_names):
+        row = one_sample_df[one_sample_df["exp_group"] == eg]
+        if row.empty:
+            continue
+        q = float(row.iloc[0].get("qval", row.iloc[0].get("pval", 1.0)))
+        if q < 0.05:
+            mark = "†††" if q < 0.001 else "††" if q < 0.01 else "†"
+            y = y_positions[i] if i < len(y_positions) else 0
+            ax.text(i, y, mark, ha="center", va="bottom",
+                     fontsize=11, color=marker_color, fontweight="bold")
+
+
+def _scalar_metric_compute_fn(value_key: str):
+    """Adapts a per-animal scalar value (e.g. Y-Maze alternation %) into the
+    per-cluster-indexed DataFrame shape run_cluster_statistics's _compute_fn
+    contract expects, so paradigm-level scalar indices can reuse
+    run_cluster_statistics's existing group-comparison/FDR/post-hoc machinery
+    directly rather than duplicating it (single fake cluster_id=0 row)."""
+    def _fn(ani):
+        val = ani.get(value_key, float("nan"))
+        return pd.DataFrame({value_key: [val]}, index=pd.Index([0], name="cluster_id"))
+    return _fn
+
+
+# ── Shared occupancy-heatmap builder ────────────────────────────────────────
+#
+# New construction -- no direct physical x/y occupancy-heatmap precedent in
+# either file (per the plan's effort/risk note). Density uses a sequential
+# 'viridis' colormap, distinct in character from the categorical PALETTE
+# used for cluster/group colors elsewhere; colorbar/GridSpec layout borrowed
+# from build_heatmap_figure's pattern.
+#
+# Shape *outlines*: session_env_context.json stores only per-bin derived
+# values (region membership, distances), never the traced shapes' own
+# vertices -- env_arena_cfg itself is never written to any per-run output
+# file. Outlines drawn here are therefore an approximation, the convex hull
+# of the per-bin centroid positions labeled as belonging to that region (or,
+# for objects, labeled as "interacting"), not the true traced boundary --
+# labeled "(approx. from occupancy)" in the plot rather than presented as
+# the ground-truth shape. This is a disclosed deviation from the plan's
+# "region/object outlines overlaid" wording; see the implementation report.
+
+def approximate_region_outline(cx: np.ndarray, cy: np.ndarray,
+                                mask: np.ndarray) -> list:
+    """Convex hull of centroid points where `mask` is True, as a vertex
+    list [(x, y), ...]. Returns [] when fewer than 3 masked points are
+    available (not enough to define a hull) -- callers should skip drawing
+    rather than raise."""
+    pts = np.column_stack([np.asarray(cx)[mask], np.asarray(cy)[mask]])
+    pts = pts[np.all(np.isfinite(pts), axis=1)]
+    if len(pts) < 3:
+        return []
+    try:
+        from scipy.spatial import ConvexHull
+        hull = ConvexHull(pts)
+        return [tuple(pts[i]) for i in hull.vertices]
+    except Exception:
+        return []
+
+
+def build_occupancy_heatmap_figure(xy_list: list, outlines: "list | None" = None,
+                                    bins: int = 40, t: "dict | None" = None,
+                                    title: str = "") -> "plt.Figure":
+    """Whole-arena 2D occupancy density heatmap.
+
+    xy_list  : list of (x_array, y_array) pairs, pooled into one 2D
+      histogram (call once per group/phase for a faceted view; pool
+      everything for a whole-cohort view).
+    outlines : optional list of (name, kind, vertex_list) tuples drawn as
+      outline overlays (kind in {"boundary","region","object"} controls
+      line style). See module note above re: approximate outlines.
+    """
+    if t is None:
+        t = T()
+    xs_all, ys_all = [], []
+    for x, y in (xy_list or []):
+        x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+        m = np.isfinite(x) & np.isfinite(y)
+        xs_all.append(x[m]); ys_all.append(y[m])
+    all_x = np.concatenate(xs_all) if xs_all else np.array([])
+    all_y = np.concatenate(ys_all) if ys_all else np.array([])
+
+    edge_color = "white" if t.get("mpl_style") == "dark_background" else "black"
+    _STYLE_BY_KIND = {"boundary": ("-", 2.0), "region": ("--", 1.4), "object": (":", 1.8)}
+
+    with plt.style.context(t["mpl_style"]):
+        fig = plt.figure(figsize=(7.2, 6.2), facecolor=t["fig_bg"])
+        gs = GridSpec(1, 2, figure=fig, width_ratios=[20, 1], wspace=0.06)
+        ax = fig.add_subplot(gs[0, 0])
+        cax = fig.add_subplot(gs[0, 1])
+        ax.set_facecolor(t["ax_bg"])
+        if len(all_x) >= 2 and len(all_y) >= 2:
+            h, xedges, yedges = np.histogram2d(all_x, all_y, bins=bins)
+            im = ax.imshow(h.T, origin="lower",
+                            extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+                            aspect="auto", cmap="viridis")
+            cb = fig.colorbar(im, cax=cax)
+            cb.set_label("Relative occupancy (bin count)", color=t["tick"])
+            cb.ax.yaxis.set_tick_params(color=t["tick"])
+            plt.setp(cb.ax.get_yticklabels(), color=t["tick"])
+        else:
+            cax.axis("off")
+            ax.text(0.5, 0.5, "Not enough position data", ha="center", va="center",
+                    color=t["muted"], transform=ax.transAxes)
+        for name, kind, verts in (outlines or []):
+            if len(verts) < 3:
+                continue
+            ls, lw = _STYLE_BY_KIND.get(kind, ("-", 1.0))
+            poly = mpatches.Polygon(verts, closed=True, fill=False,
+                                     edgecolor=edge_color, linestyle=ls, linewidth=lw)
+            ax.add_patch(poly)
+            vxs = [v[0] for v in verts]; vys = [v[1] for v in verts]
+            ax.annotate(name, (float(np.mean(vxs)), float(np.mean(vys))),
+                        color=t["tick"], fontsize=8, ha="center", va="center",
+                        path_effects=[_pe.withStroke(linewidth=2, foreground=t["ax_bg"])])
+        ax.set_title(title, color=t["tick"], fontsize=12)
+        ax.tick_params(colors=t["tick"])
+        for spine in ax.spines.values():
+            spine.set_color(t["spine"])
+        try:
+            ax.set_aspect("equal", adjustable="box")
+        except Exception:
+            pass
+        fig.tight_layout()
+    return fig
+
+
+# ── Shared arena/region cluster-and-group cross-tab ─────────────────────────
+
+def aggregate_region_time_by_label(rows: list, region_names: list) -> dict:
+    """Pure aggregation (unit-testable): weighted-mean %-time-in-region per
+    label (a cluster id or an exp_group name), weighted by each bout's
+    duration (Run lengths, in frames) -- longer bouts count more.
+
+    rows : list of {"label": Any, "run_length": float,
+                     "pct_time_in_region": {region_name: pct, ...}}.
+    A region absent from a row's pct_time_in_region dict contributes 0.0 for
+    that row (the bout spent 0% of its time there), not NaN/skip.
+    Returns {label: {region_name: weighted_mean_pct}}; {} for empty rows or
+    when every row's weight is <= 0.
+    """
+    sums: dict = {}
+    weights: dict = {}
+    for r in rows or []:
+        lbl = r.get("label")
+        w = float(r.get("run_length", 0.0) or 0.0)
+        if w <= 0:
+            continue
+        acc = sums.setdefault(lbl, {rn: 0.0 for rn in region_names})
+        pct = r.get("pct_time_in_region") or {}
+        for rn in region_names:
+            acc[rn] += w * float(pct.get(rn, 0.0) or 0.0)
+        weights[lbl] = weights.get(lbl, 0.0) + w
+    out = {}
+    for lbl, acc in sums.items():
+        wt = weights.get(lbl, 0.0)
+        if wt > 0:
+            out[lbl] = {rn: acc[rn] / wt for rn in region_names}
+    return out
+
+
+def build_region_crosstab_figure(agg: dict, region_names: list,
+                                  color_map: "dict | None" = None,
+                                  t: "dict | None" = None, title: str = "",
+                                  legend_title: str = "Cluster") -> "plt.Figure":
+    """Grouped bar chart: x = region, one bar series per label (cluster id
+    or exp_group), y = weighted-mean % time in that region. Shared by every
+    sub-view per the plan's "Arena/region-based cluster and group analysis"
+    section -- built once, called with facet_by='cluster' or 'group'."""
+    if t is None:
+        t = T()
+    labels = list(agg.keys())
+    if color_map is None:
+        color_map = {lbl: PALETTE[i % len(PALETTE)] for i, lbl in enumerate(labels)}
+    with plt.style.context(t["mpl_style"]):
+        fig, ax = plt.subplots(figsize=(max(6.0, len(region_names) * 1.5), 5.0),
+                                facecolor=t["fig_bg"])
+        ax.set_facecolor(t["ax_bg"])
+        if labels and region_names:
+            n_lbl = len(labels)
+            width = 0.8 / n_lbl
+            x = np.arange(len(region_names))
+            for i, lbl in enumerate(labels):
+                vals = [agg[lbl].get(rn, 0.0) for rn in region_names]
+                ax.bar(x + i * width - 0.4 + width / 2, vals, width=width,
+                       color=color_map.get(lbl, PALETTE[i % len(PALETTE)]),
+                       label=str(lbl))
+            ax.set_xticks(x)
+            ax.set_xticklabels(region_names, color=t["tick"])
+            leg = ax.legend(title=legend_title, fontsize=8, facecolor=t["card"],
+                             edgecolor=t["border"], labelcolor=t["tick"])
+            leg.get_title().set_color(t["tick"])
+        else:
+            ax.text(0.5, 0.5, "No region data", ha="center", va="center",
+                    color=t["muted"], transform=ax.transAxes)
+        ax.set_ylabel("% time in region", color=t["tick"])
+        ax.set_title(title, color=t["tick"], fontsize=12)
+        ax.tick_params(colors=t["tick"])
+        for spine in ax.spines.values():
+            spine.set_color(t["spine"])
+        fig.tight_layout()
+    return fig
+
+
+# ── In-app "About this metric" documentation content ────────────────────────
+
+PARADIGM_METRIC_DOC = {
+    "Generic": ("This metric is computed directly from the regions/objects you "
+                "traced and labeled. Double-check that shape roles (e.g. which "
+                "object is 'novel,' which arm is a choice-arm vs. the center "
+                "hub) were assigned correctly — the calculation trusts your "
+                "labeling and can't detect a mislabeled shape on its own."),
+    "Y-Maze Alternation": ("This metric is computed directly from the regions/"
+                "objects you traced and labeled. Double-check that shape roles "
+                "(e.g. which object is 'novel,' which arm is a choice-arm vs. "
+                "the center hub) were assigned correctly — the calculation "
+                "trusts your labeling and can't detect a mislabeled shape on "
+                "its own."),
+    "Elevated Plus Maze": ("This metric is computed directly from the regions/"
+                "objects you traced and labeled. Double-check that shape roles "
+                "(e.g. which object is 'novel,' which arm is a choice-arm vs. "
+                "the center hub) were assigned correctly — the calculation "
+                "trusts your labeling and can't detect a mislabeled shape on "
+                "its own."),
+    "Discrimination Index": ("This metric is computed directly from the "
+                "regions/objects you traced and labeled. Double-check that "
+                "shape roles (e.g. which object is 'novel,' which arm is a "
+                "choice-arm vs. the center hub) were assigned correctly — the "
+                "calculation trusts your labeling and can't detect a "
+                "mislabeled shape on its own."),
+    "Sociability / Social Novelty": ("This metric is computed directly from "
+                "the regions/objects you traced and labeled. Double-check "
+                "that shape roles (e.g. which object is 'novel,' which arm is "
+                "a choice-arm vs. the center hub) were assigned correctly — "
+                "the calculation trusts your labeling and can't detect a "
+                "mislabeled shape on its own."),
+    "Place Preference / CPP": ("This metric is computed directly from the "
+                "regions/objects you traced and labeled. Double-check that "
+                "shape roles (e.g. which object is 'novel,' which arm is a "
+                "choice-arm vs. the center hub) were assigned correctly — the "
+                "calculation trusts your labeling and can't detect a "
+                "mislabeled shape on its own."),
+    "Approach/Avoid Events": ("This is an automated, rule-based estimate of "
+                "when the animal appeared to move directly toward a traced "
+                "region or object. It has not yet been validated against "
+                "expert human scoring — treat it as a helpful starting point "
+                "for review, not a confirmed behavioral classification, "
+                "especially before using it in a publication."),
+}
+
+
+class ParadigmResultsPanel(ctk.CTkFrame):
+    """
+    Top-level 'Paradigm Results' tab. Surfaces session_env_context.json,
+    the enriched bout sidecar, and approach_events.csv (v6 parts 1/2) as
+    seven sub-views, structurally mirroring UnbiasedAnalyticsPanel: left
+    CTkScrollableFrame controls, right plot/output area, one segmented
+    sub-view selector dispatching to a _render_<view>() method.
+
+    Requires
+    --------
+    get_animals_fn(group_by=...) -> list of animal dicts, same contract as
+      UnbiasedAnalyticsPanel/BehavioralExplorerPanel (each dict carries
+      'path' -- the bout_lengths CSV this session's outputs are found
+      relative to, 'exp_group', 'subject_id', 'df', 'fps').
+    get_eg_colors_fn() -> {exp_group_name: color} | None -- the SAME
+      accessor AnimalListPanel.get_eg_colors() exposes elsewhere in the
+      app, so a group never gets a different color here than anywhere
+      else (ground rule 6). Not get_groups_fn -- that accessor means
+      something unrelated (cluster-id -> merged-behavior-group mapping
+      from the Group Editor), confirmed by reading its actual call sites
+      before this panel was built; see the implementation report.
+    """
+
+    _VIEWS = [
+        "Generic", "Y-Maze Alternation", "Elevated Plus Maze",
+        "Discrimination Index", "Sociability / Social Novelty",
+        "Place Preference / CPP", "Approach/Avoid Events",
+    ]
+
+    _PARADIGM_TO_VIEW = {
+        "open_field": "Generic", "custom": "Generic",
+        "y_maze": "Y-Maze Alternation",
+        "elevated_plus_maze": "Elevated Plus Maze",
+        "novel_object": "Discrimination Index",
+        "three_chamber": "Sociability / Social Novelty",
+        "place_preference": "Place Preference / CPP",
+    }
+
+    def __init__(self, parent, get_animals_fn, get_eg_colors_fn=None, **kw):
+        super().__init__(parent, fg_color=T()["panel"], **kw)
+        self._get_animals    = get_animals_fn
+        self._get_eg_colors  = get_eg_colors_fn or (lambda: {})
+        self._current_figs   = []
+        self._auto_selected  = False
+        self._sessions: list = []   # cached per-session loaded data (see _load_sessions)
+
+        self.columnconfigure(0, weight=0, minsize=280)
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        self._build_controls()
+        self._build_plot_area()
+
+    # ── Controls (left panel) ───────────────────────────────────────────
+
+    def _build_controls(self):
+        ctrl = ctk.CTkScrollableFrame(self, fg_color=T()["bg"],
+                                       corner_radius=0, width=278)
+        ctrl.grid(row=0, column=0, sticky="nsew", padx=(6, 2), pady=6)
+        ctrl.columnconfigure(0, weight=1)
+
+        def section(title):
+            fr = ctk.CTkFrame(ctrl, fg_color=T()["card"], corner_radius=8)
+            fr.pack(fill="x", padx=4, pady=4)
+            ctk.CTkLabel(fr, text=title, font=ctk.CTkFont(size=12, weight="bold"),
+                         text_color=T()["hdr_text"]).pack(anchor="w", padx=10, pady=(8, 2))
+            return fr
+
+        sv = section("Paradigm Sub-view")
+        self._view_var = ctk.StringVar(master=self, value=self._VIEWS[0])
+        ctk.CTkOptionMenu(sv, variable=self._view_var, values=self._VIEWS,
+                          width=250, command=lambda _v: self._on_view_change()
+                          ).pack(padx=12, pady=(2, 4))
+        self._paradigm_lbl = ctk.CTkLabel(
+            sv, text="No session loaded yet.", text_color=T()["subtext"],
+            font=ctk.CTkFont(size=10), justify="left", wraplength=240)
+        self._paradigm_lbl.pack(anchor="w", padx=12, pady=(0, 8))
+
+        # Statistical Settings -- reuses the SAME "Experimental Design" /
+        # "Group by" control pair UnbiasedAnalyticsPanel exposes
+        # (cube_analyser.py, near L8134-8151), per ground rule 7: CPP's
+        # paired pre/post comparison is just design="repeated" + Group by
+        # naming the pre/post phase column, not a second CPP-specific
+        # longitudinal toggle.
+        sf = section("Statistical Settings")
+        ctk.CTkLabel(sf, text="Experimental Design:", text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
+        self._design_var = ctk.StringVar(master=self, value="Independent Groups")
+        ctk.CTkOptionMenu(sf, variable=self._design_var,
+                          values=["Independent Groups", "Repeated Measures"],
+                          width=250).pack(padx=12, pady=(2, 2))
+        ctk.CTkLabel(sf, text="Repeated Measures pairs animals by Label 3 / "
+                     "Animal ID across the levels of 'Group by' (e.g. "
+                     "Pre-test/Post-test for CPP).", text_color=T()["muted"],
+                     font=ctk.CTkFont(size=9), justify="left", wraplength=240
+                     ).pack(anchor="w", padx=12, pady=(0, 4))
+        ctk.CTkLabel(sf, text="Group by:", text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
+        self._group_by_var = ctk.StringVar(master=self, value="Label 1")
+        ctk.CTkOptionMenu(sf, variable=self._group_by_var,
+                          values=["Label 1", "Label 2", "Label 3 / Animal ID",
+                                  "All Labels"],
+                          width=250).pack(padx=12, pady=(2, 8))
+
+        ac = section("")
+        ctk.CTkButton(ac, text="Refresh from Loaded Sessions",
+                      command=self.refresh).pack(padx=12, pady=(2, 4), fill="x")
+        ctk.CTkButton(ac, text="Save Current Graph(s)",
+                      command=self._save_current_graphs).pack(padx=12, pady=(2, 8), fill="x")
+
+        doc = section("About this metric")
+        self._doc_box = ctk.CTkTextbox(doc, height=140, width=250, wrap="word",
+                                        fg_color=T()["card2"], text_color=T()["subtext"],
+                                        font=ctk.CTkFont(size=10))
+        self._doc_box.pack(padx=10, pady=(2, 10), fill="x")
+        self._refresh_doc_box()
+
+    def _refresh_doc_box(self):
+        text = PARADIGM_METRIC_DOC.get(self._view_var.get(), "")
+        self._doc_box.configure(state="normal")
+        self._doc_box.delete("1.0", "end")
+        self._doc_box.insert("1.0", text)
+        self._doc_box.configure(state="disabled")
+
+    # ── Plot area (right panel) ─────────────────────────────────────────
+
+    def _build_plot_area(self):
+        right = ctk.CTkFrame(self, fg_color=T()["panel"], corner_radius=0)
+        right.grid(row=0, column=1, sticky="nsew", padx=(2, 6), pady=6)
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=1)
+
+        self._canvas = tk.Canvas(right, bg=T()["panel"], highlightthickness=0)
+        self._vsb = ctk.CTkScrollbar(right, orientation="vertical",
+                                      command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._vsb.set)
+        self._canvas.grid(row=0, column=0, sticky="nsew")
+        self._vsb.grid(row=0, column=1, sticky="ns")
+
+        self._inner = ctk.CTkFrame(self._canvas, fg_color=T()["panel"])
+        self._win_id = self._canvas.create_window((0, 0), window=self._inner, anchor="nw")
+        self._inner.bind("<Configure>", lambda e: self._canvas.configure(
+            scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>",
+                          lambda e: self._canvas.itemconfig(self._win_id, width=e.width))
+        self._canvas.bind("<MouseWheel>", lambda e: self._canvas.yview_scroll(
+            int(-1 * (e.delta / 120)), "units"))
+
+        self._show_placeholder(
+            "Load animals in the Combined Analysis tab, then click\n"
+            "  Refresh from Loaded Sessions.\n\n"
+            "Sessions run with env_features_enabled=False (or predating "
+            "v6) will show a 'no environmental data' message per sub-view "
+            "instead of a plot.")
+
+    def _show_placeholder(self, msg: str):
+        for w in self._inner.winfo_children():
+            w.destroy()
+        for old in self._current_figs:
+            try:
+                plt.close(old)
+            except Exception:
+                pass
+        self._current_figs = []
+        ctk.CTkLabel(self._inner, text=msg, text_color=T()["muted"],
+                     font=ctk.CTkFont(size=13), justify="center"
+                     ).pack(pady=50, padx=20)
+
+    def _show_figures(self, figs: list):
+        for w in self._inner.winfo_children():
+            w.destroy()
+        for old in self._current_figs:
+            try:
+                plt.close(old)
+            except Exception:
+                pass
+        self._current_figs = list(figs)
+        for fig in figs:
+            mpl_c = FigureCanvasTkAgg(fig, master=self._inner)
+            mpl_c.draw()
+            widget = mpl_c.get_tk_widget()
+            widget.pack(fill="x", expand=True, padx=2, pady=(0, 6))
+            tb_fr = ctk.CTkFrame(self._inner, fg_color=T()["card2"], height=30)
+            tb_fr.pack(fill="x", pady=(0, 8))
+            NavigationToolbar2Tk(mpl_c, tb_fr)
+
+            def _bind_wheel(w):
+                w.bind("<MouseWheel>", lambda e: self._canvas.yview_scroll(
+                    int(-1 * (e.delta / 120)), "units"))
+                for child in w.winfo_children():
+                    _bind_wheel(child)
+            _bind_wheel(widget)
+        self._canvas.yview_moveto(0)
+
+    def _save_current_graphs(self):
+        if not self._current_figs:
+            messagebox.showwarning("No graph", "Generate a sub-view first.")
+            return
+        mode = self._view_var.get().replace("/", "_").replace(" ", "_").lower()
+        d = filedialog.askdirectory(title="Save Current Graph(s) To Folder")
+        if not d:
+            return
+        try:
+            for i, fig in enumerate(self._current_figs):
+                fig.savefig(str(pathlib.Path(d) / f"paradigm_{mode}_{i}.png"),
+                            dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor())
+            messagebox.showinfo("Saved", f"{len(self._current_figs)} graph(s) saved to:\n{d}")
+        except Exception as exc:
+            messagebox.showerror("Save Error", str(exc))
+
+    # ── Data loading (checkpoint b) ─────────────────────────────────────
+
+    def _group_by_key(self) -> str:
+        return {"Label 1": "label1", "Label 2": "label2",
+                "Label 3 / Animal ID": "label3", "All Labels": "all"}.get(
+            self._group_by_var.get(), "label1")
+
+    def _load_sessions(self) -> list:
+        """Build one dict per loaded animal with every v6 data source
+        attached, degrading gracefully (None) per-source when absent.
+        Never raises on a single session's missing/corrupt file -- an
+        exception loading one animal's env context must not blank the
+        whole panel for every other animal."""
+        animals = self._get_animals(group_by=self._group_by_key()) or []
+        out = []
+        for a in animals:
+            path = a.get("path")
+            env_ctx = enriched = approach = None
+            if path:
+                try:
+                    env_ctx = load_session_env_context(path)
+                except Exception:
+                    env_ctx = None
+                try:
+                    enriched = load_enriched_bout_sidecar(path)
+                except Exception:
+                    enriched = None
+                try:
+                    approach = load_approach_events(path)
+                except Exception:
+                    approach = None
+            out.append({
+                "name": a.get("name"), "exp_group": a.get("exp_group", "Default"),
+                "subject_id": a.get("subject_id", ""), "df": a.get("df"),
+                "fps": a.get("fps"), "path": path,
+                "env_ctx": env_ctx, "enriched": enriched, "approach": approach,
+            })
+        return out
+
+    def refresh(self):
+        self._sessions = self._load_sessions()
+        with_env = [s for s in self._sessions if s["env_ctx"]]
+        if not self._sessions:
+            self._show_placeholder(
+                "No animals loaded. Load sessions in the Combined Analysis "
+                "tab first, then click Refresh.")
+            self._paradigm_lbl.configure(text="No session loaded yet.")
+            return
+        if not with_env:
+            self._show_placeholder(
+                "No environmental context data for any loaded session.\n\n"
+                "This session predates CUBE v6, or was run with "
+                "env_features_enabled=False. Paradigm Results needs a run "
+                "with Environmental Context tracing enabled.")
+            self._paradigm_lbl.configure(
+                text=f"{len(self._sessions)} session(s) loaded, none have "
+                     "environmental context data.")
+            return
+        # Auto-select the sub-view matching the (first) session's paradigm,
+        # only once per Refresh -- a user deliberately browsing to another
+        # sub-view afterward should not get yanked back.
+        paradigm = with_env[0]["env_ctx"].get("paradigm", "custom")
+        auto_view = self._PARADIGM_TO_VIEW.get(paradigm, "Generic")
+        self._view_var.set(auto_view)
+        self._paradigm_lbl.configure(
+            text=f"{len(with_env)}/{len(self._sessions)} session(s) have "
+                 f"environmental data. Detected paradigm: '{paradigm}'.")
+        self._render_current_view()
+
+    def _on_view_change(self):
+        self._refresh_doc_box()
+        if self._sessions:
+            self._render_current_view()
+
+    # ── View dispatch ────────────────────────────────────────────────────
+
+    def _render_current_view(self):
+        self._refresh_doc_box()
+        view = self._view_var.get()
+        with_env = [s for s in self._sessions if s["env_ctx"]]
+        if not with_env:
+            self._show_placeholder(
+                "No environmental context data for any loaded session.")
+            return
+        session_paradigms = {s["env_ctx"].get("paradigm", "custom") for s in with_env}
+        expected_paradigm = {v: k for k, v in self._PARADIGM_TO_VIEW.items()}.get(view)
+        if (view != "Generic" and view != "Approach/Avoid Events"
+                and expected_paradigm is not None
+                and expected_paradigm not in session_paradigms):
+            shown = ", ".join(sorted(f"'{p}'" for p in session_paradigms))
+            self._show_placeholder(
+                f"This session's paradigm is {shown} — {view} isn't "
+                "applicable. Select a matching sub-view, or 'Generic' for "
+                "any paradigm.")
+            return
+        try:
+            dispatch = {
+                "Generic": self._render_generic,
+                "Y-Maze Alternation": self._render_y_maze,
+                "Elevated Plus Maze": self._render_epm,
+                "Discrimination Index": self._render_discrimination,
+                "Sociability / Social Novelty": self._render_sociability,
+                "Place Preference / CPP": self._render_cpp,
+                "Approach/Avoid Events": self._render_approach_avoid,
+            }[view](with_env)
+        except Exception as exc:
+            self._show_placeholder(f"Could not render {view}:\n{exc}")
+
+    # ── Shared helpers used by every sub-view ───────────────────────────
+
+    def _eg_color_map(self, sessions: list) -> dict:
+        override = self._get_eg_colors() or {}
+        egs = list(dict.fromkeys(s["exp_group"] for s in sessions))
+        return {eg: override.get(eg, PALETTE[i % len(PALETTE)])
+                for i, eg in enumerate(egs)}
+
+    def _pooled_xy(self, sessions: list) -> list:
+        out = []
+        for s in sessions:
+            pb = (s["env_ctx"] or {}).get("per_bin", {})
+            cx, cy = pb.get("centroid_x"), pb.get("centroid_y")
+            if cx and cy:
+                out.append((np.asarray(cx, dtype=float), np.asarray(cy, dtype=float)))
+        return out
+
+    def _region_outlines(self, sessions: list) -> list:
+        """Approximate outlines (see build_occupancy_heatmap_figure's module
+        note) for every named region across the given sessions, pooled."""
+        outlines = []
+        region_names = set()
+        for s in sessions:
+            region_names.update((s["env_ctx"] or {}).get("summary", {})
+                                 .get("time_in_region_sec", {}).keys())
+        for rn in sorted(region_names):
+            cx_all, cy_all, mask_all = [], [], []
+            for s in sessions:
+                pb = (s["env_ctx"] or {}).get("per_bin", {})
+                cx, cy = pb.get("centroid_x"), pb.get("centroid_y")
+                regions = pb.get("current_region")
+                if not (cx and cy and regions):
+                    continue
+                cx_all.extend(cx); cy_all.extend(cy)
+                mask_all.extend([r == rn for r in regions])
+            if cx_all:
+                verts = approximate_region_outline(
+                    np.asarray(cx_all, dtype=float), np.asarray(cy_all, dtype=float),
+                    np.asarray(mask_all, dtype=bool))
+                if verts:
+                    outlines.append((f"{rn} (approx.)", "region", verts))
+        return outlines
+
+    def _region_names(self, sessions: list) -> list:
+        names = set()
+        for s in sessions:
+            names.update((s["env_ctx"] or {}).get("summary", {})
+                         .get("time_in_region_sec", {}).keys())
+        return sorted(names)
+
+    def _crosstab_rows_by_cluster(self, sessions: list) -> list:
+        rows = []
+        for s in sessions:
+            df = s["enriched"]
+            if df is None or df.empty:
+                continue
+            region_cols = [c for c in df.columns if c.startswith("pct_time_in_region_")]
+            for _, r in df.iterrows():
+                pct = {c[len("pct_time_in_region_"):]: r[c] for c in region_cols}
+                rows.append({"label": int(r.get("B-SOiD labels", -1)),
+                             "run_length": float(r.get("Run lengths", 0.0)),
+                             "pct_time_in_region": pct})
+        return rows
+
+    def _crosstab_rows_by_group(self, sessions: list) -> list:
+        rows = []
+        for s in sessions:
+            df = s["enriched"]
+            if df is None or df.empty:
+                continue
+            region_cols = [c for c in df.columns if c.startswith("pct_time_in_region_")]
+            for _, r in df.iterrows():
+                pct = {c[len("pct_time_in_region_"):]: r[c] for c in region_cols}
+                rows.append({"label": s["exp_group"],
+                             "run_length": float(r.get("Run lengths", 0.0)),
+                             "pct_time_in_region": pct})
+        return rows
+
+    def _region_crosstab_figs(self, sessions: list, t: dict) -> list:
+        """The shared arena/region cluster-by-region and group-by-region
+        cross-tabs every sub-view gets, per the plan (built once here, not
+        re-implemented per sub-view)."""
+        region_names = self._region_names(sessions)
+        if not region_names:
+            return []
+        figs = []
+        cl_rows = self._crosstab_rows_by_cluster(sessions)
+        cl_agg = aggregate_region_time_by_label(cl_rows, region_names)
+        if cl_agg:
+            figs.append(build_region_crosstab_figure(
+                cl_agg, region_names, t=t, legend_title="Cluster",
+                title="Cluster-by-region occupancy (% time)"))
+        grp_rows = self._crosstab_rows_by_group(sessions)
+        grp_agg = aggregate_region_time_by_label(grp_rows, region_names)
+        if grp_agg:
+            figs.append(build_region_crosstab_figure(
+                grp_agg, region_names, color_map=self._eg_color_map(sessions),
+                t=t, legend_title="Group",
+                title="Group-by-region occupancy (% time)"))
+        return figs
+
+    def _index_bar_fig(self, sessions: list, value_fn, ylabel: str, title: str,
+                        t: dict, one_sample_ref: "float | None" = None,
+                        use_wilcoxon: bool = False) -> "tuple[plt.Figure, dict]":
+        """Generic bar-per-group index chart with between-group significance
+        brackets (draw_sig_brackets, existing visual language) and, when
+        one_sample_ref is given, one-sample-vs-reference dagger markers
+        (draw_one_sample_markers) layered on top -- visually distinct per
+        the plan's verification requirement. Returns (figure, group_values)."""
+        eg_colors = self._eg_color_map(sessions)
+        group_values: dict = {}
+        for s in sessions:
+            val = value_fn(s)
+            if val is None or (isinstance(val, float) and not np.isfinite(val)):
+                continue
+            group_values.setdefault(s["exp_group"], []).append(float(val))
+        egs = [eg for eg in eg_colors if eg in group_values]
+        with plt.style.context(t["mpl_style"]):
+            fig, ax = plt.subplots(figsize=(max(4.5, len(egs) * 1.3), 4.5),
+                                    facecolor=t["fig_bg"])
+            ax.set_facecolor(t["ax_bg"])
+            means = [float(np.mean(group_values[eg])) for eg in egs]
+            sems = [float(np.std(group_values[eg], ddof=1) / max(len(group_values[eg]), 1) ** 0.5)
+                    if len(group_values[eg]) > 1 else 0.0 for eg in egs]
+            ax.bar(range(len(egs)), means, yerr=sems,
+                   color=[eg_colors[eg] for eg in egs], capsize=4)
+            ax.set_xticks(range(len(egs)))
+            ax.set_xticklabels(egs, color=t["tick"], rotation=20, ha="right")
+            if one_sample_ref is not None:
+                ax.axhline(one_sample_ref, color=t["muted"], linestyle="--", linewidth=1)
+            y_top = max([m + se for m, se in zip(means, sems)] + [1e-9])
+            if len(egs) > 1:
+                draw_sig_brackets(ax, egs, [group_values[eg] for eg in egs],
+                                  y_start=y_top * 1.08, y_step=y_top * 0.12,
+                                  tick_color=t["tick"])
+            if one_sample_ref is not None:
+                os_df = run_one_sample_statistics(group_values, ref=one_sample_ref,
+                                                   use_wilcoxon=use_wilcoxon)
+                draw_one_sample_markers(ax, egs, os_df,
+                                        [m + se + y_top * 0.03 for m, se in zip(means, sems)])
+            ax.set_ylabel(ylabel, color=t["tick"])
+            ax.set_title(title, color=t["tick"], fontsize=12)
+            ax.tick_params(colors=t["tick"])
+            for spine in ax.spines.values():
+                spine.set_color(t["spine"])
+            fig.tight_layout()
+        return fig, group_values
+
+    # ── Sub-views ────────────────────────────────────────────────────────
+
+    def _render_generic(self, sessions: list):
+        t = T()
+        figs = [build_occupancy_heatmap_figure(
+            self._pooled_xy(sessions), outlines=self._region_outlines(sessions),
+            t=t, title="Whole-arena occupancy (all loaded sessions)")]
+        region_names = self._region_names(sessions)
+        if region_names:
+            def _time_in_region_total(s):
+                return sum((s["env_ctx"].get("summary", {})
+                            .get("time_in_region_sec", {}) or {}).values())
+            fig, _ = self._index_bar_fig(
+                sessions, _time_in_region_total, "Total time in traced regions (s)",
+                "Region time (activity control)", t)
+            figs.append(fig)
+        figs.extend(self._region_crosstab_figs(sessions, t))
+        self._show_figures(figs)
+
+    def _render_y_maze(self, sessions: list):
+        t = T()
+        alt_sessions = [dict(s, alt_pct=(s["env_ctx"].get("derived", {})
+                                          .get("spontaneous_alternation_pct")),
+                             n_entries=(s["env_ctx"].get("derived", {})
+                                        .get("n_arm_entries")))
+                       for s in sessions]
+        figs = [build_occupancy_heatmap_figure(
+            self._pooled_xy(sessions), outlines=self._region_outlines(sessions),
+            t=t, title="Per-arm occupancy")]
+        fig, _ = self._index_bar_fig(alt_sessions, lambda s: s["alt_pct"],
+                                     "Spontaneous alternation (%)",
+                                     "Y-Maze alternation", t)
+        figs.append(fig)
+        fig, _ = self._index_bar_fig(alt_sessions, lambda s: s["n_entries"],
+                                     "Total arm entries",
+                                     "Arm entries (activity control)", t)
+        figs.append(fig)
+        figs.extend(self._region_crosstab_figs(sessions, t))
+        self._show_figures(figs)
+
+    def _render_epm(self, sessions: list):
+        t = T()
+        def _entries_total(s):
+            return sum((s["env_ctx"].get("summary", {})
+                        .get("region_entries_count", {}) or {}).values())
+        figs = [build_occupancy_heatmap_figure(
+            self._pooled_xy(sessions), outlines=self._region_outlines(sessions),
+            t=t, title="Open- vs. closed-arm occupancy")]
+        for key, label in (("pct_time_open_arms", "% time in open arms"),
+                           ("pct_open_arm_entries", "% entries into open arms"),
+                           ("latency_to_first_open_arm_entry_sec",
+                            "Latency to first open-arm entry (s)")):
+            fig, _ = self._index_bar_fig(
+                sessions, lambda s, k=key: s["env_ctx"].get("derived", {}).get(k),
+                label, f"EPM: {label}", t)
+            figs.append(fig)
+        fig, _ = self._index_bar_fig(
+            sessions, _entries_total, "Total arm entries",
+            "Arm entries (locomotor control)", t)
+        figs.append(fig)
+        figs.extend(self._region_crosstab_figs(sessions, t))
+        self._show_figures(figs)
+
+    def _render_discrimination(self, sessions: list):
+        t = T()
+        def _total_explore(s):
+            return sum((s["env_ctx"].get("summary", {})
+                        .get("total_interaction_time_sec", {}) or {}).values())
+        figs = [build_occupancy_heatmap_figure(
+            self._pooled_xy(sessions), outlines=self._region_outlines(sessions),
+            t=t, title="Investigation density around each object")]
+        fig, _ = self._index_bar_fig(
+            sessions, lambda s: s["env_ctx"].get("derived", {}).get("discrimination_index"),
+            "Discrimination index", "Novel Object: discrimination index (0 = chance)",
+            t, one_sample_ref=0.0)
+        figs.append(fig)
+        fig, _ = self._index_bar_fig(
+            sessions, _total_explore, "Total exploration time, both objects (s)",
+            "Total exploration (validity control)", t)
+        figs.append(fig)
+        figs.extend(self._region_crosstab_figs(sessions, t))
+        self._show_figures(figs)
+
+    def _render_sociability(self, sessions: list):
+        t = T()
+        def _entries_total(s):
+            return sum((s["env_ctx"].get("summary", {})
+                        .get("region_entries_count", {}) or {}).values())
+        figs = [build_occupancy_heatmap_figure(
+            self._pooled_xy(sessions), outlines=self._region_outlines(sessions),
+            t=t, title="Per-chamber occupancy")]
+        for key, label, ref in (("sociability_index", "Sociability index (Phase 1)", 0.0),
+                                ("social_novelty_index", "Social novelty index (Phase 2)", 0.0)):
+            fig, _ = self._index_bar_fig(
+                sessions, lambda s, k=key: s["env_ctx"].get("derived", {}).get(k),
+                label, f"Three-Chamber: {label}", t, one_sample_ref=ref)
+            figs.append(fig)
+        fig, _ = self._index_bar_fig(
+            sessions, _entries_total, "Chamber entry frequency",
+            "Chamber entries (activity control)", t)
+        figs.append(fig)
+        figs.extend(self._region_crosstab_figs(sessions, t))
+        self._show_figures(figs)
+
+    def _render_cpp(self, sessions: list):
+        t = T()
+        figs = [build_occupancy_heatmap_figure(
+            self._pooled_xy(sessions), outlines=self._region_outlines(sessions),
+            t=t, title="Occupancy (all loaded phases pooled)")]
+        fig, group_values = self._index_bar_fig(
+            sessions, lambda s: s["env_ctx"].get("derived", {}).get("preference_index"),
+            "Preference index (post − pre, or absolute if no pre-test)",
+            "Place Preference / CPP score", t, one_sample_ref=0.0)
+        figs.append(fig)
+        if self._design_var.get() == "Repeated Measures":
+            paired_animals = [{"exp_group": s["exp_group"],
+                               "subject_id": s["subject_id"],
+                               "preference_index": s["env_ctx"].get("derived", {})
+                                                    .get("preference_index")}
+                              for s in sessions]
+            try:
+                paired_df = run_cluster_statistics(
+                    paired_animals, metric="preference_index", design="repeated",
+                    _compute_fn=_scalar_metric_compute_fn("preference_index"))
+                if not paired_df.empty:
+                    r = paired_df.iloc[0]
+                    txt = (f"Paired pre/post test (n={r.get('n_present_total', '?')} matched "
+                          f"subjects): stat={r['stat_kw']:.3g}, p={r['pval_kw']:.3g}")
+                else:
+                    txt = ("Not enough matched pre/post subjects (need Label 3 / "
+                          "Animal ID set consistently, and >=3 matched pairs).")
+            except Exception as exc:
+                txt = f"Paired comparison unavailable: {exc}"
+            with plt.style.context(t["mpl_style"]):
+                note_fig, ax = plt.subplots(figsize=(6, 1.2), facecolor=t["fig_bg"])
+                ax.axis("off")
+                ax.text(0.02, 0.5, txt, color=t["tick"], fontsize=10, va="center")
+            figs.append(note_fig)
+        else:
+            with plt.style.context(t["mpl_style"]):
+                note_fig, ax = plt.subplots(figsize=(6, 1.0), facecolor=t["fig_bg"])
+                ax.axis("off")
+                ax.text(0.02, 0.5, "Set Experimental Design to 'Repeated Measures' "
+                       "for the paired pre/post comparison (requires a genuine "
+                       "pre-test phase; sessions without one show only the "
+                       "absolute/delta score above).",
+                       color=t["muted"], fontsize=9, va="center", wrap=True)
+            figs.append(note_fig)
+        figs.extend(self._region_crosstab_figs(sessions, t))
+        self._show_figures(figs)
+
+    def _render_approach_avoid(self, sessions: list):
+        t = T()
+        with_events = [s for s in sessions if s["approach"] is not None and not s["approach"].empty]
+        if not with_events:
+            self._show_placeholder(
+                "No approach/avoid events detected for any loaded session "
+                "(requires both kinematic_directedness_enabled and "
+                "env_features_enabled, and at least one detected event).\n\n"
+                + PARADIGM_METRIC_DOC["Approach/Avoid Events"])
+            return
+        figs = [build_occupancy_heatmap_figure(
+            self._pooled_xy(sessions), outlines=self._region_outlines(sessions),
+            t=t, title="Approach/avoid trajectory context")]
+
+        def _event_rate(s):
+            df = s["approach"]
+            if df is None or df.empty or not s["fps"]:
+                return None
+            n_frames = (s["df"]["Run lengths"].sum() if s["df"] is not None
+                       and "Run lengths" in getattr(s["df"], "columns", []) else None)
+            if not n_frames:
+                return float(len(df))
+            duration_min = float(n_frames) / float(s["fps"]) / 60.0
+            return float(len(df)) / duration_min if duration_min > 0 else None
+
+        fig, _ = self._index_bar_fig(sessions, _event_rate, "Events per minute",
+                                     "Approach/avoid event rate", t)
+        figs.append(fig)
+
+        with plt.style.context(t["mpl_style"]):
+            all_events = pd.concat([s["approach"] for s in with_events], ignore_index=True)
+            targets = all_events.apply(
+                lambda r: r.get("target_object") or r.get("target_region") or "(none)", axis=1)
+            counts = (pd.DataFrame({"target": targets,
+                                    "classification": all_events.get("classification", "approach")})
+                     .value_counts().reset_index(name="count"))
+            fig2, ax = plt.subplots(figsize=(7, 4.5), facecolor=t["fig_bg"])
+            ax.set_facecolor(t["ax_bg"])
+            if not counts.empty:
+                targets_u = sorted(counts["target"].unique())
+                classes_u = sorted(counts["classification"].unique())
+                x = np.arange(len(targets_u))
+                width = 0.8 / max(len(classes_u), 1)
+                class_colors = {"approach": "#59A14F", "avoid": "#E15759"}
+                for i, cls in enumerate(classes_u):
+                    vals = [int(counts[(counts["target"] == tg) & (counts["classification"] == cls)]
+                                ["count"].sum()) for tg in targets_u]
+                    ax.bar(x + i * width - 0.4 + width / 2, vals, width=width,
+                          color=class_colors.get(cls, PALETTE[i % len(PALETTE)]), label=cls)
+                ax.set_xticks(x)
+                ax.set_xticklabels(targets_u, color=t["tick"], rotation=20, ha="right")
+                leg = ax.legend(fontsize=9, facecolor=t["card"], edgecolor=t["border"])
+                for txt_ in leg.get_texts():
+                    txt_.set_color(t["tick"])
+            ax.set_ylabel("Event count", color=t["tick"])
+            ax.set_title("Target distribution by classification", color=t["tick"], fontsize=12)
+            ax.tick_params(colors=t["tick"])
+            for spine in ax.spines.values():
+                spine.set_color(t["spine"])
+            fig2.tight_layout()
+        figs.append(fig2)
+        figs.extend(self._region_crosstab_figs(sessions, t))
+        self._show_figures(figs)
+
+
+#
 # MAIN APPLICATION
 #
 
@@ -17821,11 +18940,12 @@ class BSOiDApp(ctk.CTk):
         self._tab_unbiased  = self._tabs.add("Unbiased Analytics")
         self._tab_explorer  = self._tabs.add("Behavioral Explorer")
         self._tab_predictor = self._tabs.add("Group Predictor")
+        self._tab_paradigm  = self._tabs.add("Paradigm Results")
 
         for tab in (self._tab_preview, self._tab_analysis,
                     self._tab_metrics, self._tab_combined,
                     self._tab_unbiased, self._tab_explorer,
-                    self._tab_predictor):
+                    self._tab_predictor, self._tab_paradigm):
             tab.columnconfigure(0, weight=1)
             tab.rowconfigure(0, weight=1)
 
@@ -17887,6 +19007,23 @@ class BSOiDApp(ctk.CTk):
             get_groups_fn=self._get_groups,
         )
         self._predictor_panel.grid(row=0, column=0, sticky="nsew")
+
+        # Paradigm Results — v6 part 3. get_eg_colors_fn, NOT get_groups_fn:
+        # get_groups_fn means "cluster-id -> merged-behavior-group mapping
+        # from the Group Editor" in this codebase (see self._get_groups
+        # below), not experimental-group labels/colors, so it is the wrong
+        # accessor for this panel's group-aware plots (confirmed against
+        # AnimalListPanel's actual exp_group/get_eg_colors mechanism before
+        # building this panel; see Analyser_Paradigm_Reporting_v6_
+        # Implementation_Report.md).
+        self._paradigm_panel = ParadigmResultsPanel(
+            self._tab_paradigm,
+            get_animals_fn=self._get_animals_for_unbiased,
+            get_eg_colors_fn=lambda: (
+                self._animal_panel.get_eg_colors()
+                if hasattr(self, "_animal_panel") else {}),
+        )
+        self._paradigm_panel.grid(row=0, column=0, sticky="nsew")
 
     def _get_animals_for_unbiased(self, group_by: str = "label1") -> list:
         if hasattr(self, "_animal_panel"):
@@ -18864,6 +20001,11 @@ class BSOiDApp(ctk.CTk):
                 if sel < len(self._predictor_panel._results):
                     self._predictor_panel._draw_detail(
                         self._predictor_panel._results[sel])
+        except Exception:
+            pass
+        try:
+            if getattr(self._paradigm_panel, "_sessions", None):
+                self._paradigm_panel._render_current_view()
         except Exception:
             pass
 
