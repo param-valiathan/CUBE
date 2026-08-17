@@ -84,6 +84,26 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+# On Windows, an app that hasn't declared itself DPI-aware gets bitmap-scaled
+# by the OS on non-100%-scaled or mixed-DPI multi-monitor setups: Tk renders
+# widgets at one (logical) coordinate space while Windows displays them
+# stretched, so a click that visually lands on one widget is delivered to a
+# DIFFERENT widget at the underlying unscaled coordinates (e.g. clicking a
+# "3x" radio button in cube_video_explorer.py's annotator actually invokes
+# the "1x" button). This must be set once, process-wide, before any Tk
+# window is created -- BSoidAnnotator/AnalyserApp are created later as
+# nested tk.Tk() roots within this same process, so declaring it here covers
+# them too.
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
 #  " "  local engine  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
 # Deferred to _deferred_imports() so the loading splash renders first.
 CORE_OK      = False

@@ -41,6 +41,22 @@ from tkinter import filedialog, messagebox, simpledialog
 from pathlib import Path
 from collections import defaultdict, deque
 
+# See the matching block in cube.py for why this is needed: on Windows,
+# an app that isn't DPI-aware can get its clicks delivered to the wrong
+# widget (visually clicking one radio button invokes a different one) on
+# non-100%-scaled or mixed-DPI multi-monitor setups. Only takes effect here
+# when this file is run standalone -- cube.py already declares it earlier
+# when this module is lazy-loaded from the main launcher.
+if platform.system() == "Windows" and __name__ == "__main__":
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
 #   PIL  
 try:
     from PIL import Image, ImageTk, ImageSequence, ImageOps
@@ -278,8 +294,18 @@ class VideoTile(tk.Label):
     def __init__(self, master, path: Path, rotation: int = 0, label: str = "",
                  speed: float = 1.0, **kw):
         super().__init__(master, **kw)
-        self.configure(bg=C["panel"], anchor="center",
+        # A blank placeholder image is set immediately (rather than leaving
+        # -image empty) so Tk always treats width/height as pixels; with no
+        # image set, Tk instead treats them as character/line counts while
+        # placeholder text ("Loading...", errors, etc.) is showing, which
+        # made tiles balloon to huge sizes until the first real frame arrived.
+        self._blank = None
+        if PIL_OK:
+            blank_img = Image.new("RGB", (self.TILE_W, self.TILE_H), (247,248,250))
+            self._blank = ImageTk.PhotoImage(blank_img, master=self)
+        self.configure(bg=C["panel"], anchor="center", compound="center",
                        relief="flat", bd=0,
+                       image=self._blank if self._blank else "",
                        text="Loading...", font=("Segoe UI", 9),
                        fg=C["text_dim"])
         self._path     = path
@@ -294,10 +320,11 @@ class VideoTile(tk.Label):
         self._running  = False
 
         if path is None:
-            self.configure(text="No media file", image="")
+            self.configure(text="No media file", image=self._blank if self._blank else "")
             return
         if not path.exists():
-            self.configure(text=f"File not found:\n{path.name}", image="")
+            self.configure(text=f"File not found:\n{path.name}",
+                           image=self._blank if self._blank else "")
             return
 
         ext = path.suffix.lower()
@@ -320,7 +347,7 @@ class VideoTile(tk.Label):
             frames, delays = [], []
             for frame in ImageSequence.Iterator(img):
                 f = self._transform(frame.convert("RGBA"))
-                f.thumbnail((self.TILE_W, self.TILE_H), Image.LANCZOS)
+                f = self._fit_resize(f, self.TILE_W, self.TILE_H, Image.LANCZOS)
                 padded = Image.new("RGBA", (self.TILE_W, self.TILE_H), (247,248,250,255))
                 x = (self.TILE_W - f.width)  // 2
                 y = (self.TILE_H - f.height) // 2
@@ -339,7 +366,7 @@ class VideoTile(tk.Label):
             self._running = True
             self._animate_gif()
         except Exception as e:
-            self.configure(text=f"GIF error:\n{e}", image="")
+            self.configure(text=f"GIF error:\n{e}", image=self._blank if self._blank else "")
 
     def _animate_gif(self):
         if not self._running or self._stop_evt.is_set():
@@ -397,7 +424,8 @@ class VideoTile(tk.Label):
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_img   = Image.fromarray(frame_rgb)
                 pil_img   = self._transform(pil_img)
-                pil_img.thumbnail((self.TILE_W, self.TILE_H), Image.BILINEAR)
+                pil_img   = self._fit_resize(pil_img, self.TILE_W, self.TILE_H,
+                                             Image.BILINEAR)
                 padded    = Image.new("RGB", (self.TILE_W, self.TILE_H), (247,248,250))
                 x = (self.TILE_W - pil_img.width)  // 2
                 y = (self.TILE_H - pil_img.height) // 2
@@ -432,7 +460,8 @@ class VideoTile(tk.Label):
                 return
             item = self._q.get_nowait()
             if item is None:
-                self.configure(text=f"Cannot open:\n{self._path.name}", image="")
+                self.configure(text=f"Cannot open:\n{self._path.name}",
+                               image=self._blank if self._blank else "")
                 return
             ph = ImageTk.PhotoImage(item, master=self)
             self._photo = ph              # hard ref - prevents GC
@@ -444,6 +473,25 @@ class VideoTile(tk.Label):
         self._after_id = self.after(self._poll_delay_ms, self._poll_mp4)
 
     #   shared  
+
+    @staticmethod
+    def _fit_resize(img: "Image.Image", target_w: int, target_h: int,
+                    resample) -> "Image.Image":
+        """Resize to fit within (target_w, target_h), preserving aspect ratio.
+
+        Unlike PIL's Image.thumbnail(), this upscales when the source is
+        smaller than the target box -- needed so the zoom control actually
+        enlarges videos whose native resolution is below the zoomed tile
+        size (the common case for small BSOID example clips).
+        """
+        if img.width <= 0 or img.height <= 0:
+            return img
+        scale = min(target_w / img.width, target_h / img.height)
+        new_w = max(1, int(round(img.width * scale)))
+        new_h = max(1, int(round(img.height * scale)))
+        if (new_w, new_h) == (img.width, img.height):
+            return img
+        return img.resize((new_w, new_h), resample)
 
     def _transform(self, img: "Image.Image") -> "Image.Image":
         """Apply rotation to a PIL image."""
@@ -487,7 +535,7 @@ class VideoTile(tk.Label):
 class MultiPlayer(tk.Frame):
     """
     Displays all examples of a cluster simultaneously in a tiled layout.
-    Columns: 1 tile -> 1 col; 2 4 tiles -> 2 cols; 5+ -> 3 cols.
+    Column count is fit to the viewport width and current zoom level.
     """
 
     BASE_TILE_W = 320
@@ -500,8 +548,14 @@ class MultiPlayer(tk.Frame):
         self._tiles: list[VideoTile] = []
 
     def load(self, paths: list[Path], rotation: int = 0,
-             speed: float = 1.0, zoom: float = 1.0):
-        """Stop old tiles, create new ones for given paths."""
+             speed: float = 1.0, zoom: float = 1.0, avail_width: int = 0):
+        """Stop old tiles, create new ones for given paths.
+
+        Column count is derived from the current viewport width and the
+        zoomed tile size, so increasing zoom reduces the number of columns
+        (rows overflow into the existing vertical scrollbar) instead of
+        overflowing the window horizontally.
+        """
         self._stop_all()
         for w in self.winfo_children():
             w.destroy()
@@ -514,11 +568,22 @@ class MultiPlayer(tk.Frame):
                      fg=C["text_dim"]).pack(expand=True)
             return
 
-        cols = 1 if n == 1 else (2 if n <= 4 else 3)
-        # scale tile size: zoom applied on top of column-based sizing
-        base_w = min(self.MAX_TILE_W, max(160, 640 // cols))
-        tile_w = min(self.MAX_TILE_W, int(base_w * zoom))
-        tile_h = min(self.MAX_TILE_H, int(tile_w * 0.75))
+        # target tile size purely from zoom (independent of column count)
+        target_w = max(160, min(self.MAX_TILE_W, int(self.BASE_TILE_W * zoom)))
+        target_h = min(self.MAX_TILE_H, int(target_w * 0.75))
+
+        CELL_PAD = 12  # padx=6 on each side
+        if avail_width > 0:
+            cols = max(1, min(n, avail_width // (target_w + CELL_PAD)))
+        else:
+            cols = 1 if n == 1 else (2 if n <= 4 else 3)
+
+        tile_w, tile_h = target_w, target_h
+        if rotation in (90, 270):
+            # rotated video is portrait-shaped: swap the tile box to match,
+            # instead of letterboxing a portrait frame inside a landscape box
+            tile_w, tile_h = target_h, target_w
+
         VideoTile.TILE_W = tile_w
         VideoTile.TILE_H = tile_h
 
@@ -725,7 +790,7 @@ class BSoidAnnotator(tk.Tk):
         # filter row
         flt = tk.Frame(lf, bg=C["panel2"])
         flt.pack(fill="x")
-        self.filter_var = tk.StringVar(value="all")
+        self.filter_var = tk.StringVar(master=self, value="all")
         for val, txt, col in [
             ("all",      "All",     C["text"]),
             ("pending",  "Pending", C["accent3"]),
@@ -790,17 +855,10 @@ class BSoidAnnotator(tk.Tk):
         tk.Label(rot_row, text="  Rotation:",
                  font=("Segoe UI", 9, "bold"),
                  bg=C["bg"], fg=C["text"]).pack(side="left")
-        self._rot_var = tk.IntVar(value=0)
-        for deg in ROTATION_OPTIONS:
-            tk.Radiobutton(rot_row, text=f"{deg} ",
-                           variable=self._rot_var, value=deg,
-                           command=self._apply_rotation,
-                           bg=C["bg"], fg=C["accent"],
-                           selectcolor=C["panel"],
-                           activebackground=C["bg"],
-                           font=("Segoe UI", 9, "bold"),
-                           relief="flat", bd=0,
-                           cursor="hand2").pack(side="left", padx=6)
+        self._rot_var = tk.IntVar(master=self, value=0)
+        self._make_dropdown(rot_row, self._rot_var, ROTATION_OPTIONS,
+                            lambda v: f"{v}°", self._apply_rotation,
+                            C["accent"]).pack(side="left", padx=6)
         tk.Label(rot_row, text="(applied to all media)",
                  font=("Segoe UI", 8), bg=C["bg"],
                  fg=C["text_dim"]).pack(side="left", padx=6)
@@ -811,17 +869,10 @@ class BSoidAnnotator(tk.Tk):
         tk.Label(spd_row, text="  Speed:",
                  font=("Segoe UI", 9, "bold"),
                  bg=C["bg"], fg=C["text"]).pack(side="left")
-        self._speed_var = tk.DoubleVar(value=1.0)
-        for spd in SPEED_OPTIONS:
-            tk.Radiobutton(spd_row, text=f"{spd:g}x",
-                           variable=self._speed_var, value=spd,
-                           command=self._apply_speed,
-                           bg=C["bg"], fg=C["accent3"],
-                           selectcolor=C["panel"],
-                           activebackground=C["bg"],
-                           font=("Segoe UI", 9, "bold"),
-                           relief="flat", bd=0,
-                           cursor="hand2").pack(side="left", padx=6)
+        self._speed_var = tk.DoubleVar(master=self, value=1.0)
+        self._make_dropdown(spd_row, self._speed_var, SPEED_OPTIONS,
+                            lambda v: f"{v:g}x", self._apply_speed,
+                            C["accent3"]).pack(side="left", padx=6)
         tk.Label(spd_row, text="(0.25x/0.5x reduce jitter on slow machines)",
                  font=("Segoe UI", 8), bg=C["bg"],
                  fg=C["text_dim"]).pack(side="left", padx=6)
@@ -832,17 +883,10 @@ class BSoidAnnotator(tk.Tk):
         tk.Label(zoom_row, text="  Zoom:",
                  font=("Segoe UI", 9, "bold"),
                  bg=C["bg"], fg=C["text"]).pack(side="left")
-        self._zoom_var = tk.DoubleVar(value=1.0)
-        for z in ZOOM_OPTIONS:
-            tk.Radiobutton(zoom_row, text=f"{z:g}x",
-                           variable=self._zoom_var, value=z,
-                           command=self._apply_zoom,
-                           bg=C["bg"], fg=C["accent2"],
-                           selectcolor=C["panel"],
-                           activebackground=C["bg"],
-                           font=("Segoe UI", 9, "bold"),
-                           relief="flat", bd=0,
-                           cursor="hand2").pack(side="left", padx=6)
+        self._zoom_var = tk.DoubleVar(master=self, value=1.0)
+        self._make_dropdown(zoom_row, self._zoom_var, ZOOM_OPTIONS,
+                            lambda v: f"{v:g}x", self._apply_zoom,
+                            C["accent2"]).pack(side="left", padx=6)
         tk.Label(zoom_row, text="(scroll to pan zoomed view)",
                  font=("Segoe UI", 8), bg=C["bg"],
                  fg=C["text_dim"]).pack(side="left", padx=6)
@@ -864,12 +908,23 @@ class BSoidAnnotator(tk.Tk):
         self._player = MultiPlayer(self._player_outer)
         self._player_win = self._player_outer.create_window(
             (0,0), window=self._player, anchor="nw")
+        # Track the canvas's real width from the <Configure> event itself
+        # (event.width), not via winfo_width() -- querying winfo_width()
+        # reads Tk's cached geometry value, which is only guaranteed fresh
+        # right after a genuine OS resize; using the event's own width is
+        # always accurate and avoids computing tile/column layout from a
+        # stale value on environments where the cache doesn't refresh
+        # promptly from update_idletasks() alone.
+        self._player_canvas_width = 900  # sane default before first <Configure>
         self._player.bind("<Configure>",
             lambda e: self._player_outer.configure(
                 scrollregion=self._player_outer.bbox("all")))
-        self._player_outer.bind("<Configure>",
-            lambda e: self._player_outer.itemconfig(
-                self._player_win, width=e.width))
+        def _on_player_outer_configure(e):
+            self._player_canvas_width = e.width
+            self._player_outer.itemconfig(
+                self._player_win,
+                width=max(e.width, self._player.winfo_reqwidth()))
+        self._player_outer.bind("<Configure>", _on_player_outer_configure)
 
         #   controls below player  
         ctrl = tk.Frame(cf, bg=C["bg"])
@@ -961,7 +1016,34 @@ class BSoidAnnotator(tk.Tk):
             lambda e: self._bg_canvas.itemconfig(self._bg_win, width=e.width))
         self._bind_mousewheel(self._bg_canvas)
 
-    #   MOUSEWHEEL HELPER  
+    #   DROPDOWN HELPER
+
+    def _make_dropdown(self, parent, var, options, fmt, apply_fn, fg):
+        """Menubutton+Menu dropdown bound to `var`, replacing a Radiobutton
+        row. Radiobuttons in a tight horizontal row proved unreliable on
+        this app's target machines (a click on one option's visible label
+        was sometimes delivered as a different option's value entirely --
+        e.g. clicking "3x" applied 1.0). A dropdown has a single click
+        target (the button) and an explicit menu-item selection step, which
+        sidesteps that class of hit-testing bug.
+        """
+        display_var = tk.StringVar(master=parent, value=fmt(var.get()))
+        mb = tk.Menubutton(parent, textvariable=display_var,
+                           bg=C["panel"], fg=fg,
+                           font=("Segoe UI", 9, "bold"),
+                           relief="raised", bd=1, padx=10, pady=3,
+                           cursor="hand2", direction="below")
+        menu = tk.Menu(mb, tearoff=0, font=("Segoe UI", 9))
+        for opt in options:
+            def _on_pick(o=opt):
+                display_var.set(fmt(o))
+                apply_fn()
+            menu.add_radiobutton(label=fmt(opt), variable=var, value=opt,
+                                 command=_on_pick)
+        mb.configure(menu=menu)
+        return mb
+
+    #   MOUSEWHEEL HELPER
 
     def _bind_mousewheel(self, widget):
         widget.bind("<MouseWheel>",
@@ -1171,12 +1253,36 @@ class BSoidAnnotator(tk.Tk):
         else:
             media_paths = []
 
+        avail_w = self._player_canvas_width
         self._player.load(media_paths, rotation=self.sd.rotation,
-                          speed=self.sd.speed, zoom=self.sd.zoom)
+                          speed=self.sd.speed, zoom=self.sd.zoom,
+                          avail_width=avail_w)
+        self._force_player_redraw()
 
         self._refresh_cluster_list()
         self._scroll_to_current()
         self._update_stats()
+
+    def _force_player_redraw(self):
+        """Force Tk to repaint the player canvas immediately.
+
+        Destroying/recreating the VideoTile children in the same event-loop
+        tick can leave the canvas showing stale pixels on Windows until some
+        unrelated event (e.g. a manual window resize) forces a geometry
+        recompute -- update_idletasks() alone is not always enough. Nudging
+        the canvas window item's width and back reliably forces the repaint.
+        """
+        try:
+            self._player_outer.update_idletasks()
+            w = self._player_canvas_width
+            self._player_outer.itemconfig(self._player_win, width=w + 1)
+            self._player_outer.update_idletasks()
+            self._player_outer.itemconfig(self._player_win, width=w)
+            self._player_outer.configure(
+                scrollregion=self._player_outer.bbox("all"))
+            self._player_outer.update_idletasks()
+        except tk.TclError:
+            pass
 
     def _apply_rotation(self):
         self.sd.rotation = self._rot_var.get()

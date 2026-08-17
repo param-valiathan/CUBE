@@ -7256,13 +7256,13 @@ class GroupRow(ctk.CTkFrame):
         self.swatch.grid(row=0, column=1, padx=(2, 4), pady=10, rowspan=2)
 
         #   group name  
-        self.name_var = ctk.StringVar(value=group_name)
+        self.name_var = ctk.StringVar(master=self, value=group_name)
         ctk.CTkEntry(self, textvariable=self.name_var, width=140,
                      placeholder_text="Group name",
                      ).grid(row=0, column=2, padx=4, pady=(10, 2))
         self.name_var.trace_add("write", lambda *_: self.on_change())
 
-        self._badge_var = ctk.StringVar(value="0 labels")
+        self._badge_var = ctk.StringVar(master=self, value="0 labels")
         ctk.CTkLabel(self, textvariable=self._badge_var,
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11),
@@ -7296,7 +7296,7 @@ class GroupRow(ctk.CTkFrame):
             w.destroy()
         self._check_vars.clear()
         for i, lbl in enumerate(sorted(all_labels)):
-            var = tk.BooleanVar(value=lbl in selected)
+            var = tk.BooleanVar(master=self, value=lbl in selected)
             self._check_vars[lbl] = var
             flagged = lbl in self._low_conf_ids
             cb_kwargs = dict(
@@ -7889,9 +7889,9 @@ class AnimalListPanel(ctk.CTkFrame):
         dlg.resizable(False, False)
         dlg.grab_set()
 
-        v1 = tk.StringVar()
-        v2 = tk.StringVar()
-        v3 = tk.StringVar()
+        v1 = tk.StringVar(master=dlg)
+        v2 = tk.StringVar(master=dlg)
+        v3 = tk.StringVar(master=dlg)
 
         for row_i, (lbl, var, ph) in enumerate([
             ("Label 1", v1, "leave blank to keep current"),
@@ -8133,7 +8133,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         sf = section(ctrl, "Statistical Settings")
         ctk.CTkLabel(sf, text="Experimental Design:", text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._design_var = ctk.StringVar(value="Independent Groups")
+        self._design_var = ctk.StringVar(master=self, value="Independent Groups")
         ctk.CTkOptionMenu(sf, variable=self._design_var,
                           values=["Independent Groups", "Repeated Measures"],
                           width=240).pack(padx=12, pady=(2, 2))
@@ -8144,14 +8144,14 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                      justify="left").pack(anchor="w", padx=12, pady=(0, 4))
         ctk.CTkLabel(sf, text="Group by:", text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._group_by_var = ctk.StringVar(value="Label 1")
+        self._group_by_var = ctk.StringVar(master=self, value="Label 1")
         ctk.CTkOptionMenu(sf, variable=self._group_by_var,
                           values=["Label 1", "Label 2", "Label 3 / Animal ID",
                                   "All Labels"],
                           width=240).pack(padx=12, pady=(2, 4))
         ctk.CTkLabel(sf, text="Metric:", text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._metric_var = ctk.StringVar(value="total_duration")
+        self._metric_var = ctk.StringVar(master=self, value="total_duration")
         ctk.CTkOptionMenu(sf, variable=self._metric_var,
                           values=["total_duration", "frequency", "mean_bout",
                                   "transition_prob", "mean_speed_px_s",
@@ -8160,7 +8160,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                           width=240).pack(padx=12, pady=(2, 4))
         ctk.CTkLabel(sf, text="p-value threshold:", text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._pthresh_var = ctk.StringVar(value="0.05")
+        self._pthresh_var = ctk.StringVar(master=self, value="0.05")
         ctk.CTkEntry(sf, textvariable=self._pthresh_var, width=100
                      ).pack(anchor="w", padx=12, pady=(2, 8))
 
@@ -8168,7 +8168,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         nf = section(ctrl, "Top-N Clusters")
         ctk.CTkLabel(nf, text="N =", text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._topn_var    = ctk.StringVar(value="10")
+        self._topn_var    = ctk.StringVar(master=self, value="10")
         self._topn_slider = ctk.CTkSlider(nf, from_=1, to=30, number_of_steps=29,
                                            command=self._slider_topn, width=240)
         self._topn_slider.set(10)
@@ -8192,21 +8192,21 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         ctk.CTkLabel(df_sec, text="Min mean bout duration (ms):",
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._min_mean_ms_var = ctk.StringVar(value="")
+        self._min_mean_ms_var = ctk.StringVar(master=self, value="")
         ctk.CTkEntry(df_sec, textvariable=self._min_mean_ms_var,
                      width=120, placeholder_text="e.g. 200").pack(anchor="w", padx=12, pady=(2, 4))
 
         ctk.CTkLabel(df_sec, text="Min total duration (s, per animal):",
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._min_total_s_var = ctk.StringVar(value="")
+        self._min_total_s_var = ctk.StringVar(master=self, value="")
         ctk.CTkEntry(df_sec, textvariable=self._min_total_s_var,
                      width=120, placeholder_text="e.g. 2").pack(anchor="w", padx=12, pady=(2, 4))
 
         ctk.CTkLabel(df_sec, text="Min frequency (bouts per animal):",
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._min_freq_var = ctk.StringVar(value="")
+        self._min_freq_var = ctk.StringVar(master=self, value="")
         ctk.CTkEntry(df_sec, textvariable=self._min_freq_var,
                      width=120, placeholder_text="e.g. 5").pack(anchor="w", padx=12, pady=(2, 8))
 
@@ -8229,7 +8229,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         ctk.CTkLabel(rf_sec, text="Max k (merged groups):",
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._maxk_var = ctk.StringVar(value="10")
+        self._maxk_var = ctk.StringVar(master=self, value="10")
         ctk.CTkEntry(rf_sec, textvariable=self._maxk_var, width=80,
                      placeholder_text="10"
                      ).pack(anchor="w", padx=12, pady=(2, 4))
@@ -8237,7 +8237,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         ctk.CTkLabel(rf_sec, text="Compare k values (comma-sep):",
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._compare_k_var = ctk.StringVar(value="3,5,8")
+        self._compare_k_var = ctk.StringVar(master=self, value="3,5,8")
         self._compare_k_user_edited = False
         self._compare_k_entry = ctk.CTkEntry(
             rf_sec, textvariable=self._compare_k_var, width=200,
@@ -8262,7 +8262,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         ctk.CTkLabel(rf_sec, text="Pose-distance cap (percentile, 100 = off):",
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._pose_cap_var = ctk.StringVar(value="100")
+        self._pose_cap_var = ctk.StringVar(master=self, value="100")
         self._pose_cap_entry = ctk.CTkEntry(rf_sec, textvariable=self._pose_cap_var,
                                              width=80, placeholder_text="100")
         self._pose_cap_entry.pack(anchor="w", padx=12, pady=(2, 2))
@@ -8289,13 +8289,13 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         _gm_row.pack(anchor="w", padx=12, pady=(2, 8))
         ctk.CTkLabel(_gm_row, text="cap %:", text_color=T()["subtext"],
                      font=ctk.CTkFont(size=10)).pack(side="left")
-        self._guided_cap_var = ctk.StringVar(value="50")
+        self._guided_cap_var = ctk.StringVar(master=self, value="50")
         ctk.CTkEntry(_gm_row, textvariable=self._guided_cap_var, width=50,
                      placeholder_text="50"
                      ).pack(side="left", padx=(2, 10))
         ctk.CTkLabel(_gm_row, text="min gap:", text_color=T()["subtext"],
                      font=ctk.CTkFont(size=10)).pack(side="left")
-        self._guided_gap_var = ctk.StringVar(value="0.15")
+        self._guided_gap_var = ctk.StringVar(master=self, value="0.15")
         ctk.CTkEntry(_gm_row, textvariable=self._guided_gap_var, width=50,
                      placeholder_text="0.15"
                      ).pack(side="left", padx=(2, 0))
@@ -8326,7 +8326,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
 
         ctk.CTkLabel(sg_sec, text="Source:", text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(2, 0))
-        self._save_source_var = ctk.StringVar(value="Manual (k-sweep)")
+        self._save_source_var = ctk.StringVar(master=self, value="Manual (k-sweep)")
         ctk.CTkSegmentedButton(
             sg_sec, values=["Manual (k-sweep)", "Guided Merge"],
             variable=self._save_source_var,
@@ -8335,7 +8335,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         ctk.CTkLabel(sg_sec, text="k to save (manual source only):",
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(2, 0))
-        self._save_k_var = ctk.StringVar(value="5")
+        self._save_k_var = ctk.StringVar(master=self, value="5")
         ctk.CTkEntry(sg_sec, textvariable=self._save_k_var, width=80
                      ).pack(anchor="w", padx=12, pady=(2, 8))
 
@@ -8403,7 +8403,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         sel_fr.grid(row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=(4, 2))
         ctk.CTkLabel(sel_fr, text="View:",
                      font=ctk.CTkFont(size=11)).pack(side="left", padx=8, pady=6)
-        self._plot_mode = ctk.StringVar(value="Top-N Bar")
+        self._plot_mode = ctk.StringVar(master=self, value="Top-N Bar")
         ctk.CTkSegmentedButton(
             sel_fr,
             values=["Top-N Bar", "Volcano", "Heatmap",
@@ -10904,7 +10904,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
         self._perm_toggle_frame = None    # Conditional/Nested toggle frame (left panel)
 
         # Multi-factor prediction target
-        self._factor_var = tk.StringVar(value="Combined")
+        self._factor_var = tk.StringVar(master=self, value="Combined")
 
         # Threading state
         import queue as _queue
@@ -10943,7 +10943,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
 
         # Feature source
         sf = section("Feature Source")
-        self._source_var = ctk.StringVar(value="clusters")
+        self._source_var = ctk.StringVar(master=self, value="clusters")
         for label, val in [("Individual clusters",           "clusters"),
                            ("Behavior groups",               "groups"),
                            ("Mix (both)",                    "mix"),
@@ -10985,7 +10985,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
 
         # Algorithm
         af = section("Algorithm")
-        self._algo_var = ctk.StringVar(value=self._ALGO_OPTS[0])
+        self._algo_var = ctk.StringVar(master=self, value=self._ALGO_OPTS[0])
         ctk.CTkOptionMenu(af, variable=self._algo_var,
                           values=self._ALGO_OPTS,
                           width=220).pack(padx=12, pady=(4, 10))
@@ -11008,7 +11008,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
 
         # Permutation count
         pf = section("Permutation Test")
-        self._nperm_var = ctk.StringVar(value="199")
+        self._nperm_var = ctk.StringVar(master=self, value="199")
         ctk.CTkOptionMenu(pf, variable=self._nperm_var,
                           values=["99", "199", "499", "999"],
                           width=220).pack(padx=12, pady=(4, 4))
@@ -11041,7 +11041,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
                      text_color=T()["muted"],
                      font=ctk.CTkFont(size=10),
                      justify="left").pack(anchor="w", padx=12, pady=(2, 0))
-        self._max_contrib_var = ctk.StringVar(value="5")
+        self._max_contrib_var = ctk.StringVar(master=self, value="5")
         ctk.CTkOptionMenu(mc_f, variable=self._max_contrib_var,
                           values=["All", "1", "2", "3", "4", "5", "6", "8",
                                   "10", "15", "20", "30"],
@@ -11053,14 +11053,14 @@ class GroupPredictorPanel(ctk.CTkFrame):
                      text="Optional label for this run configuration",
                      text_color=T()["muted"],
                      font=ctk.CTkFont(size=10)).pack(anchor="w", padx=12, pady=(2, 0))
-        self._model_name_var = ctk.StringVar(value="")
+        self._model_name_var = ctk.StringVar(master=self, value="")
         ctk.CTkEntry(self._model_name_section,
                      textvariable=self._model_name_var,
                      placeholder_text="e.g. Mix-Locomotion",
                      width=220).pack(padx=12, pady=(4, 10))
         self._model_name_section.pack_forget()   # hidden until mix / custom
 
-        self._view_model_var = tk.IntVar(value=0)
+        self._view_model_var = tk.IntVar(master=self, value=0)
         self._model_radio_btns: list = []
 
         # Run
@@ -11138,7 +11138,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
                          font=ctk.CTkFont(size=10)).pack(anchor="w", padx=6)
             return
         for c in sorted(all_clusters):
-            var = tk.BooleanVar(value=True)
+            var = tk.BooleanVar(master=self, value=True)
             self._cluster_vars[c] = var
             ctk.CTkCheckBox(self._clusters_inner, text=f"Cluster {c}",
                             variable=var,
@@ -11158,7 +11158,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
                          font=ctk.CTkFont(size=10)).pack(anchor="w", padx=6)
             return
         for gname in groups:
-            var = tk.BooleanVar(value=True)
+            var = tk.BooleanVar(master=self, value=True)
             self._group_vars[gname] = var
             ctk.CTkCheckBox(self._groups_inner, text=gname,
                             variable=var,
@@ -16838,7 +16838,7 @@ class BehavioralExplorerPanel(ctk.CTkFrame):
         ctk.CTkLabel(gb, text="Treat this label as experimental group:",
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._group_by_var = ctk.StringVar(value="Label 1")
+        self._group_by_var = ctk.StringVar(master=self, value="Label 1")
         ctk.CTkOptionMenu(gb, variable=self._group_by_var,
                           values=["Label 1", "Label 2", "Label 3 / Animal ID",
                                   "All Labels"],
@@ -16849,7 +16849,7 @@ class BehavioralExplorerPanel(ctk.CTkFrame):
         ctk.CTkLabel(dh, text="Reference / Control group:",
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._ctrl_var = ctk.StringVar(value="(auto — first group)")
+        self._ctrl_var = ctk.StringVar(master=self, value="(auto — first group)")
         self._ctrl_entry = ctk.CTkEntry(dh, textvariable=self._ctrl_var, width=220)
         self._ctrl_entry.pack(padx=12, pady=(2, 8))
 
@@ -16865,7 +16865,7 @@ class BehavioralExplorerPanel(ctk.CTkFrame):
         ctk.CTkLabel(sk, text="Bout positions to show:",
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._nsteps_var = ctk.StringVar(value="5")
+        self._nsteps_var = ctk.StringVar(master=self, value="5")
         self._nsteps_slider = ctk.CTkSlider(
             sk, from_=2, to=10, number_of_steps=8,
             command=lambda v: self._nsteps_var.set(str(int(round(v)))),
@@ -16920,7 +16920,7 @@ class BehavioralExplorerPanel(ctk.CTkFrame):
         ctk.CTkLabel(bf, text="Min mean bout duration (ms):",
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._brf_min_mean_ms_var = ctk.StringVar(value="")
+        self._brf_min_mean_ms_var = ctk.StringVar(master=self, value="")
         ctk.CTkEntry(bf, textvariable=self._brf_min_mean_ms_var,
                      width=120, placeholder_text="e.g. 200"
                      ).pack(anchor="w", padx=12, pady=(2, 4))
@@ -16928,7 +16928,7 @@ class BehavioralExplorerPanel(ctk.CTkFrame):
         ctk.CTkLabel(bf, text="Min total duration (s, per animal):",
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._brf_min_total_s_var = ctk.StringVar(value="")
+        self._brf_min_total_s_var = ctk.StringVar(master=self, value="")
         ctk.CTkEntry(bf, textvariable=self._brf_min_total_s_var,
                      width=120, placeholder_text="e.g. 2"
                      ).pack(anchor="w", padx=12, pady=(2, 4))
@@ -16936,7 +16936,7 @@ class BehavioralExplorerPanel(ctk.CTkFrame):
         ctk.CTkLabel(bf, text="Min frequency (bouts per animal):",
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._brf_min_freq_var = ctk.StringVar(value="")
+        self._brf_min_freq_var = ctk.StringVar(master=self, value="")
         ctk.CTkEntry(bf, textvariable=self._brf_min_freq_var,
                      width=120, placeholder_text="e.g. 5"
                      ).pack(anchor="w", padx=12, pady=(2, 8))
@@ -16989,7 +16989,7 @@ class BehavioralExplorerPanel(ctk.CTkFrame):
                     padx=4, pady=(4, 2))
         ctk.CTkLabel(sel_fr, text="View:",
                      font=ctk.CTkFont(size=11)).pack(side="left", padx=8, pady=6)
-        self._view_var = ctk.StringVar(value=self._VIEWS[0])
+        self._view_var = ctk.StringVar(master=self, value=self._VIEWS[0])
         ctk.CTkSegmentedButton(
             sel_fr,
             values=self._VIEWS,
@@ -17729,7 +17729,7 @@ class BSOiDApp(ctk.CTk):
         ctk.CTkLabel(hdr, text="   CUBE Suite",
                      font=ctk.CTkFont(size=17, weight="bold"),
                      ).grid(row=0, column=0, sticky="w")
-        self._theme_var = ctk.StringVar(value="Dark")
+        self._theme_var = ctk.StringVar(master=self, value="Dark")
         ctk.CTkSegmentedButton(
             hdr, values=["Dark", "Light"],
             variable=self._theme_var,
@@ -17756,7 +17756,7 @@ class BSOiDApp(ctk.CTk):
                       ).pack(side="left")
 
         # Ignore-groups toggle
-        self._ignore_groups_var = ctk.BooleanVar(value=False)
+        self._ignore_groups_var = ctk.BooleanVar(master=self, value=False)
         ctk.CTkCheckBox(
             fc, text="Ignore imported groups — use clusters directly",
             variable=self._ignore_groups_var,
@@ -17775,7 +17775,7 @@ class BSOiDApp(ctk.CTk):
         )
         self._csv_combo.grid(row=0, column=1, padx=(0, 10), pady=8)
         ctk.CTkLabel(mc, text="FPS:").grid(row=1, column=0, padx=(10, 4))
-        self._fps_var = ctk.StringVar(value=str(DEFAULT_FPS))
+        self._fps_var = ctk.StringVar(master=self, value=str(DEFAULT_FPS))
         ctk.CTkEntry(mc, textvariable=self._fps_var, width=70,
                      ).grid(row=1, column=1, padx=(0, 10), pady=(0, 8), sticky="w")
         self._fps_var.trace_add("write", lambda *_: self._refresh_preview())
@@ -18021,7 +18021,7 @@ class BSOiDApp(ctk.CTk):
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(side="left", padx=(16, 2), pady=6)
         if not hasattr(self, "_combined_group_by_var"):
-            self._combined_group_by_var = ctk.StringVar(value="Label 1")
+            self._combined_group_by_var = ctk.StringVar(master=self, value="Label 1")
         ctk.CTkOptionMenu(btns, variable=self._combined_group_by_var,
                           values=["Label 1", "Label 2", "Label 3 / Animal ID",
                                   "All Labels"],
