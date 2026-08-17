@@ -4,8 +4,9 @@ This document explains, end to end, how CUBE turns raw DeepLabCut (DLC) pose-tra
 labelled behaviours, and positions CUBE's clustering pipeline — including the cluster-quality upgrades
 added on top of the base B-SOiD architecture — against the wider unsupervised behaviour-classification
 literature (B-SOiD, VAME, keypoint-MoSeq, MotionMapper, and the semi-supervised alternatives SimBA/
-DeepEthogram). It is a companion to `README.md` (feature summary) and `CUBE_GUIDE.md` (step-by-step usage) —
-this document is the "why it's built this way" reference.
+DeepEthogram). It is a companion to `README.md` (feature summary), `CUBE_GUIDE.md` (step-by-step usage), and
+`Behavioral_Paradigms_Reference.md` (data requirements, use cases, and limitations for the paradigm-specific
+reporting covered in Section 6) — this document is the "why it's built this way" reference.
 
 ---
 
@@ -134,10 +135,69 @@ Full parameter reference, defaults, and worked use cases are in `CUBE_GUIDE.md`'
 
 ---
 
+## 6. Paradigm-specific reporting (v6 part 3, post-hoc, Analyser)
+
+Everything above operates on clustering output alone — cluster identity, duration, frequency, transitions —
+with no reference to the animal's position in the arena or its relationship to traced regions/objects.
+CUBE's Environmental Context feature (`env_features_enabled`) closes that gap by computing per-bin
+region/object membership and distance series alongside the existing pipeline (Section 2's table, this
+document), and the Analyser's Paradigm Results tab (`ParadigmResultsPanel`, `cube_analyser.py`) turns that
+series into six literature-standard behavioral-paradigm indices — spontaneous alternation (Y-Maze), open-arm
+time/entries/latency (Elevated Plus Maze), discrimination index (Novel Object Recognition), sociability and
+social-novelty indices (Three-Chamber Test), and preference index (Place/Conditioned Place Preference) —
+plus a paradigm-agnostic rule-based approach/avoid event detector. Full data requirements, per-paradigm use
+cases, and known limitations are in `Behavioral_Paradigms_Reference.md`; this section covers the
+**methodological** choices, in the same register as the clustering methodology above.
+
+**Statistical design.** Two distinct questions recur across every paradigm and are deliberately kept
+statistically and visually separate: "does this index differ between experimental groups" (Kruskal-Wallis +
+Dunn's/Mann-Whitney post-hoc, BH-FDR corrected — identical machinery to Section 5's cluster-level tests,
+reused via a thin adapter rather than re-implemented) and "does this index differ from a fixed reference
+value" (chance level for Discrimination Index, zero for CPP's delta score — a one-sample t-test or
+one-sample Wilcoxon signed-rank test, likewise BH-FDR corrected, and rendered with a visually distinct
+marker convention). Folding both questions onto one significance symbol would let a reader mistake "group A
+differs from group B" for "group A differs from chance," which are not interchangeable claims — this is the
+same discipline the field expects of, e.g., a discrimination-index paper reporting both a one-sample test
+against 50%/0 and a between-group test, not one or the other.
+
+**The activity/locomotor confound is treated as a first-class requirement, not an afterthought.** A
+literature review conducted while designing this feature found that every paradigm except Novel Object
+pairs its primary index with a separate activity/exploration control metric in standard published usage,
+because an index that looks anxiolytic, preferring, or discriminating can, in an underpowered or
+confounded design, simply reflect a locomotor difference. CUBE's Paradigm Results tab makes this bar
+mandatory (shown alongside the primary index automatically, not an optional toggle) rather than leaving it
+to the user to remember.
+
+**Spatial reporting is deliberately labeled as an approximation where it is one.** The occupancy-density
+heatmap is a real, direct measurement (2D histogram of tracked centroid position). The region/object
+*outlines* drawn on top of it are not — `env_arena_cfg`'s traced polygon vertices are never persisted to any
+per-run output file (a genuine, disclosed architectural gap, not a rounding error), so the outline shown is
+reconstructed as the convex hull of positions already known to belong to that region/object. This is stated
+explicitly in-figure (`"(approx.)"`) rather than presented with the same visual authority as a directly
+measured boundary — a distinction worth preserving in any downstream figure reuse.
+
+**A new statistical primitive was added, not a new statistical framework.** `run_cluster_statistics()`
+(Section 5's reused machinery) has no group-vs-fixed-constant mode; rather than generalizing that function
+or building a parallel testing framework, one small, self-contained one-sample primitive
+(`run_one_sample_statistics`) was added alongside it, sharing its BH-FDR convention. This mirrors the
+scoping discipline already established in Section 5 — WGCNA's `mergeCloseModules` pattern was adopted
+without adopting WGCNA's full module-detection framework, and the same "borrow the smallest correct
+mechanism" approach applies here.
+
+Full parameter reference, per-paradigm tracing requirements, use cases, and shortcomings are in
+`Behavioral_Paradigms_Reference.md`; implementation detail (schema, deviations, verification) is in
+`Environmental_Context_v6_Implementation_Report.md`, `Kinematics_v6_Implementation_Report.md`, and
+`Analyser_Paradigm_Reporting_v6_Implementation_Report.md`.
+
+---
+
 *Sources: B-SOiD (Hsu & Yttri, *eLife* 2021); VAME (Luxem et al., *Communications Biology* 2022); keypoint-MoSeq
 (Weinreb et al., *Nature Methods* 2024); MotionMapper (Berman et al., *J. R. Soc. Interface* 2014); WGCNA /
 `dynamicTreeCut` / `mergeCloseModules` (Langfelder & Horvath, *BMC Bioinformatics* 2008); cophenetic
-correlation (Sokal & Rohlf, *Taxon* 1962). See also `README.md`'s "How this relates to B-SOiD, VAME, and
-keypoint-MoSeq" section and `CUBE_GUIDE.md`'s Step 3 (Iterative Split/Merge Refinement, Visibility &
-Confidence Features), Step 5 (Cluster Validity plot mode), and Recombination Guide documentation for the
-corresponding user-facing settings.*
+correlation (Sokal & Rohlf, *Taxon* 1962); standard behavioral-paradigm metric/control conventions per
+ConductScience's OFT/EPM/Y-maze/CPP protocol references, PMC reviews of novel-object-recognition and
+three-chamber sociability methodology, and a Frontiers review of CPP quantification approaches (used to
+confirm standard metric/control pairings, not cited as primary research claims). See also `README.md`'s "How
+this relates to B-SOiD, VAME, and keypoint-MoSeq" section and `CUBE_GUIDE.md`'s Step 3 (Iterative
+Split/Merge Refinement, Visibility & Confidence Features), Step 5 (Cluster Validity plot mode, Paradigm
+Results tab), and Recombination Guide documentation for the corresponding user-facing settings.*

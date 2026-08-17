@@ -37,6 +37,7 @@ The pipeline runs from raw video to full statistical group comparisons in six st
 |---|---|
 | [CUBE_GUIDE.md](CUBE_GUIDE.md) | **Full user guide** — installation, step-by-step walkthrough, all features, troubleshooting |
 | [GROUP_PREDICTOR_REFERENCE.md](GROUP_PREDICTOR_REFERENCE.md) | **Complete Group Predictor reference** — algorithms, figures, controls, interpretation, caveats |
+| [Behavioral_Paradigms_Reference.md](Behavioral_Paradigms_Reference.md) | **Complete Paradigm Results reference** — per-paradigm data/tracing requirements, use cases, and limitations |
 | [TEST_README.md](TEST_README.md) | Test suite documentation |
 
 ---
