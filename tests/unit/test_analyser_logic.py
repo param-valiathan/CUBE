@@ -153,3 +153,67 @@ class TestComputeTransitionMatrix:
         assert cids == [0]
         assert mat.shape == (1, 1)
         assert mat[0, 0] == 0.0
+
+
+class TestClusterKinematicsJoin:
+    """v6 K1: compute_cluster_kinematics.csv wiring into cube_analyser.py's
+    per-cluster metrics table (find_cluster_kinematics/load_cluster_kinematics/
+    compute_per_cluster_metrics' kinematics_df param). Covers the plan's own
+    verification bullets: file found + joined correctly, and graceful
+    degradation (no crash, NaN not KeyError) when the file is absent."""
+
+    def _make_run(self, tmp_path, write_kinematics=True):
+        out_dir = tmp_path / "run1"
+        bout_dir = out_dir / "bout_lengths"
+        bout_dir.mkdir(parents=True)
+        bout_path = bout_dir / "sess1_bout_lengths_hmm.csv"
+        make_bout_df([(0, 0, 10), (1, 10, 10), (2, 20, 10)]).rename(
+            columns={"label": "B-SOiD labels", "start_frame": "Start time (frames)",
+                     "run_len": "Run lengths"}
+        ).to_csv(bout_path, index=False)
+        if write_kinematics:
+            pd.DataFrame({
+                "cluster_id": [0, 1, 2],
+                "n_frames": [100, 50, 50],
+                "mean_speed_px_s": [1.5, 2.5, 3.5],
+                "mean_body_elongation_px": [10.0, 11.0, 12.0],
+                "mean_angular_velocity_rad_s": [0.1, 0.2, 0.3],
+            }).to_csv(out_dir / "cluster_kinematics.csv", index=False)
+        return bout_path
+
+    def test_find_and_load_kinematics_when_present(self, tmp_path):
+        bout_path = self._make_run(tmp_path, write_kinematics=True)
+        found = ca.find_cluster_kinematics(bout_path)
+        assert found is not None and found.name == "cluster_kinematics.csv"
+        kin = ca.load_cluster_kinematics(bout_path)
+        assert kin is not None
+        assert list(kin.index) == [0, 1, 2]
+        assert kin.loc[1, "mean_speed_px_s"] == pytest.approx(2.5)
+
+    def test_load_kinematics_returns_none_when_absent(self, tmp_path):
+        bout_path = self._make_run(tmp_path, write_kinematics=False)
+        assert ca.find_cluster_kinematics(bout_path) is None
+        assert ca.load_cluster_kinematics(bout_path) is None
+
+    def test_compute_per_cluster_metrics_joins_kinematics_columns(self, tmp_path):
+        bout_path = self._make_run(tmp_path, write_kinematics=True)
+        df = ca.load_csv(bout_path)
+        kin = ca.load_cluster_kinematics(bout_path)
+        pcm = ca.compute_per_cluster_metrics(df, fps=30, kinematics_df=kin)
+        assert pcm.loc[0, "mean_speed_px_s"] == pytest.approx(1.5)
+        assert pcm.loc[1, "mean_body_elongation_px"] == pytest.approx(11.0)
+        assert pcm.loc[2, "mean_angular_velocity_rad_s"] == pytest.approx(0.3)
+        # pre-existing columns untouched
+        assert pcm.loc[0, "frequency"] == 1
+
+    def test_compute_per_cluster_metrics_degrades_gracefully_without_kinematics(self, tmp_path):
+        bout_path = self._make_run(tmp_path, write_kinematics=False)
+        df = ca.load_csv(bout_path)
+        # No kinematics_df at all (legacy call signature) -- columns are
+        # present (so metric-selection UI never KeyErrors) but NaN.
+        pcm = ca.compute_per_cluster_metrics(df, fps=30)
+        assert "mean_speed_px_s" in pcm.columns
+        assert np.isnan(pcm.loc[0, "mean_speed_px_s"])
+        # Core columns unaffected by the missing kinematics file.
+        assert pcm.loc[0, "frequency"] == 1
+        assert pcm.loc[0, "total_duration"] == pytest.approx(10 / 30)

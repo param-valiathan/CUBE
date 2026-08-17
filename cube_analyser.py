@@ -439,6 +439,27 @@ def find_cluster_mapping(root: pathlib.Path) -> pathlib.Path | None:
     return None
 
 
+def find_cluster_kinematics(bout_path: pathlib.Path) -> pathlib.Path | None:
+    """
+    Locate cluster_kinematics.csv for the run a given bout_lengths CSV belongs
+    to. Written by BSoidEngine.run() directly under <output_dir>/ (a sibling
+    of the bout_lengths/ folder), so this walks upward from the bout file's
+    parent looking for it -- gracefully returns None for older runs that
+    predate this file (e.g. pre-v6 CUBE outputs).
+    """
+    try:
+        for ancestor in (bout_path.parent, bout_path.parent.parent,
+                          bout_path.parent.parent.parent):
+            if not ancestor.is_dir():
+                continue
+            candidate = ancestor / "cluster_kinematics.csv"
+            if candidate.is_file():
+                return candidate
+    except Exception:
+        pass
+    return None
+
+
 def find_phase4_session_json(root: pathlib.Path) -> pathlib.Path | None:
     """
     Search for a Phase 4 (Video Explorer) session JSON file.
@@ -824,6 +845,26 @@ def load_csv(path: pathlib.Path) -> pd.DataFrame:
     return df.sort_values("start_frame").reset_index(drop=True)
 
 
+def load_cluster_kinematics(bout_path: pathlib.Path) -> pd.DataFrame | None:
+    """
+    Load cluster_kinematics.csv (written by compute_cluster_kinematics in
+    cube_core.py) for the run a given bout_lengths CSV belongs to, indexed by
+    cluster_id. Returns None -- never raises -- when the run predates this
+    file or it can't be read, so callers can degrade gracefully (K1, v6).
+    """
+    kin_path = find_cluster_kinematics(bout_path)
+    if kin_path is None:
+        return None
+    try:
+        df = pd.read_csv(kin_path)
+        if "cluster_id" not in df.columns:
+            return None
+        df["cluster_id"] = df["cluster_id"].astype(int)
+        return df.set_index("cluster_id")
+    except Exception:
+        return None
+
+
 def load_mapping_tsv(path: pathlib.Path) -> dict:
     """
     Load a cluster_behaviour_mapping.tsv produced by Video Explorer v2+.
@@ -860,21 +901,37 @@ def load_mapping_tsv(path: pathlib.Path) -> dict:
 # PER-CLUSTER METRIC EXTRACTION  (used by Unbiased Analytics)
 #  
 
-def compute_per_cluster_metrics(df: pd.DataFrame, fps: int) -> pd.DataFrame:
+def compute_per_cluster_metrics(df: pd.DataFrame, fps: int,
+                                 kinematics_df: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Compute per-cluster (individual B-SOiD label) metrics for one animal.
     Returns DataFrame: cluster_id, total_duration, frequency, mean_bout
+    [, mean_speed_px_s, mean_body_elongation_px, mean_angular_velocity_rad_s]
+
+    kinematics_df: optional, cluster_id-indexed DataFrame from
+    load_cluster_kinematics() (K1, v6). Its three interpretable kinematic-
+    signature columns are always present in the output so callers/plots can
+    reference them unconditionally without KeyErrors; values are NaN whenever
+    kinematics_df is None (older run predating cluster_kinematics.csv) or the
+    cluster id is absent from it -- graceful degradation, not a crash.
     """
     rows = []
     for label in df["label"].unique():
         sub   = df[df["label"] == label]
         durs  = sub["run_len"].values / fps
-        rows.append({
+        row = {
             "cluster_id":     int(label),
             "total_duration": float(durs.sum()),
             "frequency":      len(durs),
             "mean_bout":      float(durs.mean()),
-        })
+        }
+        krow = (kinematics_df.loc[int(label)]
+                if kinematics_df is not None and int(label) in kinematics_df.index
+                else None)
+        row["mean_speed_px_s"]            = float(krow["mean_speed_px_s"]) if krow is not None else np.nan
+        row["mean_body_elongation_px"]     = float(krow["mean_body_elongation_px"]) if krow is not None else np.nan
+        row["mean_angular_velocity_rad_s"] = float(krow["mean_angular_velocity_rad_s"]) if krow is not None else np.nan
+        rows.append(row)
     return pd.DataFrame(rows).set_index("cluster_id")
 
 
@@ -1371,7 +1428,8 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
         raise ValueError(f"Unknown design {design!r}; expected 'independent' or 'repeated'")
 
     if _compute_fn is None:
-        _compute_fn = lambda ani: compute_per_cluster_metrics(ani["df"], ani["fps"])
+        _compute_fn = lambda ani: compute_per_cluster_metrics(
+            ani["df"], ani["fps"], ani.get("kinematics_df"))
 
     # Build per-cluster, per-group value lists (subject_id carried along so a
     # Repeated Measures design can pair the same animal across levels).
@@ -2648,7 +2706,8 @@ def build_heatmap_figure(stats_df: pd.DataFrame, animal_data: list,
     if metric == "transition_prob":
         _pcm_cache = [compute_per_pair_transition_probs(a["df"]) for a in animals_sorted]
     else:
-        _pcm_cache = [compute_per_cluster_metrics(a["df"], a["fps"]) for a in animals_sorted]
+        _pcm_cache = [compute_per_cluster_metrics(a["df"], a["fps"], a.get("kinematics_df"))
+                      for a in animals_sorted]
     mat = np.zeros((len(top_ids), n_animals))
     for ci, cid in enumerate(top_ids):
         for ai in range(n_animals):
@@ -3699,7 +3758,7 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
         (lambda a: compute_per_pair_transition_probs(a["df"]))
         if metric == "transition_prob"
         else
-        (lambda a: compute_per_cluster_metrics(a["df"], a["fps"]))
+        (lambda a: compute_per_cluster_metrics(a["df"], a["fps"], a.get("kinematics_df")))
     )
     eg_map: dict = {}
     subject_map: dict = {}   # eg -> [subject_id,...] aligned with eg_map[eg]
@@ -7702,6 +7761,7 @@ class AnimalListPanel(ctk.CTkFrame):
                     "path":      path,
                     "df":        df,
                     "fps":       fps,
+                    "kinematics_df": load_cluster_kinematics(path),
                     "exp_group": tk.StringVar(master=self, value=saved.get("label1", "Control")),
                     "label2":    tk.StringVar(master=self, value=saved.get("label2", "")),
                     "label3":    tk.StringVar(master=self, value=saved.get("label3", "")),
@@ -7935,6 +7995,7 @@ class AnimalListPanel(ctk.CTkFrame):
                 "path":       a["path"],
                 "df":         a["df"],
                 "fps":        a["fps"],
+                "kinematics_df": a.get("kinematics_df"),
                 "exp_group":  eg,
                 "subject_id": self._read_extra_label(a, "label3"),
             })
@@ -7988,6 +8049,7 @@ class AnimalListPanel(ctk.CTkFrame):
                 "path":       path,
                 "df":         df,
                 "fps":        fps,
+                "kinematics_df": load_cluster_kinematics(path),
                 "exp_group":  tk.StringVar(master=self, value=saved.get("label1", "Control")),
                 "label2":     tk.StringVar(master=self, value=saved.get("label2", "")),
                 "label3":     tk.StringVar(master=self, value=saved.get("label3", "")),
@@ -8092,7 +8154,9 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         self._metric_var = ctk.StringVar(value="total_duration")
         ctk.CTkOptionMenu(sf, variable=self._metric_var,
                           values=["total_duration", "frequency", "mean_bout",
-                                  "transition_prob"],
+                                  "transition_prob", "mean_speed_px_s",
+                                  "mean_body_elongation_px",
+                                  "mean_angular_velocity_rad_s"],
                           width=240).pack(padx=12, pady=(2, 4))
         ctk.CTkLabel(sf, text="p-value threshold:", text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
