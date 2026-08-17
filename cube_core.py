@@ -4570,6 +4570,127 @@ def _compute_env_derived_metrics(paradigm: str, regions: list,
     return out
 
 
+def detect_approach_avoid_events(bout_df: "pd.DataFrame", env_pb: dict, fps: float,
+                                  win: int, straightness_thresh: float = 0.6,
+                                  low_speed_pct: float = 50.0,
+                                  terminal_bins: int = 2) -> "pd.DataFrame":
+    """
+    Rule-based approach/avoid event detector (v6 part 2, Step 7 / Phase 3.5).
+    Pure function -- no new fusion, no new environmental computation: reuses
+    kinematics' per-bout straightness_ratio/mean_speed_px_s (already present
+    in bout_df -- i.e. this must be called on a bout table that already went
+    through Kinematic_Transition_v6_Implementation_Plan.md's
+    compute_bout_directedness()) and Step 4's per-bin region/object distance
+    series (env_pb, compute_session_env_context()'s "per_bin" output), joined
+    via enrich_bouts_from_bin_source() applied to just the LAST
+    terminal_bins bins of each candidate bout (its terminal window) rather
+    than a whole-bout average, so the reported approach target reflects
+    where the bout was actually heading, not diluted by its earlier frames.
+
+    Rule: a bout is "directed locomotion" if straightness_ratio >=
+    straightness_thresh AND mean_speed_px_s is at/above this bout table's
+    own low_speed_pct percentile (default: median -- "faster than a typical
+    bout in this session", a session-relative threshold rather than an
+    arbitrary absolute pixel speed). A detected approach EVENT additionally
+    requires the immediately following bout to be "investigation-type":
+    mean_speed_px_s below that same percentile. This codebase has no
+    separate HMM state/syntax classifier of "investigation" states to key
+    off (the plan's "existing HMM state/syntax info" phrasing), so bout-own
+    speed is the rule-based proxy used here -- flagged explicitly since this
+    is a simplification of the plan's literal wording, not a literal reuse
+    of an existing classifier that doesn't exist in this codebase.
+
+    Returns a DataFrame (possibly empty, same columns either way) with one
+    row per detected approach event: start_frame, end_frame, duration_s,
+    straightness_ratio, mean_speed_px_s, next_bout_label,
+    next_bout_mean_speed_px_s, approach_target_region,
+    approach_target_object. Region/object targets are None when nothing
+    resolvable at the bout's terminal window. Returns an empty (zero-row,
+    correctly-columned) DataFrame when bout_df lacks the required kinematics
+    columns or env_pb has no usable region/object series -- both real no-op
+    preconditions, not errors.
+    """
+    _cols = ["start_frame", "end_frame", "duration_s", "straightness_ratio",
+             "mean_speed_px_s", "next_bout_label", "next_bout_mean_speed_px_s",
+             "approach_target_region", "approach_target_object"]
+    if bout_df is None or bout_df.empty or \
+       "straightness_ratio" not in bout_df.columns or \
+       "mean_speed_px_s" not in bout_df.columns:
+        return pd.DataFrame(columns=_cols)
+
+    df = bout_df.reset_index(drop=True).copy()
+    speed = df["mean_speed_px_s"].astype(float)
+    speed_thresh = (float(np.nanpercentile(speed.dropna(), low_speed_pct))
+                     if speed.notna().any() else 0.0)
+
+    is_directed = ((df["straightness_ratio"].astype(float) >= straightness_thresh)
+                   & (speed >= speed_thresh))
+    next_speed = speed.shift(-1)
+    next_is_investigation = next_speed < speed_thresh
+    is_event = is_directed & next_is_investigation & next_speed.notna()
+
+    event_idx = df.index[is_event].tolist()
+    if not event_idx:
+        return pd.DataFrame(columns=_cols)
+
+    start_frames = df["Start time (frames)"].astype(int)
+    run_lens     = df["Run lengths"].astype(int)
+    term_rows = []
+    for i in event_idx:
+        sf, rl = int(start_frames[i]), int(run_lens[i])
+        ef = sf + rl - 1
+        term_len_frames = max(1, terminal_bins * win)
+        term_sf = max(sf, ef - term_len_frames + 1)
+        term_rows.append({"B-SOiD labels": int(df.loc[i, "B-SOiD labels"]),
+                           "Start time (frames)": term_sf,
+                           "Run lengths": ef - term_sf + 1})
+    term_df = pd.DataFrame(term_rows)
+
+    region_names = sorted({v for v in (env_pb.get("current_region") or [])
+                            if v is not None})
+    object_names = sorted((env_pb.get("dist_to_nearest_object_nose") or {}).keys())
+    if not region_names and not object_names:
+        return pd.DataFrame(columns=_cols)
+
+    src, agg, out_names = {}, {}, {}
+    if region_names:
+        src["current_region"] = np.array(env_pb.get("current_region") or [], dtype=object)
+        agg["current_region"] = lambda seg: (
+            pd.Series([v for v in seg if v is not None]).mode().iloc[0]
+            if len(seg) and any(v is not None for v in seg) else None)
+        out_names["current_region"] = "approach_target_region"
+    for _on in object_names:
+        _k = f"dist__{_on}"
+        src[_k] = np.array(env_pb["dist_to_nearest_object_nose"].get(_on, []), dtype=float)
+        agg[_k] = np.nanmean
+        out_names[_k] = f"__meandist__{_on}"
+
+    joined = enrich_bouts_from_bin_source(
+        term_df, src, bin_offset=0, win=win, agg_fns=agg, out_col_names=out_names)
+
+    dist_cols = [c for c in joined.columns if c.startswith("__meandist__")]
+    approach_target_object = []
+    for _, row in joined.iterrows():
+        vals = {c[len("__meandist__"):]: row[c] for c in dist_cols if pd.notna(row[c])}
+        approach_target_object.append(min(vals, key=vals.get) if vals else None)
+
+    out_rows = []
+    for j, i in enumerate(event_idx):
+        sf, rl = int(start_frames[i]), int(run_lens[i])
+        out_rows.append({
+            "start_frame": sf, "end_frame": sf + rl - 1,
+            "duration_s": rl / fps,
+            "straightness_ratio": float(df.loc[i, "straightness_ratio"]),
+            "mean_speed_px_s": float(df.loc[i, "mean_speed_px_s"]),
+            "next_bout_label": int(df.loc[i + 1, "B-SOiD labels"]),
+            "next_bout_mean_speed_px_s": float(next_speed.loc[i]),
+            "approach_target_region": (joined.loc[j, "approach_target_region"]
+                                        if "approach_target_region" in joined.columns else None),
+            "approach_target_object": approach_target_object[j],
+        })
+    return pd.DataFrame(out_rows, columns=_cols)
+
+
 def compute_cluster_confidence_profile(vis_feats: np.ndarray, vis_col_names: list,
                                         labels: np.ndarray, out_path: Path,
                                         low_conf_floor: float = 0.40) -> "pd.DataFrame":
@@ -10868,6 +10989,31 @@ class BSoidEngine:
                             str(self._out_bouts /
                                 f"{_name}_bout_lengths_hmm_enriched.csv"),
                             index=False)
+                    # v6 part 2 (Environmental_Context_v6_Implementation_Plan.md
+                    # Step 7 / Phase 3.5): sequence-plus-tag approach/avoid
+                    # detection. Requires BOTH kinematic_directedness_enabled
+                    # (straightness_ratio/mean_speed_px_s columns) AND
+                    # env_features_enabled + traced shapes -- if either
+                    # prerequisite is missing, detect_approach_avoid_events()
+                    # itself no-ops (empty DataFrame), and no
+                    # approach_events.csv is written at all in that case.
+                    if (bool(self._cfg.get("kinematic_directedness_enabled", False))
+                            and bool(self._cfg.get("env_features_enabled", False))
+                            and _bout_hmm_enriched is not None and _env_pb):
+                        try:
+                            _win_bin = max(1, int(round(
+                                _file_fps * (_env_sec.get("bin_ms", 100.0) / 1000.0))))
+                            _approach_df = detect_approach_avoid_events(
+                                _bout_hmm_enriched, _env_pb, _file_fps, _win_bin)
+                            if not _approach_df.empty:
+                                _approach_df.to_csv(
+                                    str(self._out_bouts /
+                                        f"{_name}_approach_events.csv"),
+                                    index=False)
+                        except Exception:
+                            self._log(
+                                f"  [WARN] approach/avoid detection "
+                                f"({_name}): {traceback.format_exc()}")
                     pd.DataFrame({
                         "frame":               np.arange(len(_hmm_display)),
                         "time_s":              np.arange(len(_hmm_display)) / _file_fps,
