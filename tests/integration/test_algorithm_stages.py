@@ -8,7 +8,6 @@ determinism under a fixed seed. Never asserts a "correct" clustering or
 classification result.
 """
 import numpy as np
-import pytest
 
 import cube_core as cc
 
@@ -185,26 +184,15 @@ class TestTrainDecodeHmm:
         assert decoded.dtype.kind in ("i", "u")
         assert set(np.unique(decoded)).issubset(set(range(n_clusters)))
 
-    @pytest.mark.xfail(
-        reason="BUG: train_hmm() constructs hmmlearn.CategoricalHMM without "
-               "passing random_state, so its 's' (startprob) init draws from "
-               "the global numpy legacy RandomState each call. Two back-to-"
-               "back calls with IDENTICAL inputs/cfg usually produce "
-               "measurably different transmat_/emissionprob_ (differences on "
-               "the order of 1e-5, i.e. real EM-trajectory divergence, not "
-               "float noise) -- unlike run_umap/train_mlp, which both accept "
-               "and use a seed. This breaks the 'seeded, low iteration count' "
-               "determinism the test plan expects at this stage, and quietly "
-               "undermines any reproducibility claim for a saved bsoid_model.pkl "
-               "trained via train_hmm. strict=False: whether this coincidentally "
-               "passes depends on the ambient global numpy RNG state left by "
-               "whichever tests ran earlier in the same process, so it is not "
-               "reliably reproducible as a hard failure across every run order "
-               "-- the underlying bug (no explicit seed control) is real and "
-               "confirmed either way; see test_train_hmm_determinism_with_"
-               "manually_seeded_global_rng below for the deterministic repro.",
-        strict=False)
     def test_train_hmm_determinism_same_input(self):
+        # Regression test for a fixed bug: train_hmm() used to construct
+        # hmmlearn.CategoricalHMM without passing random_state, so its 's'
+        # (startprob) init drew from the global numpy legacy RandomState each
+        # call, making two back-to-back calls with identical inputs diverge
+        # by ~1e-5 in transmat_/emissionprob_ -- unlike run_umap/train_mlp,
+        # which both already accepted and used a seed. Fixed by adding a
+        # random_state parameter (default 42, config key hmm_random_state)
+        # threaded into the CategoricalHMM constructor.
         n_clusters = 3
         seqs = make_label_sequences(n_clusters=n_clusters, seed=22)
         model1 = cc.train_hmm(seqs, n_clusters, n_iter=10)

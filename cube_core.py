@@ -397,7 +397,14 @@ def load_dlc_file(path, likelihood_thresh: float = 0.3,
 
 def smooth_boxcar(xy: np.ndarray, fps: float, win_sec: float) -> np.ndarray:
     """Centred boxcar (moving average) smoothing per column."""
+    n = xy.shape[0]
+    if n == 0:
+        return xy.copy()
     win = max(1, int(round(fps * win_sec)))
+    # Clamp to the sequence length: np.convolve(..., mode="same") returns
+    # max(len(a), len(kernel)) rather than len(a) whenever the kernel is
+    # longer than the signal, which desyncs frame counts downstream.
+    win = min(win, n)
     if win <= 1:
         return xy.copy()
     k = np.ones(win) / win
@@ -2646,7 +2653,7 @@ def _sanitize_labels_for_hmm(seq: np.ndarray, n_clusters: int) -> np.ndarray:
 
 def train_hmm(label_sequences: list, n_clusters: int,
               n_states: int = None, n_iter: int = 100, log_fn=None,
-              transition_prior: str = "global"):
+              transition_prior: str = "global", random_state: int = 42):
     """Fit a Multinomial (Categorical) HMM to B-SOiD MLP label sequences.
 
     Uses Baum-Welch EM.  n_states defaults to n_clusters (smoothing-only mode).
@@ -2712,6 +2719,7 @@ def train_hmm(label_sequences: list, n_clusters: int,
         tol=1e-4,
         init_params=_ip,   # 's' only; 'e' and 't' we set manually
         params="ste",      # all params updated during EM
+        random_state=random_state,
     )
     # Diagonal Dirichlet prior on the transition matrix: 90% self-transition,
     # 10% spread uniformly.  This anchors Baum-Welch away from degenerate
@@ -2798,7 +2806,8 @@ def decode_hmm(hmm_model, frame_labels: np.ndarray) -> np.ndarray:
 def train_hmm_soft(bin_proba_sequences: list, n_clusters: int,
                     n_states: int = None, n_iter: int = 100, log_fn=None,
                     transition_prior: str = "global",
-                    bin_label_sequences: list = None):
+                    bin_label_sequences: list = None,
+                    random_state: int = 42):
     """B.1 (Aug 2026): fit a GaussianHMM on per-bin MLP class-probability
     vectors (predict_labels(..., return_proba=True)'s bin_proba) instead of
     a CategoricalHMM on hard argmax labels (train_hmm's approach). Each
@@ -2871,6 +2880,7 @@ def train_hmm_soft(bin_proba_sequences: list, n_clusters: int,
         tol=1e-4,
         init_params="sc",  # startprob + covars auto-init; transmat/means set manually below
         params="stmc",     # all params updated during EM
+        random_state=random_state,
     )
     # Same diagonal Dirichlet transition-matrix prior as train_hmm's default
     # (90% self-transition, 10% spread), UNLESS transition_prior="per_cluster"
@@ -7616,6 +7626,9 @@ class BSoidEngine:
         hmm_enabled           = True,    # wrap MLP output with Multinomial HMM
         hmm_n_states          = 0,       # 0/None → n_clusters (smoothing-only mode)
         hmm_n_iter            = 100,     # Baum-Welch EM iterations
+        hmm_random_state      = 42,      # seeds CategoricalHMM/GaussianHMM startprob_
+                                        #   init so train_hmm/train_hmm_soft are
+                                        #   reproducible across identical-input calls
         hmm_min_prob          = 0.05,    # min edge probability in syntax network plot
         # hmm_transition_prior: "per_cluster" (default since Aug 2026, was
         #   "global" pre-Aug-2026) derives each cluster's own self-transition
@@ -9975,6 +9988,7 @@ class BSoidEngine:
                         log_fn=self._log,
                         transition_prior=str(self._cfg.get("hmm_transition_prior", "global")),
                         bin_label_sequences=_hmm_bin_labels_train,
+                        random_state=int(self._cfg.get("hmm_random_state", 42)),
                     )
                 elif _bin_level_ok:
                     self._log("\n[HMM]  Training Multinomial HMM on MLP "
@@ -9987,6 +10001,7 @@ class BSoidEngine:
                         n_iter=int(self._cfg.get("hmm_n_iter", 100)),
                         log_fn=self._log,
                         transition_prior=str(self._cfg.get("hmm_transition_prior", "global")),
+                        random_state=int(self._cfg.get("hmm_random_state", 42)),
                     )
                 else:
                     self._log("\n[HMM]  Training Multinomial HMM on MLP label sequences...")
@@ -9997,6 +10012,7 @@ class BSoidEngine:
                         n_iter=int(self._cfg.get("hmm_n_iter", 100)),
                         log_fn=self._log,
                         transition_prior=str(self._cfg.get("hmm_transition_prior", "global")),
+                        random_state=int(self._cfg.get("hmm_random_state", 42)),
                     )
                 self._log(f"  HMM trained in {time.perf_counter() - _t0:.2f} s  "
                           f"({hmm_model.n_components} states, Baum-Welch)")

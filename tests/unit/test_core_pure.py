@@ -10,7 +10,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pytest
 
 import cube_core as cc
 
@@ -68,27 +67,23 @@ class TestSmoothBoxcar:
         assert out.shape == (1, 2)
         assert np.allclose(out, xy)
 
-    @pytest.mark.xfail(
-        reason="BUG: smooth_boxcar(xy, ...) with n_frames < win (win>1) returns "
-               "MORE rows than the input via np.convolve(..., mode='same') "
-               "(output length = max(len(a), len(win_kernel))), silently "
-               "breaking the shape-preservation invariant every caller assumes. "
-               "Repro: smooth_boxcar(np.array([[1.,2.]]), fps=30, win_sec=0.07) "
-               "-> win=2, output shape (2,2) instead of (1,2).",
-        strict=True)
-    def test_single_frame_input_win_gt_nframes_shape_bug(self):
+    def test_single_frame_input_win_gt_nframes_shape_preserved(self):
+        # Regression test for a fixed bug: smooth_boxcar(xy, ...) with
+        # n_frames < win (win>1) used to return MORE rows than the input via
+        # np.convolve(..., mode='same') (output length =
+        # max(len(a), len(win_kernel))), silently breaking the
+        # shape-preservation invariant every caller assumes. Fixed by
+        # clamping win to n_frames before building the kernel.
         xy = np.array([[1.0, 2.0]])
         out = cc.smooth_boxcar(xy, fps=30, win_sec=0.07)  # win = round(2.1) = 2
         assert out.shape == (1, 2)
 
-    @pytest.mark.xfail(
-        reason="BUG: smooth_boxcar crashes on an empty (0-row) input whenever "
-               "win > 1, because np.convolve(empty_array, kernel, mode='same') "
-               "raises ValueError('a cannot be empty') instead of returning an "
-               "empty array. Repro: smooth_boxcar(np.zeros((0,3)), fps=30, "
-               "win_sec=0.07).",
-        strict=True)
     def test_empty_input(self):
+        # Regression test for a fixed bug: smooth_boxcar used to crash on an
+        # empty (0-row) input whenever win > 1, because
+        # np.convolve(empty_array, kernel, mode='same') raises
+        # ValueError('a cannot be empty') instead of returning an empty
+        # array. Fixed with an explicit n == 0 early-return guard.
         xy = np.zeros((0, 3))
         out = cc.smooth_boxcar(xy, fps=30, win_sec=0.07)
         assert out.shape == (0, 3)
