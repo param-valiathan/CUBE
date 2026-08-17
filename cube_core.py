@@ -2035,6 +2035,91 @@ def attach_centroid_distance(epochs: "pd.DataFrame", embedding: np.ndarray,
     return epochs
 
 
+def enrich_bouts_from_bin_source(bout_df: "pd.DataFrame", per_bin_source,
+                                  bin_offset: int, win: int, agg_fns,
+                                  out_col_names=None) -> "pd.DataFrame":
+    """
+    Generalizes attach_centroid_distance's bout-frame -> per-bin-array slice
+    -> aggregate -> append pattern into a reusable join utility (v6 K2 Step
+    2), shared by this plan (per-bout kinematic directedness) and
+    Environmental_Context_v6_Implementation_Plan.md's Phase 3 (per-bout
+    region/object membership). attach_centroid_distance itself is untouched;
+    this is a separate, more general sibling, not a refactor of it.
+
+    bout_df: raw *_bout_lengths[_hmm].csv-shaped DataFrame for ONE session --
+      columns "B-SOiD labels", "Start time (frames)", "Run lengths" (exact
+      B-SOiD GUI schema). end_frame = start_frame + run_len - 1 is
+      reconstructed here since bout CSVs don't carry it natively (unlike
+      *_epochs.csv, which is a filtered subset -- this utility works directly
+      off the unfiltered bout table).
+    per_bin_source: either a single np.ndarray of shape (n_bins_total, ...)
+      indexed by GLOBAL bin id (bin_offset + local bin, matching
+      session_bin_ranges.json's convention), or a dict {name: np.ndarray} for
+      the multi-column case (e.g. multiple region-membership channels).
+    bin_offset, win: this session's slice into the global per-bin array(s),
+      following the same session_bin_ranges.json (_sbr) / win100 convention
+      used everywhere else in BSoidEngine.run() -- mirrors
+      attach_centroid_distance's own b0/b1 lookup and clamping exactly.
+    agg_fns: a single callable(segment: np.ndarray) -> scalar (paired with a
+      single per_bin_source array), or a dict {name: callable} matching
+      per_bin_source's keys when per_bin_source is a dict. Aggregator choice
+      (mean for continuous values, mode for categorical/region-membership,
+      circular mean for angles) is the caller's responsibility.
+    out_col_names: optional single str or {name: str} renaming the appended
+      column(s); defaults to per_bin_source's dict key(s), or "value" for the
+      single-array case.
+
+    Returns a copy of bout_df with the new column(s) appended, one row per
+    input bout row in the same order. NaN where a bout's bin range maps
+    outside per_bin_source, the per-bin slice is empty, or the aggregator
+    raises on that slice.
+    """
+    out = bout_df.copy()
+
+    multi   = isinstance(per_bin_source, dict)
+    sources = per_bin_source if multi else {"value": per_bin_source}
+    aggs    = agg_fns if multi else {"value": agg_fns}
+    if out_col_names is None:
+        names = {k: k for k in sources}
+    elif isinstance(out_col_names, dict):
+        names = out_col_names
+    else:
+        names = {"value": out_col_names}
+
+    if out.empty:
+        for key in sources:
+            out[names.get(key, key)] = pd.Series(dtype=float)
+        return out
+
+    win = max(1, int(win))
+    start_frames = out["Start time (frames)"].astype(int).to_numpy()
+    run_lens     = out["Run lengths"].astype(int).to_numpy()
+    end_frames   = start_frames + run_lens - 1
+
+    for key, arr in sources.items():
+        agg_fn = aggs[key]
+        n_bins_total = arr.shape[0]
+        col_vals = []
+        for sf, ef in zip(start_frames, end_frames):
+            b0 = bin_offset + int(sf) // win
+            b1 = bin_offset + int(ef) // win
+            b0 = max(0, min(b0, n_bins_total - 1))
+            b1 = max(0, min(b1, n_bins_total - 1))
+            if b1 < b0:
+                b0, b1 = b1, b0
+            seg = arr[b0:b1 + 1]
+            if seg.shape[0] == 0:
+                col_vals.append(np.nan)
+                continue
+            try:
+                col_vals.append(agg_fn(seg))
+            except Exception:
+                col_vals.append(np.nan)
+        out[names.get(key, key)] = col_vals
+
+    return out
+
+
 #
 #  HIERARCHICAL / CONSENSUS REFINEMENT  (issue 4 — bidirectional split + merge)
 #
