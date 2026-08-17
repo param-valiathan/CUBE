@@ -107,8 +107,37 @@ the same pose data to either.
 
 ---
 
+## 5. Hierarchy-informed reclustering (post-hoc, Analyser)
+
+Everything above concerns the primary HDBSCAN clustering. A separate problem exists one layer up: the
+Analyser's post-hoc reclustering (merging over-split HDBSCAN clusters into a smaller set of behaviours,
+for statistics and write-up) originally judged merges on a single line of evidence — correlation of each
+cluster's usage pattern across experimental groups, blended with transition-profile similarity. Two
+clusters can be highly correlated on both measures for reasons unrelated to being the same movement
+(shared arousal state, a session-length confound, coincidence in a small dataset), and nothing in that
+blended distance alone could distinguish a real oversplit from a spurious correlation.
+
+This is structurally the same problem WGCNA (Langfelder & Horvath) solved for gene-expression module
+detection: `mergeCloseModules` only merges two modules if their similarity clears a threshold on a
+*second, independently computed* criterion, not just the primary clustering signal. CUBE's analyser now
+applies the same pattern — the primary clustering's own feature-space centroid hierarchy (already
+computed and exported as `cluster_hierarchy_*.png`, persisted to `model/cluster_feature_centroids.npz`)
+acts as a hard veto: a merge is only proposed if the two clusters are close in **both** response-pattern
+space and pose space, not either alone. A greedy, self-stopping "Guided Merge" mode (a
+`dynamicTreeCut`-style minimum-gap stopping rule) replaces "pick one k for everything" with "only take
+merges that are individually justified," so the output favours the minimum number of merges actually
+supported by the data rather than a global k the user has to guess from an elbow plot.
+
+Full parameter reference, defaults, and worked use cases are in `CUBE_GUIDE.md`'s
+[Recombination Guide](CUBE_GUIDE.md#6a-recombination-guide); the original design rationale is in
+`RECLUSTERING_HIERARCHY_PLAN.md`.
+
+---
+
 *Sources: B-SOiD (Hsu & Yttri, *eLife* 2021); VAME (Luxem et al., *Communications Biology* 2022); keypoint-MoSeq
-(Weinreb et al., *Nature Methods* 2024); MotionMapper (Berman et al., *J. R. Soc. Interface* 2014). See also
-`README.md`'s "How this relates to B-SOiD, VAME, and keypoint-MoSeq" section and `CUBE_GUIDE.md`'s Step 3
-(Iterative Split/Merge Refinement, Visibility & Confidence Features) and Step 5 (Cluster Validity plot mode)
-documentation for the corresponding user-facing settings.*
+(Weinreb et al., *Nature Methods* 2024); MotionMapper (Berman et al., *J. R. Soc. Interface* 2014); WGCNA /
+`dynamicTreeCut` / `mergeCloseModules` (Langfelder & Horvath, *BMC Bioinformatics* 2008); cophenetic
+correlation (Sokal & Rohlf, *Taxon* 1962). See also `README.md`'s "How this relates to B-SOiD, VAME, and
+keypoint-MoSeq" section and `CUBE_GUIDE.md`'s Step 3 (Iterative Split/Merge Refinement, Visibility &
+Confidence Features), Step 5 (Cluster Validity plot mode), and Recombination Guide documentation for the
+corresponding user-facing settings.*

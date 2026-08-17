@@ -106,6 +106,7 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
+import matplotlib.patheffects as _pe
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 import numpy as np
@@ -262,6 +263,93 @@ _THEME_KEY = "dark"
 
 def T() -> dict:
     return THEMES[_THEME_KEY]
+
+
+# Widget color options that may hold a literal T()[...] value baked in at
+# construction time. Kept broad (ctk + plain-tk option names) so the walker
+# below works uniformly across CTkFrame/CTkLabel/CTkButton/... and tk.Canvas.
+_THEMED_WIDGET_OPTIONS = (
+    "fg_color", "text_color", "text_color_disabled", "border_color",
+    "hover_color", "button_color", "button_hover_color",
+    "selected_color", "selected_hover_color",
+    "unselected_color", "unselected_hover_color",
+    "checkmark_color", "progress_color", "bg", "background",
+)
+
+
+def _force_repaint_ctk_tree(widget):
+    """Force every CTk widget in this subtree to redraw against whatever
+    appearance mode is active right now.
+
+    Some CTk widgets -- notably CTkLabel, whose fg_color/text_color come
+    from customtkinter's own default theme JSON rather than an explicit
+    T()[...] override -- can end up drawn against a stale appearance-mode
+    resolution. The most visible symptom is a white background "patch"
+    behind label text in dark mode, especially for widgets built inside a
+    CTkScrollableFrame before it has been scrolled/laid out (their first
+    _draw() call can resolve colors before the frame's real geometry, and
+    unlike _rethread_widget_colors -- which only fixes colors explicitly
+    set to one of THIS app's own THEMES values -- there is nothing for
+    CTkLabel's own built-in default to match against, so it's never
+    corrected by that pass).
+
+    Re-configuring a widget's own current color value back onto itself is a
+    no-op for the *data* but forces a real _draw() call resolved against
+    the appearance mode active at the moment this runs, which reliably
+    clears the stale paint regardless of why the first draw was wrong.
+    Call this once after full construction and again at the end of every
+    theme toggle (deferred via .after so it runs after layout settles).
+    """
+    for opt in ("fg_color", "text_color", "border_color", "button_color"):
+        try:
+            cur = widget.cget(opt)
+        except Exception:
+            continue
+        try:
+            widget.configure(**{opt: cur})
+        except Exception:
+            pass
+    try:
+        children = widget.winfo_children()
+    except Exception:
+        children = []
+    for c in children:
+        _force_repaint_ctk_tree(c)
+
+
+def _rethread_widget_colors(widget, old_theme: dict, new_theme: dict):
+    """Recursively re-theme an already-built widget subtree in place.
+
+    Many widgets in this app are constructed once with a literal color pulled
+    from ``T()`` at build time (e.g. ``fg_color=T()["card"]``); toggling
+    ``_THEME_KEY`` alone does nothing for them since the string was already
+    resolved. This walks the widget tree and, for any color option whose
+    current value exactly matches a value from *old_theme*, swaps in the
+    corresponding value from *new_theme* — restyling in place without
+    rebuilding widgets (which would lose StringVars / user selections).
+    """
+    for opt in _THEMED_WIDGET_OPTIONS:
+        try:
+            cur = widget.cget(opt)
+        except Exception:
+            continue
+        if not isinstance(cur, str) or not cur:
+            continue
+        for key, old_val in old_theme.items():
+            if cur == old_val:
+                new_val = new_theme.get(key)
+                if new_val is not None and new_val != cur:
+                    try:
+                        widget.configure(**{opt: new_val})
+                    except Exception:
+                        pass
+                break
+    try:
+        children = widget.winfo_children()
+    except Exception:
+        children = []
+    for child in children:
+        _rethread_widget_colors(child, old_theme, new_theme)
 
 
 #  
@@ -485,6 +573,179 @@ def find_cluster_confidence(root: pathlib.Path) -> pathlib.Path | None:
             return hit
 
     return None
+
+
+def find_cluster_centroids(root: pathlib.Path):
+    """
+    Search for cluster_feature_centroids.npz saved by cube_core (from
+    plot_cluster_hierarchy's centroid computation, or by
+    backfill_cluster_centroids_from_umap for old run folders). Mirrors
+    find_umap_data's search strategy: recurse downward from root, then walk
+    up to 4 parent levels. Returns (centroids, cluster_ids, approximate,
+    linkage_method) as (numpy array, numpy array, bool, str), or
+    (None, None, False, "ward") if absent -- run folders that predate this
+    feature (and haven't been backfilled) simply don't have this file.
+
+    `approximate` is True when the npz was produced by the UMAP-embedding
+    backfill path rather than a real Step 3 run's true feature-space
+    centroids (see backfill_cluster_centroids_from_umap's docstring for why
+    that's a lower-fidelity substitute) -- callers should surface this so
+    pose-distance-based decisions on backfilled runs carry a visible caveat.
+
+    `linkage_method` is the linkage method the pipeline run actually used to
+    build cluster_hierarchy_*.png (BSoidEngine's `cluster_hierarchy_linkage`
+    config, plumbed through to plot_cluster_hierarchy's `linkage_method` arg
+    -- see cube_core.py's call site). It's persisted in the npz alongside the
+    centroids specifically so any on-the-fly re-render of this dendrogram
+    (build_cluster_hierarchy_figure) uses the SAME method the pipeline used,
+    instead of silently assuming "ward" -- a mismatch here previously made
+    the Analyser's re-rendered dendrogram topology diverge from the actual
+    cluster_hierarchy_*.png whenever a run used a non-default linkage method.
+    Falls back to "ward" (the pipeline's own default) for older npz files
+    saved before this field existed.
+    """
+    def _search(directory: pathlib.Path):
+        candidates = sorted(directory.rglob("cluster_feature_centroids.npz"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+        return candidates[0] if candidates else None
+
+    hit = _search(root)
+    if not hit:
+        candidate = root.resolve()
+        for _ in range(4):
+            parent = candidate.parent
+            if parent == candidate:
+                break
+            candidate = parent
+            hit = _search(candidate)
+            if hit:
+                break
+
+    if not hit:
+        return None, None, False, "ward"
+
+    try:
+        data = np.load(hit)
+        approximate = bool(data["approximate"]) if "approximate" in data else False
+        linkage_method = (str(data["linkage_method"])
+                          if "linkage_method" in data else "ward")
+        return data["centroids"], data["cluster_ids"], approximate, linkage_method
+    except Exception:
+        return None, None, False, "ward"
+
+
+def backfill_cluster_centroids_from_umap(root: pathlib.Path):
+    """
+    Cheap backward-compatibility path for run folders that predate
+    cluster_feature_centroids.npz (produced before this feature existed):
+    computes pseudo-centroids directly from the already-saved
+    umap_embedding.npy + umap_labels.npy (mean embedding position per
+    cluster) instead of the true standardized feature space, so no
+    re-extraction of raw pose data and no Step 3 re-run is required.
+
+    This is explicitly a LOWER-FIDELITY substitute for the real thing --
+    cube_core.py's plot_cluster_hierarchy docstring and
+    RECLUSTERING_HIERARCHY_PLAN.md §4a both note UMAP inter-cluster
+    distances are only locally meaningful, not a reliable global
+    pose-distance proxy the way true feature-space centroid distance is.
+    The saved npz is flagged `approximate=True` so find_cluster_centroids's
+    callers can warn accordingly. Prefer a real Step 3 re-run when accuracy
+    matters (e.g. a result going into a publication figure) -- this exists
+    only so the pose-distance cap / Guided Merge / Cluster Hierarchy views
+    aren't hard-blocked on old run folders that will never be re-run.
+
+    Only ever writes the file if it doesn't already exist for this run --
+    never overwrites a real Step 3-produced (non-approximate) centroid file.
+
+    Returns (success: bool, message: str).
+    """
+    existing_centroids, _, _, _ = find_cluster_centroids(root)
+    if existing_centroids is not None:
+        return False, "cluster_feature_centroids.npz already exists for this run — not overwritten."
+
+    emb_p, lbl_p = find_umap_data(root)
+    if emb_p is None or lbl_p is None:
+        return False, ("No umap_embedding.npy / umap_labels.npy found for this run "
+                       "— cannot backfill without them.")
+    try:
+        embedding = np.load(str(emb_p))
+        labels = np.load(str(lbl_p))
+    except Exception as e:
+        return False, f"Failed to load UMAP data: {e}"
+
+    if embedding.shape[0] != labels.shape[0]:
+        return False, ("umap_embedding.npy / umap_labels.npy size mismatch "
+                       "— this model folder predates a fix and the two files "
+                       "are no longer index-aligned; cannot backfill.")
+
+    uniq = sorted(int(c) for c in set(labels.tolist()) if c >= 0)
+    if len(uniq) < 2:
+        return False, "Fewer than 2 non-noise clusters in this run — cannot backfill."
+
+    centroids = np.vstack([embedding[labels == c].mean(axis=0) for c in uniq])
+    out_path = emb_p.parent / "cluster_feature_centroids.npz"
+    try:
+        np.savez(out_path, centroids=centroids, cluster_ids=np.array(uniq),
+                 approximate=True)
+    except Exception as e:
+        return False, f"Failed to save {out_path.name}: {e}"
+
+    return True, (f"Backfilled {out_path.name} from UMAP embedding "
+                  f"({len(uniq)} clusters). APPROXIMATE pose distances — "
+                  "based on the UMAP embedding, not true feature space. "
+                  "Re-run Step 3 (Clustering Engine) for accurate pose-"
+                  "distance data if this result matters for publication.")
+
+
+def compute_feat_dist_matrix(centroids, centroid_cluster_ids, all_clusters: list):
+    """
+    Build a (len(all_clusters), len(all_clusters)) Euclidean distance matrix
+    over pose-space centroids, restricted and reordered to match
+    `all_clusters` (compute_reclustering_suggestions's duration-filtered
+    cluster id list).
+
+    Returns (feat_dist_matrix | None, available: bool, reason: str).
+    Some centroid-file clusters may have been duration-filtered out of
+    all_clusters; some all_clusters entries may be missing from an old
+    centroid file (e.g. re-run added new clusters). Both are handled by
+    intersecting the two id sets -- if the overlap is too small to be
+    useful (< 2 clusters, or covers less than half of all_clusters),
+    feat_dist is dropped entirely with a reason string explaining why.
+    """
+    if centroids is None or centroid_cluster_ids is None:
+        return None, False, "no cluster_feature_centroids.npz found for this run — re-run Step 3 (Clustering Engine) to enable pose-distance features"
+
+    centroid_ids = [int(c) for c in centroid_cluster_ids]
+    id_to_row = {cid: i for i, cid in enumerate(centroid_ids)}
+    all_clusters_int = [int(c) for c in all_clusters]
+    overlap = [c for c in all_clusters_int if c in id_to_row]
+
+    if len(overlap) < 2 or len(overlap) < 0.5 * len(all_clusters_int):
+        return None, False, (
+            f"only {len(overlap)}/{len(all_clusters_int)} clusters overlap "
+            "between the centroid file and this reclustering's cluster set "
+            "— pose-distance features disabled for this run")
+
+    if len(overlap) < len(all_clusters_int):
+        missing = [c for c in all_clusters_int if c not in id_to_row]
+        reason = (f"pose-distance available for {len(overlap)}/"
+                   f"{len(all_clusters_int)} clusters (missing from centroid "
+                   f"file: {missing}) — those pairs excluded from the cap")
+    else:
+        reason = ""
+
+    from scipy.spatial.distance import cdist as _cdist
+    n = len(all_clusters_int)
+    feat_dist = np.full((n, n), np.nan)
+    rows = np.array([id_to_row[c] for c in overlap])
+    sub_centroids = np.asarray(centroids)[rows]
+    sub_dist = _cdist(sub_centroids, sub_centroids, metric="euclidean")
+    overlap_idx = [i for i, c in enumerate(all_clusters_int) if c in id_to_row]
+    for oi, ai in enumerate(overlap_idx):
+        for oj, aj in enumerate(overlap_idx):
+            feat_dist[ai, aj] = sub_dist[oi, oj]
+
+    return feat_dist, True, reason
 
 
 def load_cluster_confidence(path: pathlib.Path) -> dict:
@@ -1486,15 +1747,18 @@ def behavioral_fingerprint_classification(animal_data: list,
         (out_dir / "fingerprint_classification.json").write_text(
             json.dumps(result, indent=2))
         order = np.argsort(importance)[::-1][:15]
-        fig, ax = plt.subplots(figsize=(8, 4))
+        t = T()
+        fig, ax = plt.subplots(figsize=(8, 4), facecolor=t["fig_bg"])
         ax.bar([f"C{all_clusters[i]}" for i in order],
                [importance[i] for i in order], color="#4E79A7")
-        ax.set_ylabel("RandomForest importance")
+        ax.set_ylabel("RandomForest importance", color=t["tick"])
         ax.set_title(f"Behavioural fingerprint — CV acc {acc:.2f} "
-                     f"(chance {chance:.2f}, perm p={pval:.3f})")
+                     f"(chance {chance:.2f}, perm p={pval:.3f})", color=t["tick"])
         ax.tick_params(axis="x", rotation=45)
+        _style_ax(ax, t)
         fig.tight_layout()
-        fig.savefig(str(out_dir / "fingerprint_classification.png"), dpi=150)
+        fig.savefig(str(out_dir / "fingerprint_classification.png"), dpi=150,
+                    facecolor=fig.get_facecolor())
         plt.close(fig)
     except Exception:
         pass
@@ -1612,15 +1876,20 @@ def time_resolved_usage(animal_data: list,
         if not df.empty:
             piv = (df.groupby(["window_start_s", "cluster_id"])["time_fraction"]
                      .mean().unstack(fill_value=0.0))
-            fig, ax = plt.subplots(figsize=(10, 5))
+            t = T()
+            fig, ax = plt.subplots(figsize=(10, 5), facecolor=t["fig_bg"])
             for cid in piv.columns:
                 ax.plot(piv.index, piv[cid], marker="o", label=f"C{cid}")
-            ax.set_xlabel(f"Time (s, {int(window_s)}s windows)")
-            ax.set_ylabel("Mean time fraction")
-            ax.set_title("Cluster usage over time (mean across animals)")
-            ax.legend(fontsize=7, ncol=4)
+            ax.set_xlabel(f"Time (s, {int(window_s)}s windows)", color=t["tick"])
+            ax.set_ylabel("Mean time fraction", color=t["tick"])
+            ax.set_title("Cluster usage over time (mean across animals)", color=t["tick"])
+            leg = ax.legend(fontsize=7, ncol=4)
+            for txt in leg.get_texts():
+                txt.set_color(t["tick"])
+            _style_ax(ax, t)
             fig.tight_layout()
-            fig.savefig(str(out_dir / "usage_over_time.png"), dpi=150)
+            fig.savefig(str(out_dir / "usage_over_time.png"), dpi=150,
+                        facecolor=fig.get_facecolor())
             plt.close(fig)
     except Exception:
         pass
@@ -1986,7 +2255,8 @@ def compute_bio_exclusions(animal_data: list, dur_filter: dict) -> set:
 
 def compute_reclustering_suggestions(animal_data: list, max_k: int = 10,
                                       metric: str = "total_duration",
-                                      duration_filter: dict = None) -> dict:
+                                      duration_filter: dict = None,
+                                      centroid_root: pathlib.Path = None) -> dict:
     """
     Agglomerative reclustering of B-SOiD clusters based on their *pattern of
     change* across experimental groups AND their *temporal co-occurrence* as
@@ -2014,8 +2284,16 @@ def compute_reclustering_suggestions(animal_data: list, max_k: int = 10,
     Returns dict with keys:
       feature_matrix, X_normed, dist_matrix, linkage_matrix,
       silhouette_scores, inertia_scores, eg_names, cluster_ids,
+      max_k_actual             the ceiling k actually swept =
+                                min(max_k, len(cluster_ids) - 1); may be
+                                lower than the requested max_k
       transition_result,      new: transition similarity data
       filtered_cluster_ids    new: ids that survived the duration filter
+      feat_dist_matrix        pose-space centroid distance, reordered to match
+                               cluster_ids, or None if unavailable
+      feat_dist_available     bool — whether feat_dist_matrix is usable
+      feat_dist_reason        str — explains why unavailable, or a partial-
+                               coverage note when available but incomplete
     """
     if not (SCIPY_OK and SK_OK and SCIPY_CLUSTER_OK):
         raise RuntimeError("scipy + scikit-learn required for reclustering. "
@@ -2151,6 +2429,23 @@ def compute_reclustering_suggestions(animal_data: list, max_k: int = 10,
             inertia += float(np.sum((pts - pts.mean(axis=0))**2))
         inertia_scores[k] = inertia
 
+    #   Pose-space (feature-centroid) distance -- Phase 2 of hierarchy-
+    #   informed reclustering.  Additive only: doesn't affect dist_mat/lnk
+    #   above, just makes feat_dist available for later phases to veto with.
+    feat_dist_matrix     = None
+    feat_dist_available  = False
+    feat_dist_reason     = "centroid_root not provided"
+    feat_dist_approximate = False
+    if centroid_root is not None:
+        centroids, centroid_cluster_ids, feat_dist_approximate, _ = \
+            find_cluster_centroids(pathlib.Path(centroid_root))
+        feat_dist_matrix, feat_dist_available, feat_dist_reason = \
+            compute_feat_dist_matrix(centroids, centroid_cluster_ids, all_clusters)
+        if feat_dist_available and feat_dist_approximate:
+            feat_dist_reason = ("APPROXIMATE — pose distances backfilled from the "
+                                "UMAP embedding, not true feature space. Re-run "
+                                "Step 3 for accurate pose-distance data.")
+
     return {
         "feature_matrix":       feat_df,
         "X_normed":             X_normed,
@@ -2163,8 +2458,13 @@ def compute_reclustering_suggestions(animal_data: list, max_k: int = 10,
         "inertia_scores":       inertia_scores,
         "eg_names":             eg_names,
         "cluster_ids":          all_clusters,
+        "max_k_actual":         max_k_actual,
         "filtered_cluster_ids": filtered_cluster_ids,
         "all_raw_cluster_ids":  all_raw_clusters,
+        "feat_dist_approximate": feat_dist_approximate,
+        "feat_dist_matrix":     feat_dist_matrix,
+        "feat_dist_available":  feat_dist_available,
+        "feat_dist_reason":     feat_dist_reason,
     }
 
 
@@ -2386,7 +2686,7 @@ def build_heatmap_figure(stats_df: pd.DataFrame, animal_data: list,
     # Figure: wider columns for readability (1.2 in per animal, min 10 in)
     col_w  = max(1.2, 10.0 / max(n_animals, 1))
     fig_w  = max(10, n_animals * col_w + 4.5)   # extra for dend + cbar
-    fig_h  = max(6,  len(ids_ordered) * 0.38 + 3.0)
+    fig_h  = max(6, min(len(ids_ordered) * 0.38 + 3.0, 14))
 
     cid_to_grp = _cluster_group_map(groups)
     has_groups = bool(cid_to_grp)
@@ -2570,12 +2870,210 @@ def build_reclustering_figure(recluster_result: dict, t: dict = None) -> plt.Fig
     return fig
 
 
+def apply_pose_distance_cap(labels: np.ndarray, cids: list,
+                             feat_dist_matrix, cap_pct: float):
+    """
+    Post-filter fcluster's output: reject any merged group where at least
+    one internal pair's pose-space (feature-centroid) distance exceeds the
+    cap_pct percentile of the full pairwise feat_dist distribution. A
+    rejected group is split back into its individual raw-cluster
+    constituents (not partially re-merged) — the simplest reading of "split
+    back into pre-existing constituent parts" that keeps this a pure
+    display-time post-filter with no dependency on linkage internals.
+
+    Pairs with unknown distance (NaN — e.g. one cluster missing from an
+    older/partial centroid file) are treated as ineligible-to-merge, same
+    as an over-cap distance, since proximity can't be confirmed.
+
+    labels, cids must be the same length and same order (as returned by
+    fcluster(lnk, t=k, ...) zipped against recluster_result["cluster_ids"]).
+
+    Returns (new_labels: np.ndarray, n_rejected: int, n_considered: int).
+    cap_pct >= 100 or feat_dist_matrix is None is a no-op (today's behaviour).
+    """
+    if feat_dist_matrix is None or cap_pct >= 100:
+        return np.asarray(labels).copy(), 0, 0
+
+    n = len(cids)
+    iu = np.triu_indices(n, k=1)
+    pair_dists = np.asarray(feat_dist_matrix)[iu]
+    valid = ~np.isnan(pair_dists)
+    if valid.sum() == 0:
+        return np.asarray(labels).copy(), 0, 0
+    cap_dist = float(np.percentile(pair_dists[valid], cap_pct))
+
+    new_labels = np.asarray(labels).copy()
+    next_new_label = int(new_labels.max()) + 1
+    n_rejected = 0
+    n_considered = 0
+    for lab in sorted(set(int(l) for l in labels)):
+        idxs = np.where(labels == lab)[0]
+        if len(idxs) < 2:
+            continue
+        n_considered += 1
+        violates = False
+        for a in range(len(idxs)):
+            for b in range(a + 1, len(idxs)):
+                i, j = idxs[a], idxs[b]
+                d = feat_dist_matrix[i, j]
+                if np.isnan(d) or d > cap_dist:
+                    violates = True
+                    break
+            if violates:
+                break
+        if violates:
+            n_rejected += 1
+            for idx in idxs:
+                new_labels[idx] = next_new_label
+                next_new_label += 1
+
+    return new_labels, n_rejected, n_considered
+
+
+def compute_guided_merge(recluster_result: dict, feat_cap_pct: float = 50.0,
+                          min_gap: float = 0.15) -> dict:
+    """
+    Greedy, self-stopping hierarchy-informed merge
+    (RECLUSTERING_HIERARCHY_PLAN.md §4c). Starts with every duration-filtered
+    cluster as a singleton and repeatedly merges the closest eligible pair of
+    groups by blended (corr/trans) distance — "eligible" meaning every
+    cross-pair of underlying raw clusters is within the feat_cap_pct
+    percentile of pairwise pose-space (feature-centroid) distance, mirroring
+    apply_pose_distance_cap's complete-linkage-style veto so a merged group
+    is never internally split by a later cap check.
+
+    Stops the moment the single best remaining eligible pair either doesn't
+    exist, or fails a minimum-gap check against the closest INELIGIBLE pair:
+    if the best eligible merge isn't clearly better (by min_gap, a relative
+    fraction) than the next pair pose-distance already ruled out, it isn't a
+    well-justified merge — this is what makes the result "minimum necessary
+    merges" instead of a global k the user has to guess via an elbow plot.
+
+    Returns a dict shaped like extract_reclustered_groups's output, plus:
+      merge_log : list of dicts, one per accepted merge — cluster_a,
+        cluster_b (the closest original-cluster pair driving that merge),
+        blended_distance, pose_distance (worst-case pose distance inside
+        the merged group), pose_percentile, response_corr, transition_sim.
+      available : bool — False when feat_dist_matrix is unavailable for this
+        recluster_result (Guided Merge is meaningless without pose data);
+        the groups returned in that case are singletons (no merges).
+      reason : str — explains why unavailable, empty string otherwise.
+    """
+    cids = [int(c) for c in recluster_result["cluster_ids"]]
+    n = len(cids)
+
+    def _singleton_result(reason: str) -> dict:
+        out = {
+            f"RG-{i+1}": {"labels": [cids[i]], "color": PALETTE[i % len(PALETTE)]}
+            for i in range(n)
+        }
+        out["merge_log"]  = []
+        out["available"]  = False
+        out["reason"]     = reason
+        return out
+
+    feat_dist = recluster_result.get("feat_dist_matrix")
+    if feat_dist is None or not recluster_result.get("feat_dist_available"):
+        return _singleton_result(recluster_result.get(
+            "feat_dist_reason", "pose-distance unavailable for this run"))
+    if n < 2:
+        return _singleton_result("fewer than 2 clusters to merge")
+
+    dist_mat   = recluster_result["dist_matrix"]
+    corr_dist  = recluster_result.get("corr_dist_matrix")
+    trans_dist = recluster_result.get("trans_dist_matrix")
+
+    iu = np.triu_indices(n, k=1)
+    pose_pairs = np.asarray(feat_dist)[iu]
+    valid_pose = ~np.isnan(pose_pairs)
+    if not valid_pose.any():
+        return _singleton_result("no valid pose-distance pairs for this cluster set")
+    cap_dist = float(np.percentile(pose_pairs[valid_pose], feat_cap_pct))
+
+    groups = [{i} for i in range(n)]
+    merge_log: list = []
+
+    def _blended_dist(ga, gb):
+        vals = [dist_mat[i, j] for i in ga for j in gb]
+        return float(np.mean(vals))
+
+    def _pose_eligible(ga, gb):
+        for i in ga:
+            for j in gb:
+                d = feat_dist[i, j]
+                if np.isnan(d) or d > cap_dist:
+                    return False
+        return True
+
+    def _pose_max(ga, gb):
+        vals = [feat_dist[i, j] for i in ga for j in gb if not np.isnan(feat_dist[i, j])]
+        return float(np.max(vals)) if vals else float("nan")
+
+    while len(groups) > 1:
+        best_elig   = None   # (dist, a, b)
+        best_inelig = None
+        for a in range(len(groups)):
+            for b in range(a + 1, len(groups)):
+                d = _blended_dist(groups[a], groups[b])
+                if _pose_eligible(groups[a], groups[b]):
+                    if best_elig is None or d < best_elig[0]:
+                        best_elig = (d, a, b)
+                else:
+                    if best_inelig is None or d < best_inelig[0]:
+                        best_inelig = (d, a, b)
+
+        if best_elig is None:
+            break
+
+        d_elig, a, b = best_elig
+        if best_inelig is not None:
+            d_inelig = best_inelig[0]
+            gap = (d_inelig - d_elig) / max(d_elig, 1e-9)
+            if gap < min_gap:
+                break
+
+        ga, gb = groups[a], groups[b]
+        pose_d   = _pose_max(ga, gb)
+        pose_pct = (float((pose_pairs[valid_pose] <= pose_d).mean() * 100)
+                    if not np.isnan(pose_d) else float("nan"))
+        rep_i, rep_j = min(((i, j) for i in ga for j in gb),
+                            key=lambda ij: dist_mat[ij[0], ij[1]])
+        resp_corr = (1.0 - corr_dist[rep_i, rep_j]) if corr_dist is not None else float("nan")
+        trans_sim = (1.0 - trans_dist[rep_i, rep_j] / 2.0) if trans_dist is not None else float("nan")
+        merge_log.append({
+            "cluster_a":        cids[rep_i],
+            "cluster_b":        cids[rep_j],
+            "blended_distance": d_elig,
+            "pose_distance":    pose_d,
+            "pose_percentile":  pose_pct,
+            "response_corr":    resp_corr,
+            "transition_sim":   trans_sim,
+        })
+
+        new_groups = [g for k, g in enumerate(groups) if k not in (a, b)]
+        new_groups.append(ga | gb)
+        groups = new_groups
+
+    groups_sorted = sorted(groups, key=lambda g: min(g))
+    out = {}
+    for gi, g in enumerate(groups_sorted):
+        out[f"RG-{gi + 1}"] = {
+            "labels": sorted(cids[i] for i in g),
+            "color":  PALETTE[gi % len(PALETTE)],
+        }
+    out["merge_log"] = merge_log
+    out["available"] = True
+    out["reason"]    = ""
+    return out
+
+
 def build_recombination_comparison_figure(recluster_result: dict,
                                            k_list: list,
                                            animal_data: list,
                                            metric: str = "total_duration",
                                            eg_colors_override: dict = None,
-                                           t: dict = None) -> plt.Figure:
+                                           t: dict = None,
+                                           cap_pct: float = 100.0) -> plt.Figure:
     """
     Comparative direction-of-change visualisation for selected k values.
 
@@ -2592,9 +3090,20 @@ def build_recombination_comparison_figure(recluster_result: dict,
     of whether one merged group is 10x larger than another in absolute terms.
     The reference group (first exp-group alphabetically / by insertion order) is
     always plotted as a dashed 1.0 baseline.
+
+    cap_pct : pose-distance cap percentile (100 = no cap, today's behaviour).
+        When < 100 and recluster_result["feat_dist_available"], any proposed
+        merged group with an internal pair above the cap is split back into
+        singleton raw clusters for display at that k (apply_pose_distance_cap)
+        — the underlying recluster_result / linkage is never mutated. Rejected
+        merges are reported in the figure's suptitle.
     """
     if t is None:
         t = T()
+
+    feat_dist_matrix = recluster_result.get("feat_dist_matrix")
+    _total_rejected = 0
+    _total_considered = 0
 
     lnk      = recluster_result["linkage_matrix"]
     eg_names = recluster_result["eg_names"]
@@ -2620,7 +3129,7 @@ def build_recombination_comparison_figure(recluster_result: dict,
     with plt.style.context(t["mpl_style"]):
         fig, axes = plt.subplots(
             n_k, 1,
-            figsize=(max(10, len(eg_names) * 2.2 + 3), 5.5 * n_k),
+            figsize=(max(10, len(eg_names) * 2.2 + 3), min(3.8 * n_k, 16)),
             facecolor=t["fig_bg"],
             squeeze=False,
         )
@@ -2628,8 +3137,12 @@ def build_recombination_comparison_figure(recluster_result: dict,
         for row_i, k in enumerate(k_list):
             ax = axes[row_i, 0]
             labels = fcluster(lnk, t=k, criterion="maxclust")
+            labels, _n_rej, _n_cons = apply_pose_distance_cap(
+                labels, cids, feat_dist_matrix, cap_pct)
+            _total_rejected   += _n_rej
+            _total_considered += _n_cons
 
-            #   build merged-group definitions  
+            #   build merged-group definitions
             # merged_groups: {merged_id: [cluster_id, ...]}
             merged_groups: dict = {}
             for ci, cid in zip(labels, cids):
@@ -2671,6 +3184,7 @@ def build_recombination_comparison_figure(recluster_result: dict,
                     "raw":     raw,
                     "ref_val": ref_val,
                     "n_clusters": len(cluster_ids_in),
+                    "cluster_ids": sorted(cluster_ids_in),
                 }
 
             #   plot grouped bars  
@@ -2727,12 +3241,31 @@ def build_recombination_comparison_figure(recluster_result: dict,
                                 ha="center", fontsize=11, color="#FF4081",
                                 fontweight="bold")
 
-            # x-axis labels: show RG-N and how many raw clusters it contains
+            # x-axis labels: show RG-N and exactly which raw clusters compose
+            # it. Fewer merged groups per row => more room per label, so show
+            # more ids; many merged groups => shrink hard to avoid crowding.
+            max_show = 6 if n_mg <= 4 else 4 if n_mg <= 8 else 3
+            fsize_x  = max(6, 9 - n_mg // 3)
+
+            def _compose_label(mg):
+                cid_list = mg_stats[mg]["cluster_ids"]
+                if len(cid_list) <= max_show:
+                    shown_ids = cid_list
+                    extra = 0
+                else:
+                    shown_ids = cid_list[:max_show]
+                    extra = len(cid_list) - max_show
+                # wrap onto multiple short lines instead of one long run
+                chunks = [shown_ids[i:i + 3] for i in range(0, len(shown_ids), 3)]
+                cid_txt = "\n".join(",".join(f"C{c}" for c in ch) for ch in chunks)
+                if extra:
+                    cid_txt += f"\n+{extra} more"
+                return f"RG-{mg}\n({cid_txt})"
             ax.set_xticks(x_base)
             ax.set_xticklabels(
-                [f"RG-{mg}\n(n={mg_stats[mg]['n_clusters']} clust.)"
-                 for mg in mg_ids],
-                fontsize=9, color=t["tick"],
+                [_compose_label(mg) for mg in mg_ids],
+                fontsize=fsize_x, color=t["tick"],
+                rotation=0 if n_mg <= 6 else 30, ha="center" if n_mg <= 6 else "right",
             )
             ax.set_ylabel(f"Normalised {metric.replace('_',' ')}\n(ref = {ref_eg})",
                           color=t["tick"])
@@ -2742,12 +3275,392 @@ def build_recombination_comparison_figure(recluster_result: dict,
                       labelcolor=t["tick"], loc="upper right")
             _style_ax(ax, t)
 
+        _cap_note = ""
+        if cap_pct < 100:
+            if feat_dist_matrix is None:
+                _cap_note = "\npose-distance cap requested but unavailable for this run"
+            else:
+                _cap_note = (f"\npose-distance cap = {cap_pct:.0f}th percentile — "
+                              f"{_total_rejected} of {_total_considered} proposed "
+                              f"merges rejected")
+                if recluster_result.get("feat_dist_approximate"):
+                    _cap_note += " (APPROXIMATE — from UMAP embedding)"
         fig.suptitle(
             "Recombination Comparison  -  Normalised change across experimental groups\n"
-            "(clusters are merged by similarity of change pattern, not absolute magnitude)",
+            "(clusters are merged by similarity of change pattern, not absolute magnitude)"
+            + _cap_note,
             color=t["tick"], fontsize=11, fontweight="bold"
         )
         fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+
+def _cophenetic_corr(recluster_result: dict):
+    """Cophenetic correlation coefficient of the blended-distance dendrogram
+    (§5 sanity check: does the linkage tree actually reflect the underlying
+    pairwise distances at all — a low value is a signal to distrust any cut
+    of that tree, guided or manual). Returns None if it can't be computed
+    (e.g. too few clusters for a meaningful cophenetic distance)."""
+    from scipy.cluster.hierarchy import cophenet
+    from scipy.spatial.distance import squareform
+    lnk      = recluster_result.get("linkage_matrix")
+    dist_mat = recluster_result.get("dist_matrix")
+    if lnk is None or dist_mat is None:
+        return None
+    try:
+        condensed = squareform(dist_mat, checks=False)
+        c, _ = cophenet(lnk, condensed)
+        c = float(c)
+        # With too few clusters (e.g. k=2, a single pairwise distance) the
+        # cophenetic correlation is statistically undefined -- cophenet()
+        # returns NaN rather than raising, so this must be checked explicitly.
+        return c if not np.isnan(c) else None
+    except Exception:
+        return None
+
+
+def _draw_merge_diagnostics_panel(ax, recluster_result: dict, guided_result: dict, t: dict):
+    """Per-merge diagnostic table + cophenetic correlation (§5 replacement
+    for silhouette/elbow as the primary reclustering diagnostic) — one row
+    per Guided Merge merge_log entry: pair, blended distance, pose distance
+    + percentile, response-pattern correlation, transition similarity.
+    Drawn onto an existing (already turned-off) axis so it can be embedded
+    as a second panel in build_guided_merge_figure, or used standalone via
+    build_guided_merge_diagnostics_figure.
+    """
+    ax.axis("off")
+    merge_log = guided_result.get("merge_log", [])
+    coph = _cophenetic_corr(recluster_result)
+    coph_txt = f"{coph:.3f}" if coph is not None else "n/a (too few clusters)"
+    header = (f"Guided Merge diagnostics — cophenetic correlation of "
+              f"blended dendrogram: {coph_txt}")
+
+    if not merge_log:
+        ax.text(0.5, 0.5,
+                header + "\n\nNo merges were accepted at the current "
+                "cap / min-gap settings.",
+                ha="center", va="center", color=t["tick"],
+                transform=ax.transAxes, fontsize=10, multialignment="center")
+        return
+
+    def _fmt(v, suffix=""):
+        return "n/a" if (v is None or (isinstance(v, float) and np.isnan(v))) \
+            else f"{v:.2f}{suffix}"
+
+    col_labels = ["Pair", "Blended dist", "Pose dist", "Pose %ile",
+                  "Response r", "Transition sim"]
+    rows = [[
+        f"C{m['cluster_a']} + C{m['cluster_b']}",
+        _fmt(m["blended_distance"]),
+        _fmt(m["pose_distance"]),
+        _fmt(m["pose_percentile"], "th"),
+        _fmt(m["response_corr"]),
+        _fmt(m["transition_sim"]),
+    ] for m in merge_log]
+
+    tbl = ax.table(cellText=rows, colLabels=col_labels, loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    tbl.scale(1, 1.6)
+    for (r, _c), cell in tbl.get_celld().items():
+        cell.set_edgecolor(t["spine"])
+        cell.set_text_props(color=t["tick"])
+        cell.set_facecolor(t["panel"] if r == 0 else t["ax_bg"])
+    ax.set_title(header, color=t["tick"], fontsize=10, pad=16)
+
+
+def build_guided_merge_diagnostics_figure(recluster_result: dict, guided_result: dict,
+                                           t: dict = None) -> plt.Figure:
+    """Standalone per-merge diagnostic table + cophenetic correlation —
+    see _draw_merge_diagnostics_panel. build_guided_merge_figure embeds the
+    same panel automatically as a second row rather than requiring users to
+    switch to a separate mode; this standalone entry point exists for the
+    same reason build_cluster_validity_figure etc. exist standalone."""
+    if t is None:
+        t = T()
+    fig, ax = plt.subplots(figsize=(11, max(2.5, 0.6 * len(
+        guided_result.get("merge_log", [])) + 1.5)), facecolor=t["fig_bg"])
+    _draw_merge_diagnostics_panel(ax, recluster_result, guided_result, t)
+    fig.tight_layout()
+    return fig
+
+
+def build_guided_merge_figure(recluster_result: dict, guided_result: dict,
+                               animal_data: list,
+                               metric: str = "total_duration",
+                               eg_colors_override: dict = None,
+                               t: dict = None) -> plt.Figure:
+    """
+    Direction-of-change visualisation for the Guided Merge partition
+    (compute_guided_merge's output) — same visual grammar as one row of
+    build_recombination_comparison_figure (normalised bars + animal dots +
+    SEM + significance stars + crowding-aware composition labels), but
+    driven by a single fixed group assignment instead of a k-sweep, since
+    Guided Merge produces one self-stopped partition, not several k's to
+    compare. A second panel (_draw_merge_diagnostics_panel) is always drawn
+    below it — the per-merge diagnostic table + cophenetic correlation from
+    RECLUSTERING_HIERARCHY_PLAN.md §5, shown automatically rather than
+    requiring a separate mode switch.
+
+    When guided_result["available"] is False (no pose-distance data for this
+    run), returns a placeholder explaining why instead of attempting to plot.
+    """
+    if t is None:
+        t = T()
+
+    if not guided_result.get("available", False):
+        fig, ax = plt.subplots(figsize=(9, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5,
+                "Guided Merge unavailable for this run.\n"
+                f"{guided_result.get('reason', '')}\n\n"
+                "Re-run Step 3 (Clustering Engine) to generate\n"
+                "model/cluster_feature_centroids.npz.",
+                ha="center", va="center", color=t["tick"],
+                transform=ax.transAxes, fontsize=10, multialignment="center")
+        _style_ax(ax, t)
+        return fig
+
+    eg_names = recluster_result["eg_names"]
+    animal_pcm_cache = {
+        ani["uid"]: compute_per_cluster_metrics(ani["df"], ani["fps"])
+        for ani in animal_data
+    }
+    eg_colors: dict = {}
+    for i, eg in enumerate(eg_names):
+        if eg_colors_override and eg in eg_colors_override:
+            eg_colors[eg] = eg_colors_override[eg]
+        else:
+            eg_colors[eg] = PALETTE[i % len(PALETTE)]
+    ref_eg = eg_names[0]
+    n_eg   = len(eg_names)
+
+    mg_keys = [k for k in guided_result if k.startswith("RG-")]
+    mg_keys.sort(key=lambda k: int(k.split("-")[1]))
+    n_mg = len(mg_keys)
+
+    bar_w  = 0.7 / max(n_eg, 1)
+    x_base = np.arange(n_mg)
+    rng    = np.random.default_rng(99)
+
+    mg_stats = {}
+    for mg in mg_keys:
+        cluster_ids_in = guided_result[mg]["labels"]
+        raw: dict = {eg: [] for eg in eg_names}
+        for ani in animal_data:
+            eg  = ani["exp_group"]
+            pcm = animal_pcm_cache[ani["uid"]]
+            total = 0.0
+            for cid in cluster_ids_in:
+                if cid in pcm.index:
+                    total += float(pcm.loc[cid, metric])
+            raw[eg].append(total)
+        means = {eg: float(np.mean(v)) if v else 0.0 for eg, v in raw.items()}
+        sems  = {
+            eg: float(np.std(v, ddof=1) / np.sqrt(len(v))) if len(v) > 1 else 0.0
+            for eg, v in raw.items()
+        }
+        ref_val = means[ref_eg] if means[ref_eg] != 0 else 1.0
+        mg_stats[mg] = {
+            "means": means, "sems": sems, "raw": raw, "ref_val": ref_val,
+            "cluster_ids": sorted(cluster_ids_in),
+        }
+
+    n_merge_rows = len(guided_result.get("merge_log", []))
+    diag_h = max(1.6, 0.5 * n_merge_rows + 1.0)
+
+    with plt.style.context(t["mpl_style"]):
+        fig, (ax, ax_diag) = plt.subplots(
+            2, 1, figsize=(max(10, n_mg * 1.6 + 3), 5.2 + diag_h),
+            facecolor=t["fig_bg"],
+            gridspec_kw={"height_ratios": [5.2, diag_h]})
+
+        for ei, eg in enumerate(eg_names):
+            offset = (ei - (n_eg - 1) / 2) * bar_w
+            norm_means, norm_sems, pts_x_all, pts_y_all = [], [], [], []
+            for xi, mg in enumerate(mg_keys):
+                st = mg_stats[mg]
+                ref_val = st["ref_val"]
+                norm_means.append(st["means"][eg] / ref_val)
+                norm_sems.append(st["sems"][eg] / ref_val)
+                for v in st["raw"][eg]:
+                    pts_x_all.append(x_base[xi] + offset +
+                                      rng.uniform(-bar_w * 0.22, bar_w * 0.22))
+                    pts_y_all.append(v / ref_val)
+
+            color = eg_colors[eg]
+            hatch = "" if eg != ref_eg else "///"
+            ax.bar(x_base + offset, norm_means, width=bar_w * 0.88,
+                   color=color, alpha=0.82, edgecolor="none",
+                   linewidth=0.6, label=eg, hatch=hatch, zorder=2)
+            ax.errorbar(x_base + offset, norm_means, yerr=norm_sems,
+                        fmt="none", color=t["tick"], lw=1.2, capsize=3, zorder=3)
+            ax.scatter(pts_x_all, pts_y_all, color=t["ax_bg"], edgecolors=color,
+                       s=22, linewidths=0.7, alpha=0.85, zorder=4)
+
+        ax.axhline(1.0, color=t["spine"], lw=1.0, ls="--", alpha=0.7,
+                   label=f"ref ({ref_eg})")
+
+        if SCIPY_OK and n_eg >= 2:
+            for xi, mg in enumerate(mg_keys):
+                st = mg_stats[mg]
+                groups_for_test = [np.array(st["raw"][eg]) for eg in eg_names]
+                try:
+                    _, pv = sp_stats.kruskal(*groups_for_test)
+                except Exception:
+                    pv = 1.0
+                stars = ("***" if pv < 0.001 else "**" if pv < 0.01 else
+                          "*" if pv < 0.05 else "")
+                if stars:
+                    ymax = ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 2.0
+                    ax.text(x_base[xi], ymax * 0.95, stars, ha="center",
+                            fontsize=11, color="#FF4081", fontweight="bold")
+
+        max_show = 6 if n_mg <= 4 else 4 if n_mg <= 8 else 3
+        fsize_x  = max(6, 9 - n_mg // 3)
+
+        def _compose_label(mg):
+            cid_list = mg_stats[mg]["cluster_ids"]
+            if len(cid_list) <= max_show:
+                shown_ids, extra = cid_list, 0
+            else:
+                shown_ids, extra = cid_list[:max_show], len(cid_list) - max_show
+            chunks = [shown_ids[i:i + 3] for i in range(0, len(shown_ids), 3)]
+            cid_txt = "\n".join(",".join(f"C{c}" for c in ch) for ch in chunks)
+            if extra:
+                cid_txt += f"\n+{extra} more"
+            return f"{mg}\n({cid_txt})"
+
+        ax.set_xticks(x_base)
+        ax.set_xticklabels(
+            [_compose_label(mg) for mg in mg_keys],
+            fontsize=fsize_x, color=t["tick"],
+            rotation=0 if n_mg <= 6 else 30, ha="center" if n_mg <= 6 else "right",
+        )
+        ax.set_ylabel(f"Normalised {metric.replace('_',' ')}\n(ref = {ref_eg})",
+                      color=t["tick"])
+        ax.set_title(f"Guided Merge  -  {n_mg} groups (self-stopped) — "
+                     f"direction of change vs {ref_eg}",
+                     color=t["tick"], fontweight="bold", fontsize=11)
+        ax.legend(fontsize=8, framealpha=0.3, facecolor=t["ax_bg"],
+                  labelcolor=t["tick"], loc="upper right")
+        _style_ax(ax, t)
+
+        _draw_merge_diagnostics_panel(ax_diag, recluster_result, guided_result, t)
+
+        _approx_note = ""
+        if recluster_result.get("feat_dist_approximate"):
+            _approx_note = ("\nAPPROXIMATE pose distances — backfilled from UMAP "
+                            "embedding, not true feature space")
+        fig.suptitle(
+            f"Guided Merge  -  {n_merge_rows} merge(s) accepted, hierarchy-aware\n"
+            "(pose-distance-vetoed, minimum-gap-stopped)" + _approx_note,
+            color=("#FF9800" if recluster_result.get("feat_dist_approximate") else t["tick"]),
+            fontsize=11, fontweight="bold"
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+
+def _cluster_identity_color(cid: int) -> str:
+    """Colour for raw cluster id cid — mirrors cube_core.py's _cmap exactly
+    (same PALETTE, same golden-ratio gist_rainbow fallback beyond it) so a
+    cluster's colour matches between the pipeline's exported
+    cluster_hierarchy_*.png and this module's live Cluster Hierarchy view,
+    which is the whole point of being able to cross-reference the two."""
+    cid = int(cid)
+    if cid < len(PALETTE):
+        return PALETTE[cid]
+    cmap = plt.cm.get_cmap("gist_rainbow")
+    frac = ((cid - len(PALETTE)) * 0.61803398875) % 1.0
+    r, g, b, _a = cmap(frac)
+    return mcolors.to_hex((r, g, b))
+
+
+def build_cluster_hierarchy_figure(centroids, cluster_ids, t: dict = None,
+                                    linkage_method: str = "ward",
+                                    approximate: bool = False) -> plt.Figure:
+    """
+    On-the-fly re-render of the pose-hierarchy dendrogram from
+    model/cluster_feature_centroids.npz (find_cluster_centroids), using this
+    module's own t: dict theme convention rather than embedding the static
+    cluster_hierarchy_*.png (which is fixed at whatever theme the pipeline
+    run happened to export, and wouldn't re-theme when the Analyser's
+    dark/light toggle is used) — mirrors build_cluster_validity_figure's
+    cube_core -> cube_analyser theme port for the same reason.
+
+    Ports the dendrogram-drawing logic from cube_core.plot_cluster_hierarchy
+    (module-global _BG/_PANEL/_TEXT_COL/_TICK_COL there) to the t-dict
+    convention; scipy's dendrogram layout is deterministic given the same
+    linkage input, so topology matches the pipeline-exported PNG exactly
+    (leaf order / branch structure), even though this is a fresh Ward
+    linkage over the saved centroids rather than a copy of the image.
+
+    centroids : (n_clusters, n_features) array from the npz.
+    cluster_ids : (n_clusters,) array of raw B-SOiD cluster ids from the npz.
+    approximate : True when centroids/cluster_ids came from
+        backfill_cluster_centroids_from_umap (UMAP-embedding-based, not true
+        feature space) — a caveat is shown in the title so it's never
+        mistaken for a real Step 3-produced hierarchy.
+    """
+    if t is None:
+        t = T()
+
+    def _placeholder(msg):
+        fig, ax = plt.subplots(figsize=(9, 3), facecolor=t["fig_bg"])
+        ax.text(0.5, 0.5, msg, ha="center", va="center", color=t["tick"],
+                transform=ax.transAxes, fontsize=10, multialignment="center")
+        _style_ax(ax, t)
+        return fig
+
+    if centroids is None or cluster_ids is None:
+        return _placeholder(
+            "Cluster hierarchy unavailable for this run.\n"
+            "Re-run Step 3 (Clustering Engine) to generate\n"
+            "model/cluster_feature_centroids.npz.")
+
+    from scipy.cluster.hierarchy import linkage, dendrogram
+
+    centroids = np.asarray(centroids, dtype=float)
+    uniq = [int(c) for c in cluster_ids]
+    if len(uniq) < 2:
+        return _placeholder("Need at least 2 clusters for a dendrogram.")
+
+    Z = linkage(centroids, method=linkage_method)
+    leaf_labels = [f"C{c}" for c in uniq]
+
+    with plt.style.context(t["mpl_style"]):
+        fig_w = max(8.0, 0.55 * len(uniq) + 2.0)
+        fig, ax = plt.subplots(figsize=(fig_w, 6.5), facecolor=t["fig_bg"])
+        dn = dendrogram(Z, labels=leaf_labels, ax=ax,
+                        link_color_func=lambda k: t["tick"])
+        for line in ax.get_lines():
+            line.set_linewidth(2.2)
+            line.set_alpha(0.95)
+        ax.tick_params(axis="x", labelbottom=False, length=0)
+        ax.tick_params(axis="y", colors=t["tick"])
+
+        y0, y1 = ax.get_ylim()
+        yr = y1 - y0
+        n_leaves = len(dn["leaves"])
+        leaf_x = 5.0 + 10.0 * np.arange(n_leaves)
+        for x, leaf_idx in zip(leaf_x, dn["leaves"]):
+            c = uniq[leaf_idx]
+            col = _cluster_identity_color(c)
+            ax.scatter([x], [y0 - 0.045 * yr], s=100, color=col,
+                       edgecolor=t["fig_bg"], linewidth=1.0, zorder=6, clip_on=False)
+            ax.text(x, y0 - 0.09 * yr, f"C{c}", color=col,
+                    fontsize=8, fontweight="bold", ha="center", va="top",
+                    linespacing=1.3, clip_on=False)
+        ax.set_ylim(y0 - 0.24 * yr, y1)
+
+        ax.set_ylabel(f"{linkage_method.title()} linkage distance (feature space)",
+                      color=t["tick"])
+        title = f"Cluster hierarchy ({len(uniq)} clusters, feature-space centroids)"
+        if approximate:
+            title += "\nAPPROXIMATE — backfilled from UMAP embedding, not true feature space"
+        ax.set_title(title, color=("#FF9800" if approximate else t["tick"]), fontsize=10)
+        _style_ax(ax, t)
+        fig.tight_layout()
     return fig
 
 
@@ -2843,7 +3756,7 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
     ncols = min(n_c, 5)
     nrows = int(np.ceil(n_c / ncols))
     fig_w = max(12, ncols * 2.4)
-    fig_h = max(4,  nrows * 3.2) + 0.6
+    fig_h = max(4,  nrows * 2.6) + 0.6
     with plt.style.context(t["mpl_style"]):
         fig, axes_flat = plt.subplots(
             nrows, ncols,
@@ -3311,8 +4224,8 @@ def build_transition_figure(recluster_result: dict, groups: dict = None,
     def _label_color(cid_int):
         return cid_to_grp[cid_int][1] if cid_int in cid_to_grp else t["tick"]
 
-    row_h  = max(5, n * 0.32 + 2)
-    net_h  = max(6, min(n * 0.4 + 2, 12))
+    row_h  = max(5, min(n * 0.32 + 2, 8))
+    net_h  = max(6, min(n * 0.4 + 2, 9))
     fig_w  = max(16, n * 0.32 * 2 + 5)
 
     with plt.style.context(t["mpl_style"]):
@@ -3339,8 +4252,7 @@ def build_transition_figure(recluster_result: dict, groups: dict = None,
         tmat_display[tmat_display <= chance_floor_t] = np.nan
         vmax_tmat = float(np.nanmax(tmat_display)) \
             if not np.all(np.isnan(tmat_display)) else 1.0
-        cmap_tmat = plt.cm.magma.copy()
-        cmap_tmat.set_bad(color=t["ax_bg"])
+        cmap_tmat = _trans_cmap(t)
 
         im1 = ax1.imshow(tmat_display, cmap=cmap_tmat, aspect="auto",
                          interpolation="nearest",
@@ -3511,7 +4423,7 @@ def build_group_transition_comparison_figure(
     cell_size  = max(0.28, 5.0 / max(n_cl, 1))
     hmap_size  = n_cl * cell_size + 2.0
     fig_w      = max(16, n_top_cols * (hmap_size + 0.5) + 2)
-    fig_h      = max(10, hmap_size * 2 + 3)
+    fig_h      = max(10, min(hmap_size * 1.4 + 3, 15))
 
     with plt.style.context(t["mpl_style"]):
         fig = plt.figure(figsize=(fig_w, fig_h), facecolor=t["fig_bg"])
@@ -3530,8 +4442,7 @@ def build_group_transition_comparison_figure(
 
         # ── Panel A — per-EG heatmaps ─────────────────────────────────────────
         ax_egs = [fig.add_subplot(top_gs[0, i]) for i in range(n_eg)]
-        cmap_a = plt.cm.magma.copy()
-        cmap_a.set_bad(color=t["ax_bg"])
+        cmap_a = _trans_cmap(t)
         _last_im = None
         for idx_eg, eg in enumerate(eg_names):
             ax = ax_egs[idx_eg]
@@ -3624,8 +4535,7 @@ def build_group_transition_comparison_figure(
             stack_eg = np.stack([eg_tmats[eg] for eg in eg_names], axis=0)
             std_mat  = np.std(stack_eg, axis=0)
             np.fill_diagonal(std_mat, np.nan)
-            cmap_std = plt.cm.magma.copy()
-            cmap_std.set_bad(color=t["ax_bg"])
+            cmap_std = _trans_cmap(t)
             im_b = ax_b.imshow(std_mat, cmap=cmap_std, aspect="auto",
                                interpolation="nearest")
             ax_b.set_xticks([tick_pos[k] for k in range(len(tick_pos))])
@@ -3876,7 +4786,7 @@ def build_cluster_stats_figure(recluster_result: dict, animal_data: list,
     with plt.style.context(t["mpl_style"]):
         fig, axes = plt.subplots(
             len(metrics_plot), 1,
-            figsize=(max(14, len(all_raw) * 0.35 + 2), 4.5 * len(metrics_plot)),
+            figsize=(max(14, len(all_raw) * 0.35 + 2), 3.3 * len(metrics_plot)),
             facecolor=t["fig_bg"],
             sharex=True,
         )
@@ -3934,7 +4844,8 @@ def build_cluster_stats_figure(recluster_result: dict, animal_data: list,
     return fig
 
 
-def extract_reclustered_groups(recluster_result: dict, k: int) -> dict:
+def extract_reclustered_groups(recluster_result: dict, k: int,
+                                cap_pct: float = 100.0) -> dict:
     """
     Convert a chosen k into a behaviour-groups dict compatible with the
     Group Editor and compute_combined / Combined Analysis.
@@ -3945,10 +4856,16 @@ def extract_reclustered_groups(recluster_result: dict, k: int) -> dict:
 
     Cluster IDs in each merged group correspond directly to B-SOiD label
     integers and can be used as-is in compute_metrics / compute_combined.
+
+    cap_pct : same pose-distance cap as build_recombination_comparison_figure
+        (see apply_pose_distance_cap) — < 100 splits any merged group with an
+        over-cap internal pair back into singleton raw clusters before export.
     """
     lnk  = recluster_result["linkage_matrix"]
     cids = recluster_result["cluster_ids"]
     labels = fcluster(lnk, t=k, criterion="maxclust")
+    labels, _, _ = apply_pose_distance_cap(
+        labels, cids, recluster_result.get("feat_dist_matrix"), cap_pct)
     groups = {}
     for ci, cid in zip(labels, cids):
         key = f"RG-{int(ci)}"
@@ -3982,6 +4899,36 @@ def _style_ax(ax, t: dict):
     ax.xaxis.label.set_color(t["tick"])
     ax.yaxis.label.set_color(t["tick"])
     ax.title.set_color(t["tick"])
+
+
+def _trans_cmap(t: dict, base: str = None, low_cut: float = None):
+    """Sequential colormap for sparse transition-probability heatmaps.
+
+    ``vmin`` on these plots is usually the above-chance floor, so the raw
+    colormap's darkest colours (near-black for magma) end up painting most
+    of the low-but-above-floor cells. On a light background that reads as
+    stray black splotches rather than "low but present" — truncating the
+    colormap's bottom slice keeps the low end a dark-but-not-black colour
+    that stays legible against both the dark and light theme backgrounds.
+    NaN-masked (below-floor / diagonal) cells still use the theme's own
+    ``ax_bg`` via ``set_bad`` so they blend into the axes background.
+
+    In light mode ``ax_bg`` is white, and magma's low end (even truncated)
+    stays a dark purple — so masked-white cells next to dark-purple cells
+    read as harsh white patches. ``YlOrRd`` starts pale/near-white instead,
+    so masked cells blend into the colormap's own low end rather than
+    clashing with it. Dark mode keeps the original magma behaviour.
+    """
+    is_light = t.get("ctk_mode") == "light"
+    if base is None:
+        base = "YlOrRd" if is_light else "magma"
+    if low_cut is None:
+        low_cut = 0.0 if is_light else 0.14
+    src  = plt.get_cmap(base)
+    cmap = mcolors.LinearSegmentedColormap.from_list(
+        f"{base}_trunc", src(np.linspace(low_cut, 1.0, 256)))
+    cmap.set_bad(color=t["ax_bg"])
+    return cmap
 
 
 def plot_ethogram(ax, groups, metrics, session_s, t):
@@ -4233,7 +5180,7 @@ def build_per_group_transition_figure(
             _cf = 1.0 / max(1, n - 1)
             disp_d = disp.astype(float)
             disp_d[disp_d <= _cf] = np.nan
-            _cmap_m = plt.cm.magma.copy(); _cmap_m.set_bad(color=t["ax_bg"])
+            _cmap_m = _trans_cmap(t)
 
             eg_color = PALETTE[ei % len(PALETTE)]
             vmax     = float(np.nanmax(disp_d)) if not np.all(np.isnan(disp_d)) else 1.0
@@ -4556,7 +5503,7 @@ def build_diff_heatmap_figure(
     tick_lbl  = [labels[i] for i in tick_pos]
 
     _cf_d  = 1.0 / max(1, n - 1)   # chance floor for absolute panels
-    _cmap_d = plt.cm.magma.copy(); _cmap_d.set_bad(color=t["ax_bg"])
+    _cmap_d = _trans_cmap(t)
 
     with plt.style.context(t["mpl_style"]):
         fig, axes = plt.subplots(
@@ -4819,7 +5766,7 @@ def build_sankey_figure(
     ncols = min(n_eg, 2)
     nrows = int(np.ceil(n_eg / ncols))
     fw    = max(10, n_steps * 2.2) * ncols
-    fh    = 7.5 * nrows
+    fh    = 5.2 * nrows
 
     colors_state = [PALETTE[c % len(PALETTE)] for c in all_cids]
     col_w  = 0.04
@@ -5383,7 +6330,7 @@ def build_group_aggregate_transition_figure(
         axes_flat = axes.flatten()
 
         _cf_g = 1.0 / max(1, ng - 1)
-        _cmap_mg = plt.cm.magma.copy(); _cmap_mg.set_bad(color=t["ax_bg"])
+        _cmap_mg = _trans_cmap(t)
 
         for ei, eg in enumerate(eg_names):
             ax_eg    = axes_flat[ei]
@@ -5497,7 +6444,7 @@ def build_diff_heatmap_beh_groups_figure(
     fsize = max(5, 9 - ng // 5)
 
     _cf_bg  = 1.0 / max(1, ng - 1)
-    _cmap_bg = plt.cm.magma.copy(); _cmap_bg.set_bad(color=t["ax_bg"])
+    _cmap_bg = _trans_cmap(t)
 
     with plt.style.context(t["mpl_style"]):
         fig, axes = plt.subplots(
@@ -6569,6 +7516,12 @@ class AnimalListPanel(ctk.CTkFrame):
         self._uid_counter: int = 0
         # per-exp-group color overrides { eg_name: hex }
         self._eg_colors: dict = {}
+        # persistence: remembers Label 1/2/3 + EG colors per source folder so
+        # the user doesn't have to retype them every time the same folder is
+        # reopened. Keyed by file path (relative to the folder when possible).
+        self._label_store_folder: pathlib.Path | None = None
+        self._label_store_cache: dict = {}
+        self._label_save_after_id = None
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
@@ -6647,6 +7600,7 @@ class AnimalListPanel(ctk.CTkFrame):
         def _apply():
             for eg, d in swatches.items():
                 self._eg_colors[eg] = d["color"].get()
+            self._schedule_save_label_store()
             win.destroy()
 
         ctk.CTkButton(win, text="Apply", command=_apply,
@@ -6655,7 +7609,77 @@ class AnimalListPanel(ctk.CTkFrame):
     def get_eg_colors(self) -> dict:
         return dict(self._eg_colors)
 
-    #   load / remove  
+    #   label persistence (remember Label 1/2/3 + EG colors per folder)
+
+    _LABEL_STORE_FILENAME = ".cube_group_labels.json"
+
+    def _label_store_path(self) -> "pathlib.Path | None":
+        if self._label_store_folder is None:
+            return None
+        return self._label_store_folder / self._LABEL_STORE_FILENAME
+
+    def set_label_store_folder(self, folder):
+        """Point the panel at a source folder and load any previously saved
+        Label 1/2/3 + EG-color assignments for it. Call this before adding
+        files so new rows can be pre-filled from the store."""
+        self._label_store_folder = pathlib.Path(folder) if folder else None
+        self._label_store_cache = {}
+        path = self._label_store_path()
+        if path and path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                self._label_store_cache = data.get("files", {})
+                self._eg_colors = data.get("eg_colors", {})
+            except Exception:
+                self._label_store_cache = {}
+
+    def _store_key(self, path: "pathlib.Path") -> str:
+        if self._label_store_folder is not None:
+            try:
+                return str(path.relative_to(self._label_store_folder))
+            except ValueError:
+                pass
+        return path.name
+
+    def _stored_labels_for(self, path: "pathlib.Path") -> dict:
+        return self._label_store_cache.get(self._store_key(path), {})
+
+    def _schedule_save_label_store(self, *_args):
+        if self._label_store_folder is None:
+            return
+        if self._label_save_after_id is not None:
+            try:
+                self.after_cancel(self._label_save_after_id)
+            except Exception:
+                pass
+        self._label_save_after_id = self.after(600, self._save_label_store)
+
+    def _save_label_store(self):
+        self._label_save_after_id = None
+        path = self._label_store_path()
+        if path is None:
+            return
+        files = {}
+        for a in self._animals:
+            files[self._store_key(a["path"])] = {
+                "label1": self._read_eg(a),
+                "label2": self._read_extra_label(a, "label2"),
+                "label3": self._read_extra_label(a, "label3"),
+            }
+        data = {"files": files, "eg_colors": self._eg_colors}
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+        except Exception:
+            pass
+
+    def _wire_label_persistence(self, entry: dict):
+        """Attach change traces so edits to this entry's labels get saved."""
+        for key in ("exp_group", "label2", "label3"):
+            entry[key].trace_add("write", self._schedule_save_label_store)
+
+    #   load / remove
 
     def _add(self):
         paths = filedialog.askopenfilenames(
@@ -6671,20 +7695,22 @@ class AnimalListPanel(ctk.CTkFrame):
                 fps = extract_fps(path)
                 uid = self._uid_counter
                 self._uid_counter += 1
+                saved = self._stored_labels_for(path)
                 entry = {
                     "uid":       uid,
                     "name":      path.stem,
                     "path":      path,
                     "df":        df,
                     "fps":       fps,
-                    "exp_group": tk.StringVar(master=self, value="Control"),
-                    "label2":    tk.StringVar(master=self, value=""),
-                    "label3":    tk.StringVar(master=self, value=""),
+                    "exp_group": tk.StringVar(master=self, value=saved.get("label1", "Control")),
+                    "label2":    tk.StringVar(master=self, value=saved.get("label2", "")),
+                    "label3":    tk.StringVar(master=self, value=saved.get("label3", "")),
                     "_selected": tk.BooleanVar(master=self, value=False),
                     "_row_frame": None,
                 }
                 self._animals.append(entry)
                 self._build_row(entry, len(self._animals) - 1)
+                self._wire_label_persistence(entry)
                 added += 1
             except Exception as e:
                 messagebox.showerror("Load Error", f"{path.name}:\n{e}")
@@ -6841,6 +7867,7 @@ class AnimalListPanel(ctk.CTkFrame):
             if entry["_row_frame"] and entry["_row_frame"].winfo_exists():
                 entry["_row_frame"].destroy()
             self._update_info()
+            self._schedule_save_label_store()
             self.on_change()
 
     def _update_info(self):
@@ -6954,20 +7981,22 @@ class AnimalListPanel(ctk.CTkFrame):
             path, df, fps = read_results[idx]
             uid = self._uid_counter
             self._uid_counter += 1
+            saved = self._stored_labels_for(path)
             entry = {
                 "uid":        uid,
                 "name":       path.stem,
                 "path":       path,
                 "df":         df,
                 "fps":        fps,
-                "exp_group":  tk.StringVar(master=self, value="Control"),
-                "label2":     tk.StringVar(master=self, value=""),
-                "label3":     tk.StringVar(master=self, value=""),
+                "exp_group":  tk.StringVar(master=self, value=saved.get("label1", "Control")),
+                "label2":     tk.StringVar(master=self, value=saved.get("label2", "")),
+                "label3":     tk.StringVar(master=self, value=saved.get("label3", "")),
                 "_selected":  tk.BooleanVar(master=self, value=False),
                 "_row_frame": None,
             }
             self._animals.append(entry)
             self._build_row(entry, len(self._animals) - 1)
+            self._wire_label_persistence(entry)
             added += 1
         read_results.clear()
 
@@ -6994,15 +8023,18 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
     EXHAUSTIVE_COMBO_LIMIT = 15_000
 
     def __init__(self, parent, get_animals_fn, load_groups_to_editor_fn=None,
-                 get_groups_fn=None, get_combined_fn=None, get_umap_fn=None, **kw):
+                 get_groups_fn=None, get_combined_fn=None, get_umap_fn=None,
+                 get_root_fn=None, **kw):
         super().__init__(parent, fg_color=T()["panel"], **kw)
         self._get_animals           = get_animals_fn
         self._load_groups_to_editor = load_groups_to_editor_fn
         self._get_groups_fn         = get_groups_fn   # () -> {group_name: {labels, color}}
         self._get_combined_fn       = get_combined_fn  # () -> combined dict or None
+        self._get_root_fn           = get_root_fn      # () -> pathlib.Path | None (run folder root)
         self._get_umap_fn           = get_umap_fn      # () -> (embedding, labels) or None
         self._stats_df:    pd.DataFrame | None = None
         self._recluster:   dict | None          = None
+        self._guided_merge: dict | None         = None  # cached compute_guided_merge() result
         self._raw_preview: dict | None          = None  # pre-recluster transition preview
         self._last_animals: list | None         = None  # inputs of the last stats run
         self._last_metric:  str | None          = None
@@ -7134,15 +8166,85 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
         self._maxk_var = ctk.StringVar(value="10")
-        ctk.CTkEntry(rf_sec, textvariable=self._maxk_var, width=80
+        ctk.CTkEntry(rf_sec, textvariable=self._maxk_var, width=80,
+                     placeholder_text="10"
                      ).pack(anchor="w", padx=12, pady=(2, 4))
 
         ctk.CTkLabel(rf_sec, text="Compare k values (comma-sep):",
                      text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
         self._compare_k_var = ctk.StringVar(value="3,5,8")
-        ctk.CTkEntry(rf_sec, textvariable=self._compare_k_var, width=200
-                     ).pack(anchor="w", padx=12, pady=(2, 8))
+        self._compare_k_user_edited = False
+        self._compare_k_entry = ctk.CTkEntry(
+            rf_sec, textvariable=self._compare_k_var, width=200,
+            placeholder_text="3,5,8")
+        self._compare_k_entry.pack(anchor="w", padx=12, pady=(2, 8))
+
+        def _on_compare_k_key(*_a):
+            self._compare_k_user_edited = True
+        self._compare_k_entry.bind("<KeyRelease>", _on_compare_k_key)
+
+        def _on_compare_k_changed(*_a):
+            # The Recombination view is only re-rendered when the segmented
+            # button's selection *changes* — editing this field while already
+            # on that view otherwise leaves the old k values on screen.
+            if self._plot_mode.get() == "Recombination" and self._recluster is not None:
+                try:
+                    self._switch_plot("Recombination")
+                except Exception:
+                    pass
+        self._compare_k_var.trace_add("write", _on_compare_k_changed)
+
+        ctk.CTkLabel(rf_sec, text="Pose-distance cap (percentile, 100 = off):",
+                     text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
+        self._pose_cap_var = ctk.StringVar(value="100")
+        self._pose_cap_entry = ctk.CTkEntry(rf_sec, textvariable=self._pose_cap_var,
+                                             width=80, placeholder_text="100")
+        self._pose_cap_entry.pack(anchor="w", padx=12, pady=(2, 2))
+        self._pose_cap_status_lbl = ctk.CTkLabel(
+            rf_sec, text="Run Reclustering to check pose-distance availability.",
+            text_color=T()["subtext"], font=ctk.CTkFont(size=9),
+            justify="left", wraplength=230)
+        self._pose_cap_status_lbl.pack(anchor="w", padx=12, pady=(0, 2))
+        self._pose_cap_var.trace_add("write", _on_compare_k_changed)
+
+        self._backfill_btn = ctk.CTkButton(
+            rf_sec, text="Backfill pose data (approximate)",
+            command=self._backfill_pose_centroids,
+            fg_color=T()["btn_folder"], height=26,
+            font=ctk.CTkFont(size=10))
+        self._backfill_btn.pack(anchor="w", padx=12, pady=(2, 8))
+
+        ctk.CTkLabel(rf_sec,
+                     text="Guided Merge (greedy, self-stopping —\n"
+                          "see 'Guided Merge' view):",
+                     text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(6, 0))
+        _gm_row = ctk.CTkFrame(rf_sec, fg_color="transparent")
+        _gm_row.pack(anchor="w", padx=12, pady=(2, 8))
+        ctk.CTkLabel(_gm_row, text="cap %:", text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=10)).pack(side="left")
+        self._guided_cap_var = ctk.StringVar(value="50")
+        ctk.CTkEntry(_gm_row, textvariable=self._guided_cap_var, width=50,
+                     placeholder_text="50"
+                     ).pack(side="left", padx=(2, 10))
+        ctk.CTkLabel(_gm_row, text="min gap:", text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=10)).pack(side="left")
+        self._guided_gap_var = ctk.StringVar(value="0.15")
+        ctk.CTkEntry(_gm_row, textvariable=self._guided_gap_var, width=50,
+                     placeholder_text="0.15"
+                     ).pack(side="left", padx=(2, 0))
+
+        def _on_guided_params_changed(*_a):
+            self._guided_merge = None   # invalidate cache
+            if self._plot_mode.get() == "Guided Merge" and self._recluster is not None:
+                try:
+                    self._switch_plot("Guided Merge")
+                except Exception:
+                    pass
+        self._guided_cap_var.trace_add("write", _on_guided_params_changed)
+        self._guided_gap_var.trace_add("write", _on_guided_params_changed)
 
         ctk.CTkButton(ctrl, text="   Run Reclustering",
                       command=self._run_reclustering,
@@ -7158,7 +8260,16 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                      font=ctk.CTkFont(size=10),
                      justify="left").pack(anchor="w", padx=12, pady=(2, 6))
 
-        ctk.CTkLabel(sg_sec, text="k to save:", text_color=T()["subtext"],
+        ctk.CTkLabel(sg_sec, text="Source:", text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(2, 0))
+        self._save_source_var = ctk.StringVar(value="Manual (k-sweep)")
+        ctk.CTkSegmentedButton(
+            sg_sec, values=["Manual (k-sweep)", "Guided Merge"],
+            variable=self._save_source_var,
+        ).pack(anchor="w", padx=12, pady=(2, 8))
+
+        ctk.CTkLabel(sg_sec, text="k to save (manual source only):",
+                     text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(2, 0))
         self._save_k_var = ctk.StringVar(value="5")
         ctk.CTkEntry(sg_sec, textvariable=self._save_k_var, width=80
@@ -7192,6 +8303,29 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                       fg_color=T()["btn_save"],
                       ).pack(fill="x", padx=8, pady=(4, 2))
 
+        # Force a repaint of the default-valued entries built above. Native
+        # tkinter.Entry widgets embedded (via CTkEntry) inside a
+        # CTkScrollableFrame can fail to paint their initial textvariable
+        # content while off-screen/unmapped at construction time -- the
+        # StringVar itself is correct (confirmed via .get()), only the
+        # on-screen paint is stale. Re-setting each var to its own current
+        # value re-fires the write trace tkinter.Entry uses to sync its
+        # display, which is enough to force the repaint once the widgets
+        # are actually mapped (hence deferring via .after, not doing this
+        # inline before the scrollable frame has laid out). Also called
+        # after _run_reclustering() auto-updates save_k/compare_k so those
+        # later programmatic .set() calls repaint too, not just the initial
+        # construction-time defaults.
+        self.after(50, self._force_repaint_reclustering_defaults)
+
+    def _force_repaint_reclustering_defaults(self):
+        for _var in (self._maxk_var, self._compare_k_var, self._pose_cap_var,
+                    self._guided_cap_var, self._guided_gap_var, self._save_k_var):
+            try:
+                _var.set(_var.get())
+            except Exception:
+                pass
+
     #   plot area
 
     def _build_plot_area(self):
@@ -7209,7 +8343,8 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         ctk.CTkSegmentedButton(
             sel_fr,
             values=["Top-N Bar", "Volcano", "Heatmap",
-                    "Elbow/Silhouette", "Recombination",
+                    "Elbow/Silhouette", "Cluster Hierarchy", "Guided Merge",
+                    "Recombination",
                     "Dist Matrix", "Transitions", "Grp Transitions",
                     "Cluster Stats", "Cluster Validity"],
             variable=self._plot_mode,
@@ -7367,7 +8502,9 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             "top_n_bar":          ("Top-N Bar",          True,  False, False),
             "volcano":            ("Volcano",             True,  False, False),
             "heatmap":            ("Heatmap",             True,  False, False),
+            "cluster_hierarchy":  ("Cluster Hierarchy",   False, False, False),
             "elbow_silhouette":   ("Elbow/Silhouette",    False, True,  False),
+            "guided_merge":       ("Guided Merge",        False, True,  False),
             "recombination":      ("Recombination",       False, True,  False),
             "dist_matrix":        ("Dist Matrix",         False, False, True),
             "transitions":        ("Transitions",         False, False, True),
@@ -7404,16 +8541,32 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                         self._stats_df, animals, top_n, p_thresh, metric,
                         eg_colors or None,
                         groups=user_groups or None)]
+                elif mode == "Cluster Hierarchy":
+                    _root = self._get_root_dir()
+                    _centroids, _hier_cids, _approx, _link_m = (find_cluster_centroids(_root)
+                                                       if _root is not None else (None, None, False, "ward"))
+                    figs_to_save = [build_cluster_hierarchy_figure(
+                        _centroids, _hier_cids, linkage_method=_link_m, approximate=_approx)]
                 elif mode == "Elbow/Silhouette":
                     figs_to_save = [build_reclustering_figure(self._recluster)]
+                elif mode == "Guided Merge":
+                    _cap, _gap = self._get_guided_merge_params()
+                    _gm = compute_guided_merge(self._recluster, feat_cap_pct=_cap, min_gap=_gap)
+                    figs_to_save = [build_guided_merge_figure(
+                        self._recluster, _gm, animals, metric, eg_colors or None)]
                 elif mode == "Recombination":
                     raw = self._compare_k_var.get()
                     k_list = [int(x.strip()) for x in raw.split(",")
                               if x.strip().isdigit()] or [3, 5]
-                    max_avail = max(self._recluster["silhouette_scores"].keys(), default=2)
+                    # True ceiling for fcluster(..., criterion="maxclust") is
+                    # the cluster count, not the silhouette sweep's "Max k"
+                    # setting -- a user-typed k above the last sweep's cap
+                    # must still be honoured rather than silently dropped.
+                    max_avail = max(2, len(self._recluster["cluster_ids"]) - 1)
                     k_list = [k for k in k_list if 2 <= k <= max_avail] or [2]
                     figs_to_save = [build_recombination_comparison_figure(
-                        self._recluster, k_list, animals, metric, eg_colors or None)]
+                        self._recluster, k_list, animals, metric, eg_colors or None,
+                        cap_pct=self._get_pose_cap_pct())]
                 elif mode == "Dist Matrix":
                     figs_to_save = [build_distance_matrix_figure(
                         recluster_data, groups=user_groups or None)]
@@ -7627,12 +8780,13 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             f"  min_total={dur_filter.get('min_total_duration_s', '-')} s  "
             f"  min_freq={dur_filter.get('min_frequency', '-')}"
         )
-        self._raw_preview = None  # invalidate cached raw preview
+        self._raw_preview  = None  # invalidate cached raw preview
+        self._guided_merge = None  # invalidate cached guided-merge result
         self._status(f"Running reclustering...\n(transition-aware, biologically filtered)\n{filter_desc}")
         try:
             self._recluster = compute_reclustering_suggestions(
                 animals, max_k=max_k, metric=metric,
-                duration_filter=dur_filter)
+                duration_filter=dur_filter, centroid_root=self._get_root_dir())
         except Exception as exc:
             messagebox.showerror("Reclustering Error", traceback.format_exc())
             self._status(str(exc), "#cc4444")
@@ -7644,29 +8798,115 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
 
         n_all      = len(raw_ids)
         n_filtered = len(kept_ids)
-        best_k = max(self._recluster["silhouette_scores"],
-                     key=self._recluster["silhouette_scores"].get,
-                     default=None)
+        # NaN-safe: silhouette_score() can return NaN for a degenerate k, and
+        # plain max(..., key=dict.get) never replaces a NaN "best so far"
+        # (NaN comparisons are always False), so a NaN at the first-evaluated
+        # k=2 would incorrectly stick as "best" forever. Drop NaNs first.
+        _valid_sil = {k: v for k, v in self._recluster["silhouette_scores"].items()
+                      if v == v}  # v == v is False for NaN
+        best_k = max(_valid_sil, key=_valid_sil.get, default=None)
+        # The sweep's true ceiling can be lower than what the "Max k" field
+        # requested (compute_reclustering_suggestions clamps to
+        # n_clusters - 1) -- reflect that back into the field so the user can
+        # see the effective limit instead of the stale requested value.
+        max_k_actual = self._recluster.get(
+            "max_k_actual", max(self._recluster["silhouette_scores"].keys(), default=2))
+        self._maxk_var.set(str(max_k_actual))
         self._status(
             f"Reclustering complete.\n"
             f"{n_filtered}/{n_all} clusters kept after filter.\n"
-            f"Best k = {best_k} (silhouette).  Set k in 'Save' to export.", "#88cc88")
+            f"Best k = {best_k} (silhouette).  Max k actually swept = {max_k_actual}.\n"
+            f"Set k in 'Save' to export.", "#88cc88")
         if best_k is not None:
             self._save_k_var.set(str(best_k))
             # Auto-populate compare_k field with values around best_k so the
             # Recombination view uses the user's actual data range, not hardcoded 3,5,8
-            max_avail = max(self._recluster["silhouette_scores"].keys(), default=2)
-            k_opts = sorted(set(
-                k for k in [
-                    max(2, best_k - 2),
-                    max(2, best_k - 1),
-                    best_k,
-                    min(max_avail, best_k + 1),
-                    min(max_avail, best_k + 2),
-                ] if 2 <= k <= max_avail
-            ))
-            self._compare_k_var.set(",".join(str(k) for k in k_opts))
+            # -- but only if the user hasn't typed their own list, so a manual
+            # edit survives repeated Run Reclustering calls.
+            if not self._compare_k_user_edited:
+                k_opts = sorted(set(
+                    k for k in [
+                        max(2, best_k - 2),
+                        max(2, best_k - 1),
+                        best_k,
+                        min(max_k_actual, best_k + 1),
+                        min(max_k_actual, best_k + 2),
+                    ] if 2 <= k <= max_k_actual
+                ))
+                self._compare_k_var.set(",".join(str(k) for k in k_opts))
+        self._update_pose_cap_ui()
+        self.after(50, self._force_repaint_reclustering_defaults)
         self._switch_plot(self._plot_mode.get())
+
+    def _update_pose_cap_ui(self):
+        """Enable/disable the pose-distance cap entry and show why, based on
+        the most recent self._recluster's feat_dist_available/feat_dist_reason."""
+        if not self._recluster or not self._recluster.get("feat_dist_available"):
+            reason = (self._recluster or {}).get(
+                "feat_dist_reason", "run Reclustering first")
+            self._pose_cap_entry.configure(state="disabled")
+            self._pose_cap_var.set("100")
+            self._pose_cap_status_lbl.configure(text=f"Unavailable: {reason}")
+        else:
+            self._pose_cap_entry.configure(state="normal")
+            reason = self._recluster.get("feat_dist_reason", "")
+            self._pose_cap_status_lbl.configure(
+                text=("Pose-distance data available."
+                      + (f" {reason}" if reason else "")))
+
+    def _backfill_pose_centroids(self):
+        """Backfill cluster_feature_centroids.npz for old run folders from
+        the already-saved UMAP embedding (backfill_cluster_centroids_from_umap)
+        — an approximate substitute for a real Step 3 run, only ever writing
+        the file if one doesn't already exist. Re-runs Reclustering
+        automatically on success so the pose-distance cap / Guided Merge /
+        Cluster Hierarchy views pick it up immediately."""
+        root = self._get_root_dir()
+        if root is None:
+            messagebox.showwarning("No folder", "Select/load a run folder first.")
+            return
+        ok, msg = backfill_cluster_centroids_from_umap(root)
+        if ok:
+            messagebox.showinfo("Backfilled", msg)
+            if self._recluster is not None:
+                self._run_reclustering()
+        else:
+            messagebox.showwarning("Backfill unavailable", msg)
+
+    def _get_pose_cap_pct(self) -> float:
+        """Return the current pose-distance cap percentile, clamped to
+        [0, 100]. Falls back to 100 (no cap) on bad input or when
+        feat_dist is unavailable for the current self._recluster."""
+        if not self._recluster or not self._recluster.get("feat_dist_available"):
+            return 100.0
+        try:
+            return max(0.0, min(100.0, float(self._pose_cap_var.get())))
+        except (ValueError, TypeError):
+            return 100.0
+
+    def _get_guided_merge_params(self):
+        try:
+            cap = max(0.0, min(100.0, float(self._guided_cap_var.get())))
+        except (ValueError, TypeError):
+            cap = 50.0
+        try:
+            gap = max(0.0, float(self._guided_gap_var.get()))
+        except (ValueError, TypeError):
+            gap = 0.15
+        return cap, gap
+
+    def _get_guided_merge_result(self) -> dict | None:
+        """Return the cached compute_guided_merge() result for the current
+        self._recluster + cap/min-gap params, computing it once and caching
+        until self._recluster or the params change (see _run_reclustering
+        and the cap/gap StringVar traces, which both invalidate the cache)."""
+        if self._recluster is None:
+            return None
+        if self._guided_merge is None:
+            cap, gap = self._get_guided_merge_params()
+            self._guided_merge = compute_guided_merge(
+                self._recluster, feat_cap_pct=cap, min_gap=gap)
+        return self._guided_merge
 
     def _get_user_groups(self) -> dict:
         """Return the user-defined behaviour groups, or {} if unavailable."""
@@ -7699,6 +8939,17 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             pass
         return None, None
 
+    def _get_root_dir(self):
+        """Return the selected run-folder root (pathlib.Path) or None.
+        Same get_root_fn callback convention as get_umap_fn — wired from
+        BSOiDApp's self._root_dir. Used to locate cluster_feature_centroids.npz."""
+        try:
+            if self._get_root_fn:
+                return self._get_root_fn()
+        except Exception:
+            pass
+        return None
+
     def _switch_plot(self, mode: str):
         animals  = self._apply_bio_filter(
             self._get_animals(group_by=self._group_by_key()))
@@ -7707,7 +8958,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         # Modes that require stats results
         stats_needed = mode in ("Top-N Bar", "Volcano", "Heatmap")
         # Modes that need full reclustering (no raw preview available)
-        full_recluster_needed = mode in ("Elbow/Silhouette", "Recombination")
+        full_recluster_needed = mode in ("Elbow/Silhouette", "Guided Merge", "Recombination")
         # Modes that can run on raw animal data OR reclustered data
         raw_ok_modes = ("Dist Matrix", "Transitions", "Cluster Stats")
 
@@ -7830,9 +9081,23 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                                             eg_colors_override=eg_colors or None,
                                             groups=user_groups or None)
                 self._show_figure(fig)
+            elif mode == "Cluster Hierarchy":
+                root = self._get_root_dir()
+                centroids, hier_cids, hier_approx, hier_link_m = (find_cluster_centroids(root)
+                                                     if root is not None else (None, None, False, "ward"))
+                self._show_figure(build_cluster_hierarchy_figure(
+                    centroids, hier_cids, linkage_method=hier_link_m, approximate=hier_approx))
             elif mode == "Elbow/Silhouette":
+                self._save_source_var.set("Manual (k-sweep)")
                 self._show_figure(build_reclustering_figure(self._recluster))
+            elif mode == "Guided Merge":
+                self._save_source_var.set("Guided Merge")
+                gm = self._get_guided_merge_result()
+                self._show_figure(build_guided_merge_figure(
+                    self._recluster, gm, animals, metric,
+                    eg_colors_override=eg_colors or None))
             elif mode == "Recombination":
+                self._save_source_var.set("Manual (k-sweep)")
                 raw = self._compare_k_var.get()
                 try:
                     k_list = [int(x.strip()) for x in raw.split(",")
@@ -7841,13 +9106,16 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                     k_list = [3, 5, 8]
                 if not k_list:
                     k_list = [3, 5]
-                max_avail = max(self._recluster["silhouette_scores"].keys(), default=2)
+                # True ceiling for fcluster(..., criterion="maxclust") is the
+                # cluster count, not the silhouette sweep's "Max k" setting.
+                max_avail = max(2, len(self._recluster["cluster_ids"]) - 1)
                 k_list    = [k for k in k_list if 2 <= k <= max_avail]
                 if not k_list:
                     k_list = [2]
                 self._show_figure(build_recombination_comparison_figure(
                     self._recluster, k_list, animals, metric,
-                    eg_colors_override=eg_colors or None))
+                    eg_colors_override=eg_colors or None,
+                    cap_pct=self._get_pose_cap_pct()))
             elif mode == "Dist Matrix":
                 self._show_figure(build_distance_matrix_figure(
                     recluster_data, groups=user_groups or None))
@@ -7907,15 +9175,38 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             messagebox.showwarning("k out of range",
                 f"k must be between 2 and {max_avail}.")
             return None
-        return extract_reclustered_groups(self._recluster, k)
+        return extract_reclustered_groups(self._recluster, k,
+                                           cap_pct=self._get_pose_cap_pct())
+
+    def _get_groups_for_save(self):
+        """Return (groups: dict | None, label: str) for whichever source is
+        selected in the "Save Reclustered Groups" panel — the manual k-sweep
+        (extract_reclustered_groups + pose cap) or Guided Merge's own
+        self-stopped partition. groups is None (with a messagebox already
+        shown) when the selected source isn't ready yet."""
+        source = self._save_source_var.get()
+        if source == "Guided Merge":
+            gm = self._get_guided_merge_result()
+            if gm is None:
+                messagebox.showwarning("No reclustering", "Run Reclustering first.")
+                return None, source
+            if not gm.get("available", False):
+                messagebox.showwarning("Guided Merge unavailable",
+                    gm.get("reason", "Pose-distance data unavailable for this run."))
+                return None, source
+            groups = {k: v for k, v in gm.items() if k.startswith("RG-")}
+            return groups, f"Guided Merge ({len(groups)} groups)"
+        else:
+            k = self._get_save_k()
+            groups = self._get_groups_for_k(k)
+            return groups, f"k={k}"
 
     def _save_groups_preset(self):
-        k = self._get_save_k()
-        groups = self._get_groups_for_k(k)
+        groups, label = self._get_groups_for_save()
         if groups is None:
             return
         path = filedialog.asksaveasfilename(
-            title=f"Save k={k} reclustered groups as preset",
+            title=f"Save {label} reclustered groups as preset",
             defaultextension=".json",
             filetypes=[("JSON preset", "*.json"), ("All files", "*")],
         )
@@ -7928,13 +9219,12 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         with open(path, "w") as fh:
             json.dump(data, fh, indent=2)
         messagebox.showinfo("Saved",
-            f"k={k} preset saved with {len(groups)} merged groups:\n{path}\n\n"
+            f"{label} preset saved with {len(groups)} merged groups:\n{path}\n\n"
             f"Load it in the Group Editor -> Load Preset to use in Combined Analysis.")
 
     def _push_groups_to_editor(self):
-        """Push the chosen k reclustered groups directly to the Group Editor."""
-        k = self._get_save_k()
-        groups = self._get_groups_for_k(k)
+        """Push the chosen source's reclustered groups directly to the Group Editor."""
+        groups, label = self._get_groups_for_save()
         if groups is None:
             return
         if self._load_groups_to_editor is None:
@@ -7943,10 +9233,10 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             return
         self._load_groups_to_editor(groups)
         self._status(
-            f"v k={k} groups pushed to Group Editor.\n"
+            f"v {label} groups pushed to Group Editor.\n"
             f"Switch to Combined Analysis and run it.", "#88cc88")
         messagebox.showinfo("Pushed to Editor",
-            f"{len(groups)} reclustered groups (k={k}) loaded into the Group Editor.\n\n"
+            f"{len(groups)} reclustered groups ({label}) loaded into the Group Editor.\n\n"
             f"They appear in the editor and the Combined Analysis tab will use them "
             f"when you click Run Combined Analysis.")
 
@@ -8182,13 +9472,21 @@ def build_umap_comparison_figure(embedding, labels, new_groups: dict,
         _style_ax(ax1, t)
 
         #   Right: recombined behaviour groups
+        n_new_groups = max(1, len(group_names))
+        max_show_leg = 6 if n_new_groups <= 6 else 3
         for gi, gname in enumerate(group_names):
             mask = new_label_arr == gi
             if not mask.any():
                 continue
             color = new_groups[gname].get("color", PALETTE[gi % len(PALETTE)])
+            cid_list = sorted(new_groups[gname].get("labels", []))
+            if len(cid_list) <= max_show_leg:
+                cid_txt = ",".join(f"C{c}" for c in cid_list)
+            else:
+                cid_txt = (",".join(f"C{c}" for c in cid_list[:max_show_leg])
+                           + f",+{len(cid_list) - max_show_leg}")
             ax2.scatter(x[mask], y[mask], c=[color], s=5,
-                        alpha=0.75, linewidths=0, label=gname)
+                        alpha=0.75, linewidths=0, label=f"{gname} ({cid_txt})")
         unassigned = new_label_arr == -1
         if unassigned.any():
             ax2.scatter(x[unassigned], y[unassigned], c="#555566", s=3,
@@ -8198,14 +9496,26 @@ def build_umap_comparison_figure(embedding, labels, new_groups: dict,
                       color=t["tick"], fontweight="bold", fontsize=12, pad=8)
         ax2.set_xlabel(f"UMAP-{_ax_i + 1}", color=t["tick"], fontsize=10)
         ax2.set_ylabel(f"UMAP-{_ax_j + 1}", color=t["tick"], fontsize=10)
-        ax2.legend(fontsize=8, loc="upper right", ncol=1,
-                   facecolor=t["ax_bg"], edgecolor=t["border"],
-                   labelcolor=t["tick"], markerscale=2)
+        # Long "gname (C..,C..,+N)" labels crowd a small in-axes legend once
+        # there are many recombined groups — shrink text and move the legend
+        # outside the plot area rather than letting it overlap the scatter.
+        if n_new_groups <= 6:
+            ax2.legend(fontsize=8, loc="upper right", ncol=1,
+                       facecolor=t["ax_bg"], edgecolor=t["border"],
+                       labelcolor=t["tick"], markerscale=2)
+        else:
+            ax2.legend(fontsize=6.5, loc="upper left",
+                       bbox_to_anchor=(1.01, 1.0), ncol=1,
+                       facecolor=t["ax_bg"], edgecolor=t["border"],
+                       labelcolor=t["tick"], markerscale=2, borderaxespad=0)
         _style_ax(ax2, t)
 
         fig.suptitle("UMAP — Before vs. After Recombination",
                      color=t["tick"], fontsize=14, fontweight="bold")
-        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        # Leave extra right-hand margin when the legend was pushed outside
+        # the axes (many recombined groups) so it isn't clipped.
+        right_margin = 0.82 if n_new_groups > 6 else 1.0
+        fig.tight_layout(rect=[0, 0, right_margin, 0.95])
     return fig
 
 
@@ -8949,7 +10259,7 @@ def build_umap_groups_figure(
     with plt.style.context(t["mpl_style"]):
         nrows = 3 if _has_dim3 else 2
         fig, axes = plt.subplots(
-            nrows, 2, figsize=(16, 6.5 * nrows), facecolor=t["fig_bg"])
+            nrows, 2, figsize=(16, 5.0 * nrows), facecolor=t["fig_bg"])
         # Force full opacity so the margins around each panel can't be
         # saved as transparent (which most viewers then render as black,
         # regardless of the light/dark theme actually in use).
@@ -12280,11 +13590,19 @@ class GroupPredictorPanel(ctk.CTkFrame):
 
     @staticmethod
     def _style_axes(ax):
-        """Apply theme colours to a matplotlib Axes in one call."""
+        """Apply theme colours to a matplotlib Axes in one call.
+
+        Mirrors the module-level ``_style_ax`` helper (also recolours the
+        axis labels/title) so callers don't need to separately pass
+        ``color=T()[...]`` to every ``set_xlabel``/``set_ylabel``/``set_title``.
+        """
         ax.set_facecolor(T()["ax_bg"])
         ax.tick_params(colors=T()["tick"])
         for spine in ax.spines.values():
             spine.set_edgecolor(T()["spine"])
+        ax.xaxis.label.set_color(T()["tick"])
+        ax.yaxis.label.set_color(T()["tick"])
+        ax.title.set_color(T()["tick"])
 
     def save_all_figures(self, out_dir: "pathlib.Path", ts: str) -> int:
         """Save overview + detail figures for ALL models. Returns count saved."""
@@ -14710,11 +16028,16 @@ class GroupPredictorPanel(ctk.CTkFrame):
                                            va="center", ha="left", fontsize=7.5,
                                            color=T()["text"], fontweight="bold",
                                            zorder=5)
-                            # Rank badge inside bar
-                            ax_sorted.text(0.005, _yp, f"#{_ri + 1}",
-                                           va="center", ha="left", fontsize=7,
-                                           color="white", fontweight="bold",
-                                           zorder=6)
+                            # Rank badge inside bar — stroked so it stays legible
+                            # regardless of bar alpha/theme (fading bars can wash
+                            # out a plain white glyph against a light background).
+                            ax_sorted.text(
+                                0.005, _yp, f"#{_ri + 1}",
+                                va="center", ha="left", fontsize=7,
+                                color="white", fontweight="bold", zorder=6,
+                                path_effects=[
+                                    _pe.withStroke(linewidth=1.6, foreground="black")
+                                ])
                         ax_sorted.axvline(chance_level, color=T()["subtext"],
                                           linestyle="--", linewidth=1.2,
                                           label=f"Chance ({chance_level:.0%})",
@@ -16314,6 +17637,14 @@ class BSOiDApp(ctk.CTk):
 
         ctk.set_appearance_mode("dark")
         self._build_ui()
+        # Guard against widgets (notably CTkLabels inside CTkScrollableFrames,
+        # e.g. the Unbiased Analytics control panel) whose first _draw() call
+        # resolved colors before the app's real layout/geometry settled --
+        # see _force_repaint_ctk_tree's docstring. _toggle_theme (called
+        # right after construction by cube.py's Step 5 launcher) does this
+        # too, but this covers a standalone cube_analyser.py launch that
+        # never calls _toggle_theme at all.
+        self.after(50, lambda: _force_repaint_ctk_tree(self))
 
     #   UI construction  
 
@@ -16467,6 +17798,7 @@ class BSOiDApp(ctk.CTk):
                 getattr(self, "_umap_embedding", None),
                 getattr(self, "_umap_labels",    None),
             ),
+            get_root_fn=lambda: getattr(self, "_root_dir", None),
         )
         self._unbiased_panel.grid(row=0, column=0, sticky="nsew")
 
@@ -16760,6 +18092,7 @@ class BSOiDApp(ctk.CTk):
         if csv_ok:
             # Auto-populate Combined Analysis animal panel with all found files
             self._animal_panel.clear_all()
+            self._animal_panel.set_label_store_folder(self._root_dir)
             self._animal_panel.add_files_from_paths(files)
             n = self._animal_panel.animal_count()
             if n:
@@ -17401,17 +18734,74 @@ class BSOiDApp(ctk.CTk):
 
     def _toggle_theme(self, value: str):
         global _THEME_KEY
+        old_theme = dict(T())
         _THEME_KEY = value.lower()
-        ctk.set_appearance_mode(T()["ctk_mode"])
+        new_theme = T()
+        ctk.set_appearance_mode(new_theme["ctk_mode"])
+
+        # Keep the Dark/Light segmented button's own displayed selection in
+        # sync with the theme actually being applied. Callers other than the
+        # button itself invoke this directly (e.g. cube.py's Step 5 launcher
+        # calls app._toggle_theme(session_plot_theme) right after
+        # construction) -- without this, the button can show "Dark" while
+        # the app is actually rendered in light mode (or vice versa), since
+        # CTkSegmentedButton only updates its own variable when clicked by
+        # the user, not when its command is invoked programmatically.
         try:
-            plt.style.use(T()["mpl_style"])
+            self._theme_var.set(value.capitalize())
         except Exception:
             pass
-        self._status("Theme switched.", T()["subtext"])
+        try:
+            plt.style.use(new_theme["mpl_style"])
+        except Exception:
+            pass
+
+        # Re-colour every already-built widget (sidebar, tab bar, control
+        # panels inside Unbiased Analytics / Behavioral Explorer / Group
+        # Predictor, ...) in place, without rebuilding anything and losing
+        # user selections.
+        _rethread_widget_colors(self, old_theme, new_theme)
+        if self._editor is not None and self._editor.winfo_exists():
+            _rethread_widget_colors(self._editor, old_theme, new_theme)
+
+        # Catch anything _rethread_widget_colors couldn't (CTkLabel's own
+        # default-themed fg_color, widgets that were unmapped at their first
+        # draw) — see _force_repaint_ctk_tree's docstring. Deferred so it
+        # runs after this toggle's own layout/geometry settles.
+        self.after(50, lambda: _force_repaint_ctk_tree(self))
+        if self._editor is not None and self._editor.winfo_exists():
+            self.after(50, lambda: _force_repaint_ctk_tree(self._editor))
+
+        self._status("Theme switched.", new_theme["subtext"])
         self._build_combined_tab()
         if self._metrics and self._df is not None:
             self._analyse()
         self._refresh_preview()
+
+        # Already-rendered figures are static images baked with the old
+        # theme's colors — redraw whichever ones are currently on screen
+        # from cached results so transition/heatmap plots etc. pick up the
+        # new theme immediately instead of staying stuck until re-run.
+        try:
+            if getattr(self._unbiased_panel, "_current_figure", None) is not None:
+                self._unbiased_panel._switch_plot(self._unbiased_panel._plot_mode.get())
+        except Exception:
+            pass
+        try:
+            if getattr(self._explorer_panel, "_current_figs", None):
+                self._explorer_panel._generate()
+        except Exception:
+            pass
+        try:
+            if getattr(self._predictor_panel, "_results", None):
+                self._predictor_panel._draw_overview(self._predictor_panel._last_chance)
+                self._predictor_panel._draw_null_comparison()
+                sel = self._predictor_panel._selected_model
+                if sel < len(self._predictor_panel._results):
+                    self._predictor_panel._draw_detail(
+                        self._predictor_panel._results[sel])
+        except Exception:
+            pass
 
     #   helpers  
 

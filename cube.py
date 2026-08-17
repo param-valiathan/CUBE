@@ -218,26 +218,33 @@ C = dict(
 # Button-specific colour slots (allow light mode to make flat buttons visible)
 C["btn"]    = C["card2"]   # button background
 C["btn_fg"] = C["subtext"] # text on secondary/muted buttons
-C["cube_title"] = C["accent"]  # CUBE header text — overridden to teal in light mode
+C["cube_title"] = "#4fc3f7"  # CUBE header text — blue, distinct from "accent" (overridden to teal in light mode)
+
+# Single source of truth for the keys that differ between dark/light — used
+# both at startup (parsing theme.txt) and by the live theme toggle, so the
+# two paths can never drift apart. Keys not listed here (accent, green, cyan,
+# yellow's dark-mode source value, orange, purple, red, dim, ...) stay fixed
+# across themes.
+_THEME_DARK = dict(
+    bg="#09090f", panel="#111120", card="#16162a", card2="#1e1e35",
+    border="#2a2a4a", text="#eaeaea", subtext="#7788aa",
+    log_bg="#07070d", log_fg="#00ff88",
+    btn="#1e1e35", btn_fg="#7788aa", yellow="#ffd60a", cube_title="#4fc3f7",
+)
+_THEME_LIGHT = dict(
+    bg="#f0f2f5", panel="#ffffff", card="#ffffff", card2="#e9ecef",
+    border="#dee2e6", text="#222222", subtext="#666666",
+    log_bg="#ffffff", log_fg="#333333",
+    # Flat buttons need a visible bg; dark amber replaces the bright yellow
+    # that is invisible on light backgrounds; teal-blue replaces red for the
+    # CUBE header text.
+    btn="#c5ccd6", btn_fg="#1c1c30", yellow="#7a4e00", cube_title="#0077a8",
+)
 
 try:
     with open(HERE / "theme.txt", "r", encoding="utf-8") as _f:
         if _f.read().strip() == "light":
-            C["bg"] = "#f0f2f5"
-            C["panel"] = "#ffffff"
-            C["card"] = "#ffffff"  # pure white — clear contrast against #f0f2f5 bg
-            C["card2"] = "#e9ecef"
-            C["border"] = "#dee2e6"
-            C["text"] = "#222222"
-            C["subtext"] = "#666666"
-            C["log_bg"] = "#ffffff"
-            C["log_fg"] = "#333333"
-            # Light-mode button overrides: flat buttons need a visible bg;
-            # dark amber replaces the bright yellow that is invisible on light backgrounds.
-            C["btn"]    = "#c5ccd6"  # soft blue-gray — visible but not heavy
-            C["btn_fg"] = "#1c1c30"  # near-black — readable on soft blue-gray
-            C["yellow"] = "#7a4e00"  # dark amber — replaces #ffd60a in light mode
-            C["cube_title"] = "#0077a8"  # teal-blue for CUBE header text (not red)
+            C.update(_THEME_LIGHT)
 except Exception:
     pass
 
@@ -245,29 +252,96 @@ except Exception:
 # read it without re-parsing theme.txt.
 _DARK_THEME: bool = C["bg"] == "#09090f"
 
-# Per-step colours — bg switches between dark/light tints
+# Per-step card background — switches between dark/light tints. Kept as an
+# explicit dark/light pair (rather than resolved once via a lambda) so a live
+# theme toggle can look up "the other" value for each step later.
+_STEP_BG_DARK = {
+    "dlc": "#1a3a1a", "dlc_3d": "#102030", "bsoid_prep": "#1a1a3a",
+    "bsoid_run": "#2a1a4a", "annotate": "#4a2a1a", "analyse": "#1a1a4a",
+}
+_STEP_BG_LIGHT = {
+    "dlc": "#edf7ed", "dlc_3d": "#e8f4fd", "bsoid_prep": "#e0f7fa",
+    "bsoid_run": "#f3e5f5", "annotate": "#fff3e0", "analyse": "#fce4ec",
+}
 _sbg = lambda dark, light: dark if _DARK_THEME else light
 STEP_META = [
     dict(num=1, key="dlc",        icon=" ", title="DLC Inference",
          subtitle="DeepLabCut SuperAnimal on raw videos",
-         bg=_sbg("#1a3a1a", "#edf7ed"), accent="#4caf50"),
+         bg=_sbg(_STEP_BG_DARK["dlc"], _STEP_BG_LIGHT["dlc"]), accent="#4caf50"),
     dict(num=2, key="dlc_3d",     icon="⬡", title="3D DLC + Anipose",
-         subtitle="Per-camera Zoo adapt · triangulate · fuse 4 cams",
-         note="Only for 3D multi-camera recordings",
-         bg=_sbg("#102030", "#e8f4fd"), accent="#4fc3f7"),
+         subtitle="Per-camera tracking · triangulate · fuse cams",
+         note="Multi-camera recordings only",
+         bg=_sbg(_STEP_BG_DARK["dlc_3d"], _STEP_BG_LIGHT["dlc_3d"]), accent="#4fc3f7"),
     dict(num=3, key="bsoid_prep", icon="", title="CUBE Pre-processing",
          subtitle="Filter bodyparts · export H5/CSV",
-         bg=_sbg("#1a1a3a", "#e0f7fa"), accent="#00b4d8"),
+         bg=_sbg(_STEP_BG_DARK["bsoid_prep"], _STEP_BG_LIGHT["bsoid_prep"]), accent="#00b4d8"),
     dict(num=4, key="bsoid_run",  icon=" ",  title="CUBE Clustering",
          subtitle="V2 features · UMAP · HDBSCAN · MLP",
-         bg=_sbg("#2a1a4a", "#f3e5f5"), accent="#9c27b0"),
+         bg=_sbg(_STEP_BG_DARK["bsoid_run"], _STEP_BG_LIGHT["bsoid_run"]), accent="#9c27b0"),
     dict(num=5, key="annotate",   icon=" ", title="Video Annotation",
          subtitle="Label clusters via example clips",
-         bg=_sbg("#4a2a1a", "#fff3e0"), accent="#ff9800"),
+         bg=_sbg(_STEP_BG_DARK["annotate"], _STEP_BG_LIGHT["annotate"]), accent="#ff9800"),
     dict(num=6, key="analyse",    icon=" ", title="Behaviour Analysis",
          subtitle="Metrics, ethograms, statistics",
-         bg=_sbg("#1a1a4a", "#fce4ec"), accent="#e94560"),
+         bg=_sbg(_STEP_BG_DARK["analyse"], _STEP_BG_LIGHT["analyse"]), accent="#e94560"),
 ]
+
+
+# Widget color options that may hold a literal C[...] (or step-card bg)
+# value baked in at construction time.
+_THEMED_WIDGET_OPTIONS = (
+    "bg", "fg", "background", "foreground",
+    "activebackground", "activeforeground",
+    "highlightbackground", "highlightcolor",
+    "insertbackground", "selectbackground", "selectforeground",
+    "troughcolor", "disabledforeground",
+)
+
+
+def _flat_theme_dict(dark: bool) -> dict:
+    """Flatten the current C-dict state + per-step card backgrounds into one
+    dict of synthetic keys -> colour values, for before/after comparison when
+    live-toggling the theme (see _rethread_widget_colors)."""
+    flat = dict(C)
+    for key in _STEP_BG_DARK:
+        flat[f"__stepbg_{key}"] = _STEP_BG_DARK[key] if dark else _STEP_BG_LIGHT[key]
+    return flat
+
+
+def _rethread_widget_colors(widget, old_theme: dict, new_theme: dict):
+    """Recursively re-theme an already-built widget subtree in place.
+
+    Most widgets in this app are constructed once with a literal color
+    pulled from the global ``C`` dict at build time (e.g. ``bg=C["card"]``);
+    flipping ``C`` afterwards does nothing for them since the string was
+    already resolved. This walks the widget tree (including any open
+    Toplevel settings windows, which appear as descendants via
+    winfo_children()) and, for any color option whose current value exactly
+    matches a value from *old_theme*, swaps in the corresponding value from
+    *new_theme* — restyling in place without rebuilding anything.
+    """
+    for opt in _THEMED_WIDGET_OPTIONS:
+        try:
+            cur = widget.cget(opt)
+        except Exception:
+            continue
+        if not isinstance(cur, str) or not cur:
+            continue
+        for key, old_val in old_theme.items():
+            if cur == old_val:
+                new_val = new_theme.get(key)
+                if new_val is not None and new_val != cur:
+                    try:
+                        widget.configure(**{opt: new_val})
+                    except Exception:
+                        pass
+                break
+    try:
+        children = widget.winfo_children()
+    except Exception:
+        children = []
+    for child in children:
+        _rethread_widget_colors(child, old_theme, new_theme)
 
 # DLC settings
 RESOLUTION_PRESETS = {
@@ -478,6 +552,18 @@ class LogPanel(tk.Frame):
         if self._logger and self._logger.log_path.is_file():
             _open_path(self._logger.log_path)
 
+    def refresh_theme(self):
+        """Called after a live theme toggle. _COLOURS is a class-level dict
+        resolved once at import time, and tk.Text tag colours aren't plain
+        widget options, so neither is touched by the generic bg/fg walk —
+        both need an explicit re-apply here."""
+        colours = dict(self._COLOURS)
+        colours.update(INFO=C["text"], WARN=C["yellow"],
+                       ERROR=C["red"], SUCCESS=C["green"], DEBUG=C["dim"])
+        for tag, colour in colours.items():
+            self._txt.tag_config(tag, foreground=colour)
+        self._txt.tag_config("TS", foreground=C["dim"])
+
 
 #  
 #  PROGRESS BAR  (dual: overall + per-step)
@@ -487,18 +573,21 @@ class DualProgressBar(tk.Frame):
     def __init__(self, parent, **kw):
         super().__init__(parent, bg=C["panel"], **kw)
         style = ttk.Style()
-        style.configure("Overall.Horizontal.TProgressbar",
-                        troughcolor=C["card"], background=C["cyan"],
-                        thickness=10)
         style.configure("Step.Horizontal.TProgressbar",
                         troughcolor=C["card"], background=C["green"],
                         thickness=8)
-        tk.Label(self, text="Overall", font=("Segoe UI", 8),
+        tk.Label(self, text="Steps", font=("Segoe UI", 8),
                  bg=C["panel"], fg=C["subtext"]).pack(anchor="w", padx=8)
-        self._overall = ttk.Progressbar(
-            self, style="Overall.Horizontal.TProgressbar",
-            mode="determinate", maximum=len(STEP_META))
-        self._overall.pack(fill="x", padx=8, pady=(0, 4))
+        chips_row = tk.Frame(self, bg=C["panel"])
+        chips_row.pack(fill="x", padx=8, pady=(0, 4))
+        self._chips: dict[str, tk.Label] = {}
+        for meta in STEP_META:
+            chip = tk.Label(chips_row, text=f"{meta['num']} {meta['icon']}",
+                             font=("Segoe UI", 8, "bold"),
+                             bg=C["card"], fg=C["subtext"],
+                             padx=6, pady=2)
+            chip.pack(side="left", padx=(0, 3))
+            self._chips[meta["key"]] = chip
         self._step_lbl = tk.Label(self, text="Step:  ",
                                   font=("Segoe UI", 8),
                                   bg=C["panel"], fg=C["subtext"])
@@ -513,8 +602,21 @@ class DualProgressBar(tk.Frame):
         self._eta_lbl.pack(anchor="e", padx=8, pady=(0, 4))
         self._t0 = 0.0
 
-    def set_overall(self, done: int):
-        self._overall["value"] = done
+    def set_step_status(self, key: str, status: str):
+        """Recolour a single step's chip to reflect its own status —
+        independent of any other step, since the pipeline can be entered
+        at any step (existing DLC output, resuming mid-way, etc.)."""
+        chip = self._chips.get(key)
+        if chip is None:
+            return
+        colour, _ = _BADGE_STATES.get(status, _BADGE_STATES["idle"])
+        fg = "white" if status in ("running", "done", "error") else C["subtext"]
+        chip.configure(bg=colour, fg=fg)
+
+    def sync_step_statuses(self, statuses: dict):
+        """Bulk-refresh every chip, e.g. after loading a saved session."""
+        for key, status in statuses.items():
+            self.set_step_status(key, status)
 
     def step_start(self, label: str, maximum: int = 100):
         self._step["mode"]    = "determinate"
@@ -594,16 +696,16 @@ class StepCard(tk.Frame):
                  font=("Segoe UI", 8),
                  bg=bg, fg=C["subtext"],
                  wraplength=195, justify="left").pack(
-            anchor="w", padx=10, pady=(0, 2))
+            anchor="w", padx=10, pady=(0, 6))
 
         if meta.get("note"):
             tk.Label(self, text=f"⚠  {meta['note']}",
                      font=("Segoe UI", 7, "italic"),
                      bg=bg, fg=meta["accent"],
                      wraplength=195, justify="left").pack(
-                anchor="w", padx=10, pady=(0, 6))
+                anchor="w", padx=10, pady=(0, 8))
         else:
-            tk.Frame(self, bg=bg, height=6).pack()
+            tk.Frame(self, bg=bg, height=8).pack()
 
         self._btn = tk.Button(
             self, text=f"   Step {meta['num']}",
@@ -623,6 +725,14 @@ class StepCard(tk.Frame):
 
     def disable(self):
         self._btn.configure(state="disabled")
+
+    def refresh_theme(self, new_bg: str):
+        """Called after a live theme toggle. The generic widget-color walk
+        (_rethread_widget_colors) already recolours every child widget by
+        matching against the old/new step-bg pair; this just keeps the
+        cached attribute in sync for any future construction that reads it.
+        """
+        self._bg = new_bg
 
 
 #  
@@ -5223,11 +5333,11 @@ class PipelineApp(tk.Tk):
         tk.Label(hdr, text="  CUBE",
                  font=("Segoe UI", 18, "bold"),
                  bg=C["log_bg"], fg=C["cube_title"]).pack(
-            side="left", padx=(16, 0), pady=(6, 8), anchor="s")
-        tk.Label(hdr, text="  Comprehensive Unsupervised Behavioral Explorer",
+            side="left", padx=(16, 4), pady=8, anchor="s")
+        tk.Label(hdr, text="Comprehensive Unsupervised Behavioral Explorer",
                  font=("Segoe UI", 13),
                  bg=C["log_bg"], fg=C["text"]).pack(
-            side="left", pady=(0, 8), anchor="s")
+            side="left", pady=8, anchor="s")
 
         right = tk.Frame(hdr, bg=C["log_bg"])
         right.pack(side="right", padx=12)
@@ -5585,6 +5695,7 @@ class PipelineApp(tk.Tk):
         self._session["video_folders"] = self._folder_list.get_folders()
         self._save_session_auto()
         self._cards[key].set_status("running")
+        self._pb.set_step_status(key, "running")
         self._status(f"Running step: {key} ")
         self._start_step_timer()
         step_idx = {"dlc":0, "dlc_3d":1, "bsoid_prep":2,
@@ -5596,9 +5707,7 @@ class PipelineApp(tk.Tk):
                 fn(*args)
                 self._session.set_status(key, "done")
                 self._session.save()
-                n_done = sum(1 for s in STEP_META
-                             if self._session.is_done(s["key"]))
-                self._after(lambda: self._pb.set_overall(n_done))
+                self._after(lambda: self._pb.set_step_status(key, "done"))
                 self._after(lambda: self._cards[key].set_status("done"))
                 self._after(lambda: self._status(f"Step '{key}' complete v"))
                 self._after(lambda: self._pb.step_done())
@@ -5621,6 +5730,7 @@ class PipelineApp(tk.Tk):
                 self._session.set_status(key, "error")
                 self._session.save()
                 self._logger.error(f"Step '{key}' failed:\n{tb}")
+                self._after(lambda: self._pb.set_step_status(key, "error"))
                 self._after(lambda: self._cards[key].set_status("error"))
                 self._after(lambda: self._status(f"Step '{key}' FAILED  -"))
                 self._after(lambda: self._pb.step_done())
@@ -5786,6 +5896,7 @@ class PipelineApp(tk.Tk):
         self._running = True
 
         self._cards["annotate"].set_status("running")
+        self._pb.set_step_status("annotate", "running")
         self._status("Step 4: Video Annotation — window opening")
         self._logger.step("Launching Video Explorer ")
 
@@ -5858,12 +5969,14 @@ class PipelineApp(tk.Tk):
                 self._running = False
                 self._session.set_status("annotate", "done")
                 self._session.save()
+                self._after(lambda: self._pb.set_step_status("annotate", "done"))
                 self._after(lambda: self._cards["annotate"].set_status("done"))
                 self._after(lambda: self._status("Step 4 complete v"))
             except Exception:
                 self._running = False
                 tb = traceback.format_exc()
                 self._logger.error(f"Step 4 error:\n{tb}")
+                self._after(lambda: self._pb.set_step_status("annotate", "error"))
                 self._after(lambda: self._cards["annotate"].set_status("error"))
                 self._after(lambda: messagebox.showerror("Step 4 Error", tb[:800]))
 
@@ -5920,6 +6033,7 @@ class PipelineApp(tk.Tk):
         _stem_to_group = dict(self._session.get("stem_to_group", {}))
 
         self._cards["analyse"].set_status("running")
+        self._pb.set_step_status("analyse", "running")
         self._status("Step 5: Analysis — window opening")
         self._logger.step("Launching CUBE Analyser")
 
@@ -6097,17 +6211,20 @@ class PipelineApp(tk.Tk):
                         default="no"):
                     self._session.set_status("analyse", "idle")
                     self._session.save()
+                    self._after(lambda: self._pb.set_step_status("analyse", "idle"))
                     self._after(lambda: self._cards["analyse"].set_status("idle"))
                     self._after(lambda: self._status("Step 5 ready — click to start another analysis."))
                 else:
                     self._session.set_status("analyse", "done")
                     self._session.save()
+                    self._after(lambda: self._pb.set_step_status("analyse", "done"))
                     self._after(lambda: self._cards["analyse"].set_status("done"))
                     self._after(lambda: self._status("Step 5 complete v"))
             except Exception:
                 self._running = False
                 tb = traceback.format_exc()
                 self._logger.error(f"Step 5 error:\n{tb}")
+                self._after(lambda: self._pb.set_step_status("analyse", "error"))
                 self._after(lambda: self._cards["analyse"].set_status("error"))
                 self._after(lambda: messagebox.showerror("Step 5 Error", tb[:800]))
 
@@ -6324,34 +6441,44 @@ class PipelineApp(tk.Tk):
 
 
     def _toggle_theme(self):
-        global C
-        if C["bg"] == "#09090f":
-            # Dark to Light
-            C["bg"] = "#f0f2f5"
-            C["panel"] = "#ffffff"
-            C["card"] = "#f8f9fa"
-            C["card2"] = "#e9ecef"
-            C["border"] = "#dee2e6"
-            C["text"] = "#222222"
-            C["subtext"] = "#666666"
-            C["log_bg"] = "#ffffff"
-            C["log_fg"] = "#333333"
-            with open(HERE / "theme.txt", "w", encoding="utf-8") as f: f.write("light")
-        else:
-            # Light to Dark
-            C["bg"] = "#09090f"
-            C["panel"] = "#111120"
-            C["card"] = "#16162a"
-            C["card2"] = "#1e1e35"
-            C["border"] = "#2a2a4a"
-            C["text"] = "#eaeaea"
-            C["subtext"] = "#7788aa"
-            C["log_bg"] = "#07070d"
-            C["log_fg"] = "#00ff88"
-            with open(HERE / "theme.txt", "w", encoding="utf-8") as f: f.write("dark")
-        messagebox.showinfo("Theme",
-                            "Theme updated. Please restart CUBE for the "
-                            "changes to take effect.")
+        global C, _DARK_THEME
+        old_flat = _flat_theme_dict(_DARK_THEME)
+
+        going_light = _DARK_THEME  # currently dark -> switching to light
+        C.update(_THEME_LIGHT if going_light else _THEME_DARK)
+        _DARK_THEME = not going_light
+        try:
+            with open(HERE / "theme.txt", "w", encoding="utf-8") as f:
+                f.write("light" if going_light else "dark")
+        except Exception:
+            pass
+
+        new_flat = _flat_theme_dict(_DARK_THEME)
+
+        # Re-colour every already-built widget in place (main window, step
+        # cards, settings panel, log console, and any currently-open
+        # Toplevel settings window — all reachable via winfo_children()).
+        _rethread_widget_colors(self, old_flat, new_flat)
+
+        # ttk widgets use named styles rather than per-instance colour
+        # options, so the progress bars need a separate style refresh.
+        style = ttk.Style()
+        style.configure("Overall.Horizontal.TProgressbar",
+                        troughcolor=C["card"], background=C["cyan"])
+        style.configure("Step.Horizontal.TProgressbar",
+                        troughcolor=C["card"], background=C["green"])
+
+        # StepCard.bg / accent live outside the widget-option walk above
+        # (they're plain instance attributes used e.g. by set_status), and
+        # the Log panel's tag colours are baked into a class-level dict at
+        # import time — both need an explicit refresh.
+        for key, card in getattr(self, "_cards", {}).items():
+            card.refresh_theme(_STEP_BG_DARK[key] if _DARK_THEME else _STEP_BG_LIGHT[key])
+        if hasattr(self, "_log_panel"):
+            self._log_panel.refresh_theme()
+
+        if getattr(self, "_logger", None):
+            self._logger.info(f"Theme switched to {'dark' if _DARK_THEME else 'light'}.")
         
     def _save_session(self):
 
@@ -6417,8 +6544,7 @@ class PipelineApp(tk.Tk):
         for meta in STEP_META:
             st = self._session["step_status"].get(meta["key"], "idle")
             self._cards[meta["key"]].set_status(st)
-        n = sum(1 for m in STEP_META if self._session.is_done(m["key"]))
-        self._pb.set_overall(n)
+            self._pb.set_step_status(meta["key"], st)
         self._logger.success(f"Session loaded: {p}")
         self._status("Session loaded — completed steps shown as ✓.")
 
