@@ -118,6 +118,9 @@ find_dlc_files = peek_dlc_bodyparts = group_bodyparts_by_region = None
 # read directly from these rather than duplicating the vocabulary here.
 resolve_env_shapes = None
 ENV_PARADIGMS = ENV_PARADIGM_ROLE_VOCAB = ENV_PARADIGM_MIN_ROLES = None
+# Used by EnvParadigmWindow's auto-threshold preview (same functions
+# compute_session_env_context itself uses for the real auto-derivation).
+load_dlc_file = _find_spine_indices = _spine_norm_factor = None
 
 #  " "   optional companion scripts  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
 HERE = Path(__file__).resolve().parent
@@ -3615,12 +3618,6 @@ class AdvancedCUBEWindow(tk.Toplevel):
         hdbscan_split_max_subclusters = 3,
         hdbscan_split_min_points     = 250,
         recluster_max_iterations     = 2,
-        # Environmental context & object interaction (v6 part 2). env_arena_cfg
-        # and env_interaction_threshold are NOT simple scalar widgets (a
-        # nested dict and an optional-float respectively) so they bypass the
-        # generic self._vars loop entirely, same as bodypart_weights above —
-        # see self._env_arena_cfg / _open_env_context / _apply below.
-        env_features_enabled  = False,
     )
     try:
         # Engine defaults win for every shared key; GUI-only keys persist.
@@ -3818,44 +3815,13 @@ class AdvancedCUBEWindow(tk.Toplevel):
                   command=self._open_bodypart_weights).pack(anchor="w", padx=8, pady=(4, 0))
         self._bpw_status.pack(anchor="w", padx=8, pady=(0, 4))
 
-        # ── Environmental context & object interaction (v6 part 2) ─────────────
-        s_env = _adv_section(p, "ENVIRONMENTAL CONTEXT  (opt-in)", C["cyan"])
-        _env_row = tk.Frame(s_env, bg=C["card"])
-        _env_row.pack(anchor="w", padx=8, pady=(2, 0), fill="x")
-        _env_v = self._v("env_features_enabled",
-                          tk.BooleanVar(value=bool(self.DEFAULTS.get(
-                              "env_features_enabled", False))))
-        tk.Checkbutton(_env_row, text="Enable environmental context features",
-                        variable=_env_v, bg=C["card"], fg=C["green"],
-                        selectcolor=C["card2"], activebackground=C["card"],
-                        command=self._refresh_env_status).pack(side="left")
-        tk.Label(s_env,
-                 text="    Trace an arena boundary / regions / objects and pick a behavioral\n"
-                      "    paradigm; adds region/object time, entries, and paradigm-specific\n"
-                      "    indices (alternation %, discrimination index, etc). Off by default --\n"
-                      "    with the checkbox unticked, nothing about this feature runs or is\n"
-                      "    written, and output is byte-identical to a pre-this-feature run.",
-                 font=("Segoe UI", 7), bg=C["card"],
-                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
-        _thr_row = tk.Frame(s_env, bg=C["card"])
-        _thr_row.pack(anchor="w", padx=8, pady=(2, 0))
-        tk.Label(_thr_row, text="Interaction threshold (px, blank = auto):",
-                 font=("Segoe UI", 8), bg=C["card"], fg=C["text"]).pack(side="left")
-        self._env_thresh_var = tk.StringVar(value="")
-        tk.Entry(_thr_row, textvariable=self._env_thresh_var, width=8,
-                 bg=C["card2"], fg=C["text"],
-                 font=("Segoe UI", 9)).pack(side="left", padx=(6, 0))
-        self._env_status = tk.Label(s_env, text="Arena: not configured",
-                                     font=("Segoe UI", 7, "italic"),
-                                     bg=C["card"], fg=C["dim"])
-        self._env_btn = tk.Button(
-            s_env, text="Environmental Context...",
-            font=("Segoe UI", 9), bg=C["btn"], fg=C["yellow"],
-            relief="flat", padx=10, pady=4, cursor="hand2",
-            command=self._open_env_context)
-        self._env_btn.pack(anchor="w", padx=8, pady=(6, 0))
-        self._env_status.pack(anchor="w", padx=8, pady=(0, 4))
-        self._env_arena_cfg: "dict | None" = None
+        # Environmental context / object interaction / behavioral paradigms
+        # now live in their own standalone EnvParadigmWindow (main window's
+        # "Environments, Objects, Paradigms..." button), not here -- this
+        # window no longer reads or writes env_features_enabled,
+        # kinematic_directedness_enabled, env_arena_cfg, or
+        # env_interaction_threshold, so there is only one place that can
+        # change them.
 
         # ── UMAP ─────────────────────────────────────────────────────────────
         s2 = _adv_section(p, "UMAP EMBEDDING  (Hsu & Yttri 2021 reference)", C["cyan"])
@@ -4139,44 +4105,6 @@ class AdvancedCUBEWindow(tk.Toplevel):
                     pass
         self._bodypart_weights = dict(cfg.get("bodypart_weights") or {})
         self._refresh_bpw_status()
-        self._env_arena_cfg = cfg.get("env_arena_cfg") or None
-        _thr = cfg.get("env_interaction_threshold")
-        self._env_thresh_var.set("" if _thr is None else str(_thr))
-        self._refresh_env_status()
-
-    def _refresh_env_status(self):
-        if not hasattr(self, "_env_status"):
-            return
-        enabled = bool(self._vars.get(
-            "env_features_enabled",
-            tk.BooleanVar(value=False)).get()) if "env_features_enabled" in self._vars else False
-        self._env_btn.configure(state=("normal" if enabled else "disabled"))
-        if not enabled:
-            self._env_status.configure(text="Arena: not configured (enable the checkbox above)")
-            return
-        cfg = self._env_arena_cfg or {}
-        n_reg = len((cfg.get("reference_shapes") or {}).get("regions") or [])
-        n_obj = len((cfg.get("reference_shapes") or {}).get("objects") or [])
-        has_bound = bool((cfg.get("reference_shapes") or {}).get("boundary"))
-        if not cfg or (n_reg == 0 and n_obj == 0 and not has_bound):
-            self._env_status.configure(text="Arena: not configured yet")
-        else:
-            self._env_status.configure(
-                text=f"Arena: {cfg.get('paradigm', 'custom')} paradigm, "
-                     f"{n_reg} region(s), {n_obj} object(s)"
-                     f"{' + boundary' if has_bound else ''}")
-
-    def _open_env_context(self):
-        try:
-            win = EnvContextWindow(self, self._session, self._env_arena_cfg)
-            self.wait_window(win)
-            result = getattr(win, "result", None)
-            if result is not None:      # None = Cancel; keep previous config
-                self._env_arena_cfg = result
-            self._refresh_env_status()
-        except Exception as e:
-            messagebox.showerror("Environmental Context",
-                                  f"Could not open the environmental context editor:\n{e}")
 
     def _refresh_bpw_status(self):
         if not hasattr(self, "_bpw_status"):
@@ -4241,16 +4169,15 @@ class AdvancedCUBEWindow(tk.Toplevel):
             if default is None or val != default:
                 cfg[k] = val
         cfg["bodypart_weights"] = getattr(self, "_bodypart_weights", {}) or {}
-        _env_cfg = getattr(self, "_env_arena_cfg", None)
-        if _env_cfg:
-            cfg["env_arena_cfg"] = _env_cfg
-        _thr_raw = (getattr(self, "_env_thresh_var", None).get()
-                    if hasattr(self, "_env_thresh_var") else "").strip()
-        if _thr_raw:
-            try:
-                cfg["env_interaction_threshold"] = float(_thr_raw)
-            except ValueError:
-                pass
+        # This window rebuilds engine_cfg from scratch above, but the four
+        # environments/objects/paradigms keys are now owned exclusively by
+        # EnvParadigmWindow (not by self._vars) -- carry over whatever it
+        # last wrote so Apply here doesn't silently erase that config.
+        _prior = self._session.get("engine_cfg", {}) or {}
+        for _k in ("env_features_enabled", "kinematic_directedness_enabled",
+                   "env_arena_cfg", "env_interaction_threshold"):
+            if _k in _prior:
+                cfg[_k] = _prior[_k]
         self._session["engine_cfg"] = cfg
         self.destroy()
 
@@ -4297,6 +4224,234 @@ _ENV_BOUNDARY_HINT = {
     "custom": "circle or polygon -- whatever matches your arena",
 }
 _ENV_VIDEO_EXTS = {".avi", ".mp4", ".mov", ".mkv", ".wmv"}
+_ENV_PARADIGM_DESCRIPTIONS = {
+    "open_field":         "General region/object time -- no paradigm-specific index.",
+    "novel_object":       "Discrimination index from time near 'novel' vs 'familiar' objects.",
+    "y_maze":             "Spontaneous alternation % from entries into 3 named 'arm' regions.",
+    "elevated_plus_maze": "% time and entries into 'open_arm' vs 'closed_arm' regions.",
+    "three_chamber":      "Sociability/social-novelty indices from 'stranger'/'empty'/'novel_stranger' objects.",
+    "place_preference":   "Preference index from time in 'paired' vs 'unpaired' regions.",
+    "custom":             "Generic per-region/per-object time and entries, no derived index.",
+}
+
+
+class EnvParadigmWindow(tk.Toplevel):
+    """
+    Standalone hub for environmental context, object interaction, and
+    behavioral paradigms -- one click from the main window rather than
+    nested inside AdvancedCUBEWindow. Owns env_features_enabled,
+    kinematic_directedness_enabled, env_arena_cfg, and
+    env_interaction_threshold exclusively: AdvancedCUBEWindow no longer
+    reads or writes any of these four engine_cfg keys, so there is only one
+    place that can change them.
+
+    Arena/region/object tracing itself is unchanged -- this window just
+    opens the existing EnvContextWindow for that part.
+    """
+
+    def __init__(self, parent, session: "SessionState"):
+        super().__init__(parent)
+        self.title("Environments, Objects, Paradigms")
+        self.configure(bg=C["bg"])
+        self.geometry("560x420")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self._session = session
+        cfg = session.get("engine_cfg", {}) or {}
+        self._env_arena_cfg = cfg.get("env_arena_cfg") or None
+
+        pad = dict(padx=10, pady=4)
+
+        tk.Label(self, text="  Environments, Objects & Paradigms",
+                 font=("Segoe UI", 12, "bold"),
+                 bg=C["bg"], fg=C["cyan"]).pack(anchor="w", padx=10, pady=(10, 2))
+        tk.Label(self,
+                 text="  Both opt-in and off by default -- with both unticked, output is "
+                      "byte-identical to a run without this feature.",
+                 font=("Segoe UI", 8), bg=C["bg"], fg=C["subtext"],
+                 justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+
+        # ── Environmental context ───────────────────────────────────────────
+        self._env_v = tk.BooleanVar(value=bool(cfg.get("env_features_enabled", False)))
+        row = tk.Frame(self, bg=C["bg"])
+        row.pack(fill="x", **pad)
+        tk.Checkbutton(row, text="Enable environmental context (arena / regions / objects)",
+                       variable=self._env_v, bg=C["bg"], fg=C["green"],
+                       selectcolor=C["card"], activebackground=C["bg"],
+                       command=self._refresh_status).pack(side="left")
+        tk.Label(self,
+                 text="  Trace an arena and pick a paradigm below for region/object time "
+                      "and paradigm-specific indices (alternation %, discrimination index, etc).",
+                 font=("Segoe UI", 7), bg=C["bg"],
+                 fg=C["dim"]).pack(anchor="w", padx=10, pady=(0, 4))
+
+        # ── Kinematic directedness ──────────────────────────────────────────
+        self._kin_v = tk.BooleanVar(value=bool(cfg.get("kinematic_directedness_enabled", False)))
+        row = tk.Frame(self, bg=C["bg"])
+        row.pack(fill="x", **pad)
+        tk.Checkbutton(row, text="Enable kinematic directedness (per-bout straightness/speed/heading)",
+                       variable=self._kin_v, bg=C["bg"], fg=C["green"],
+                       selectcolor=C["card"], activebackground=C["bg"]).pack(side="left")
+        tk.Label(self,
+                 text="  Enabling this together with environmental context also unlocks "
+                      "approach/avoid object-interaction events.",
+                 font=("Segoe UI", 7), bg=C["bg"],
+                 fg=C["dim"]).pack(anchor="w", padx=10, pady=(0, 4))
+
+        # ── Interaction threshold ───────────────────────────────────────────
+        thr_row = tk.Frame(self, bg=C["bg"])
+        thr_row.pack(fill="x", **pad)
+        tk.Label(thr_row, text="Interaction threshold (px, blank = auto):",
+                 font=("Segoe UI", 9), bg=C["bg"], fg=C["text"]).pack(side="left")
+        _thr = cfg.get("env_interaction_threshold")
+        self._env_thresh_var = tk.StringVar(value="" if _thr is None else str(_thr))
+        tk.Entry(thr_row, textvariable=self._env_thresh_var, width=8,
+                 bg=C["card2"], fg=C["text"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(6, 8))
+        tk.Button(thr_row, text="Preview auto value", font=("Segoe UI", 8),
+                  bg=C["btn"], fg=C["subtext"], relief="flat", padx=8, pady=2,
+                  cursor="hand2", command=self._preview_threshold).pack(side="left")
+        self._thr_preview_lbl = tk.Label(self, text="", font=("Segoe UI", 7, "italic"),
+                                          bg=C["bg"], fg=C["dim"])
+        self._thr_preview_lbl.pack(anchor="w", padx=10, pady=(0, 4))
+
+        # ── Arena / paradigm configuration ──────────────────────────────────
+        _hdr = tk.Frame(self, bg=C["bg"])
+        _hdr.pack(fill="x", pady=(8, 0), padx=10)
+        tk.Frame(_hdr, bg=C["dim"], height=1).pack(fill="x")
+        tk.Button(self, text="Configure Arena, Regions & Objects...",
+                  font=("Segoe UI", 9), bg=C["btn"], fg=C["yellow"],
+                  relief="flat", padx=10, pady=4, cursor="hand2",
+                  command=self._open_arena_editor).pack(anchor="w", padx=10, pady=(8, 0))
+        self._status_lbl = tk.Label(self, text="", font=("Segoe UI", 7, "italic"),
+                                     bg=C["bg"], fg=C["dim"])
+        self._status_lbl.pack(anchor="w", padx=10, pady=(2, 4))
+
+        # ── Buttons ──────────────────────────────────────────────────────────
+        btn_f = tk.Frame(self, bg=C["bg"])
+        btn_f.pack(side="bottom", fill="x", pady=8, padx=12)
+        tk.Button(btn_f, text="Cancel", font=("Segoe UI", 9),
+                  bg=C["btn"], fg=C["btn_fg"], relief="flat",
+                  padx=10, pady=5, cursor="hand2",
+                  command=self.destroy).pack(side="left")
+        tk.Button(btn_f, text="Apply & Close", font=("Segoe UI", 10, "bold"),
+                  bg=C["purple"], fg="white", relief="flat",
+                  padx=16, pady=5, cursor="hand2",
+                  command=self._apply).pack(side="right")
+
+        self._refresh_status()
+
+    def _refresh_status(self):
+        if not self._env_v.get():
+            self._status_lbl.configure(text="Arena: not configured (enable the checkbox above)")
+            return
+        cfg = self._env_arena_cfg or {}
+        n_reg = len((cfg.get("reference_shapes") or {}).get("regions") or [])
+        n_obj = len((cfg.get("reference_shapes") or {}).get("objects") or [])
+        has_bound = bool((cfg.get("reference_shapes") or {}).get("boundary"))
+        if not cfg or (n_reg == 0 and n_obj == 0 and not has_bound):
+            self._status_lbl.configure(text="Arena: not configured yet")
+        else:
+            self._status_lbl.configure(
+                text=f"Arena: {cfg.get('paradigm', 'custom')} paradigm, "
+                     f"{n_reg} region(s), {n_obj} object(s)"
+                     f"{' + boundary' if has_bound else ''}")
+
+    def _open_arena_editor(self):
+        try:
+            win = EnvContextWindow(self, self._session, self._env_arena_cfg)
+            self.wait_window(win)
+            result = getattr(win, "result", None)
+            if result is not None:      # None = Cancel; keep previous config
+                self._env_arena_cfg = result
+            self._refresh_status()
+        except Exception as e:
+            messagebox.showerror("Environments, Objects, Paradigms",
+                                  f"Could not open the arena editor:\n{e}")
+
+    def _find_first_dlc_file(self):
+        """Mirrors BodyPartWeightWindow._find_first_dlc_file's search order."""
+        candidates = []
+        try:
+            candidates.extend(self._session.get("bsoid_ready_dirs") or [])
+        except Exception:
+            pass
+        try:
+            candidates.extend(self._session.get("video_folders") or [])
+        except Exception:
+            pass
+        for folder in candidates:
+            try:
+                if not folder or not Path(folder).is_dir():
+                    continue
+                files = find_dlc_files(folder) if find_dlc_files else []
+                if files:
+                    return files[0]
+            except Exception:
+                continue
+        return None
+
+    def _preview_threshold(self):
+        if load_dlc_file is None or _find_spine_indices is None or _spine_norm_factor is None:
+            self._thr_preview_lbl.configure(text="Preview requires cube_core (not loaded).")
+            return
+        dlc_path = self._find_first_dlc_file()
+        if dlc_path is None:
+            self._thr_preview_lbl.configure(
+                text="No DLC file found yet -- run Step 1/2 first, then reopen to preview.")
+            return
+        try:
+            xy, bodyparts, _fps = load_dlc_file(dlc_path)
+            head_idx, tail_idx = _find_spine_indices(bodyparts)
+            xs, ys = xy[:, 0::2], xy[:, 1::2]
+            if head_idx is not None and tail_idx is not None:
+                import numpy as _np
+                val = float(_np.nanmedian(_spine_norm_factor(xs, ys, head_idx, tail_idx)))
+            else:
+                val = 50.0
+            self._thr_preview_lbl.configure(
+                text=f"Auto-derived value for this session would be ~{val:.1f} px.")
+        except Exception as e:
+            self._thr_preview_lbl.configure(text=f"Could not compute preview: {e}")
+
+    def _apply(self):
+        cfg = dict(self._session.get("engine_cfg", {}) or {})
+
+        if self._env_v.get():
+            cfg["env_features_enabled"] = True
+        else:
+            cfg.pop("env_features_enabled", None)
+
+        if self._kin_v.get():
+            cfg["kinematic_directedness_enabled"] = True
+        else:
+            cfg.pop("kinematic_directedness_enabled", None)
+
+        if self._env_arena_cfg:
+            cfg["env_arena_cfg"] = self._env_arena_cfg
+        else:
+            cfg.pop("env_arena_cfg", None)
+
+        _thr_raw = self._env_thresh_var.get().strip()
+        if _thr_raw:
+            try:
+                _thr_val = float(_thr_raw)
+                if _thr_val <= 0:
+                    raise ValueError("threshold must be positive")
+                cfg["env_interaction_threshold"] = _thr_val
+            except ValueError:
+                messagebox.showwarning(
+                    "Interaction Threshold",
+                    f"'{_thr_raw}' is not a valid positive number -- ignoring it. "
+                    "The threshold will be auto-derived instead.")
+                cfg.pop("env_interaction_threshold", None)
+        else:
+            cfg.pop("env_interaction_threshold", None)
+
+        self._session["engine_cfg"] = cfg
+        self.destroy()
 
 
 class EnvContextWindow(tk.Toplevel):
@@ -4384,6 +4539,8 @@ class EnvContextWindow(tk.Toplevel):
 
     def _dlc_crop_rect(self):
         adv = self._session.get("dlc_advanced_cfg", {}) or {}
+        if not bool(adv.get("dlc_crop_enable", False)):
+            return 0, 0, 0, 0
         rx, ry = int(adv.get("dlc_crop_x", 0)), int(adv.get("dlc_crop_y", 0))
         rw, rh = int(adv.get("dlc_crop_w", 0)), int(adv.get("dlc_crop_h", 0))
         return rx, ry, rw, rh
@@ -4464,6 +4621,10 @@ class EnvContextWindow(tk.Toplevel):
                            value=key, bg=C["card"], fg=C["text"],
                            selectcolor=C["card2"], activebackground=C["card"],
                            font=("Segoe UI", 10)).pack(side="left")
+            _desc = _ENV_PARADIGM_DESCRIPTIONS.get(key, "")
+            if _desc:
+                tk.Label(row, text=_desc, font=("Segoe UI", 7),
+                         bg=C["card"], fg=C["dim"]).pack(side="left", padx=(10, 0))
 
         others = self._list_videos()
         ref_stem = others[0][0] if others else "reference"
@@ -4714,8 +4875,11 @@ class EnvContextWindow(tk.Toplevel):
     def _finish_shape(self):
         if not self._drawing_kind:
             return
-        if len(self._draw_points) < (2 if self._drawing_kind == "boundary" else 3):
-            messagebox.showwarning("Finish Shape", "Need at least 3 points (a boundary needs at least 2).")
+        if len(self._draw_points) < 3:
+            messagebox.showwarning(
+                "Finish Shape",
+                "Need at least 3 points to form a closed shape (2 points make a line, "
+                "which region/boundary/object-interaction detection can't use).")
             return
         kind = self._drawing_kind
         default_name = ("Arena" if kind == "boundary" else self._suggested_name(kind))
@@ -6538,6 +6702,11 @@ class PipelineApp(tk.Tk):
                   relief="flat", padx=8, pady=4, cursor="hand2",
                   command=self._open_3d_settings).pack(side="left",
                                                         padx=(4, 0), pady=2)
+        tk.Button(adv_row, text="🌐  Environments, Objects, Paradigms...",
+                  font=("Segoe UI", 8, "bold"), bg=C["btn"], fg=C["cyan"],
+                  relief="flat", padx=8, pady=4, cursor="hand2",
+                  command=self._open_env_paradigms).pack(side="left",
+                                                          padx=(4, 0), pady=2)
 
         # "Export Extra UMAP Evolution Videos" lives in the Tools menu bar
         # (see _build_menubar) rather than as a button in the main panel.
@@ -6787,6 +6956,9 @@ class PipelineApp(tk.Tk):
 
     def _open_3d_settings(self):
         ThreeDSettingsWindow(self, self._session)
+
+    def _open_env_paradigms(self):
+        EnvParadigmWindow(self, self._session)
 
     #   STEP LAUNCHERS
 
@@ -7661,6 +7833,7 @@ def _deferred_imports():
     global filter_dlc_h5, cleanup_video_byproducts, create_umap_evolution_video
     global find_dlc_files, peek_dlc_bodyparts, group_bodyparts_by_region
     global resolve_env_shapes, ENV_PARADIGMS, ENV_PARADIGM_ROLE_VOCAB, ENV_PARADIGM_MIN_ROLES
+    global load_dlc_file, _find_spine_indices, _spine_norm_factor
     global _MOD_VIDEO, _PATH_VIDEO, _MOD_ANALYSER, _PATH_ANALYSER
 
     try:
@@ -7670,6 +7843,7 @@ def _deferred_imports():
             find_dlc_files, peek_dlc_bodyparts, group_bodyparts_by_region,
             resolve_env_shapes, ENV_PARADIGMS, ENV_PARADIGM_ROLE_VOCAB,
             ENV_PARADIGM_MIN_ROLES,
+            load_dlc_file, _find_spine_indices, _spine_norm_factor,
         )
         CORE_OK = True
     except ImportError as _ce:
