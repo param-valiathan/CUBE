@@ -530,6 +530,9 @@ With `auto_bsoid = True`, completing the 3D DLC step automatically triggers Step
   no gating flag (it reads a file that only exists once the pipeline has already produced it).
 
 **Per-bout kinematic directedness (K2, opt-in — `kinematic_directedness_enabled`, default `False`)**
+- Toggled from the main window's **Environments, Objects, Paradigms...** button, alongside the
+  environmental-context checkbox below — enabling both together also unlocks approach/avoid event
+  detection.
 - When enabled, writes an additional sidecar CSV per session, `<stem>_bout_lengths_hmm_enriched.csv`
   (see Output Layout above): the canonical 3-column bout schema plus 5 new per-bout columns —
   `net_displacement_px`, `path_length_px`, `straightness_ratio` (net displacement ÷ path length; ~1.0 =
@@ -552,9 +555,9 @@ With `auto_bsoid = True`, completing the 3D DLC step automatically triggers Step
   Three-Chamber Test, Place Preference/CPP) or Custom, and CUBE computes region/object time series and
   paradigm-specific derived metrics per session — spontaneous alternation % (Y-Maze), open-arm time/entry
   %/latency (Elevated Plus Maze), discrimination index (Novel Object), sociability/social-novelty indices
-  (Three-Chamber), and preference index (Place Preference/CPP). Configured in `cube.py`'s new
-  `EnvContextWindow` (opened from Advanced Settings' "Environmental Context..." button, itself gated on the
-  `env_features_enabled` checkbox).
+  (Three-Chamber), and preference index (Place Preference/CPP). Configured from the main window's
+  **Environments, Objects, Paradigms...** button (its own standalone window, not nested in Advanced
+  Settings), whose "Configure Arena, Regions & Objects..." button opens `cube.py`'s `EnvContextWindow`.
 - Off by default: with the checkbox unticked, no GUI invitation to configure it, `session_env_context.json`
   is never written (not even empty), and bout-CSV output is byte-identical to a pre-this-feature run.
   Turning the flag on without ever tracing shapes is also a near no-op — empty summaries, no crash.
@@ -575,8 +578,10 @@ With `auto_bsoid = True`, completing the 3D DLC step automatically triggers Step
   object (or inside a traced region) and ended meaningfully farther away from it (or outside it) —
   no following-bout requirement, since fleeing isn't expected to be followed by investigation.
 - Coordinate-space correctness (traced shapes vs. pose data) is a structural guarantee, not a runtime
-  check: `EnvContextWindow` always reads video frames through the same crop rectangle DLC tracked on, so
-  traced vertices land in the same pixel space as the pose data by construction.
+  check: `EnvContextWindow` only reads frames through the DLC crop rectangle when spatial crop is actually
+  enabled (mirroring the real DLC pipeline's own crop gate), so traced vertices land in the same pixel
+  space as the pose data even if a crop was set and later disabled. Shapes now require >= 3 points
+  (including the boundary), since fewer can't form a usable closed region.
 - See `Environmental_Context_v6_Implementation_Plan.md` and `Environmental_Context_v6_Implementation_Report.md`
   for the full schema, paradigm/role vocabulary, and verification detail, and
   `CUBE_Analyser_Paradigm_Reporting_Plan.md` / `Analyser_Paradigm_Reporting_v6_Implementation_Report.md` for

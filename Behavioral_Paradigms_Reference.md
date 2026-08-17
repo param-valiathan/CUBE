@@ -26,10 +26,10 @@ Results tab; the pipeline must be re-run.
 
 | Stage | Action | Governs |
 |---|---|---|
-| 1. Before Step 3 (Clustering Engine) | Open Advanced Settings → tick `env_features_enabled` → **Environmental Context...** button → `EnvContextWindow` | Master switch; without this, no environmental data is ever computed, regardless of what happens later |
+| 1. Before Step 3 (Clustering Engine) | Main window → **Environments, Objects, Paradigms...** → tick `env_features_enabled` → **Configure Arena, Regions & Objects...** → `EnvContextWindow` | Master switch; without this, no environmental data is ever computed, regardless of what happens later |
 | 2. Inside `EnvContextWindow`, Tab 1 | Choose one paradigm (project-wide — see §5.1) and trace a boundary + named regions/objects with roles, on **one reference video frame** | `env_arena_cfg["reference_shapes"]` — the shape set every session inherits by default |
 | 3. Inside `EnvContextWindow`, Tab 2 (optional) | Per-video translate or independent override, if the arena moved or was repositioned between recordings | `env_arena_cfg["per_video"]` — per-session correction on top of the reference shapes |
-| 4. Optional, same Advanced Settings section | Tick `kinematic_directedness_enabled` | Required for: total-distance-traveled (Open Field control bar), and *entirely* required for Approach/Avoid Events (needs `straightness_ratio`/`mean_speed_px_s` per bout) |
+| 4. Same **Environments, Objects, Paradigms...** window | Tick `kinematic_directedness_enabled` | Required for: total-distance-traveled (Open Field control bar), and *entirely* required for Approach/Avoid Events (needs `straightness_ratio`/`mean_speed_px_s` per bout) |
 | 5. Run the pipeline (Step 3) | `BSoidEngine.run()` | Writes `session_env_context.json`, the enriched bout sidecar, and (if both flags 4a/4b are on and events are detected) `approach_events.csv` |
 | 6. Analyser, Combined Analysis tab | Load the resulting `*_bout_lengths_hmm.csv` files as usual | Populates `get_animals_fn` — the Paradigm Results tab locates its sibling files from each animal's bout-CSV path |
 | 7. Analyser, Paradigm Results tab | Click **Refresh from Loaded Sessions** | Loads and renders |
