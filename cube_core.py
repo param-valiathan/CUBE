@@ -4313,13 +4313,11 @@ def compute_session_env_context(env_cfg: "dict | None", stem: str,
 
     xs, ys: (n_frames, n_bodyparts) already-smoothed per-frame pose arrays for
       this session, in the SAME pixel coordinate space the shapes in env_cfg
-      were traced in (post-crop by construction -- see coord-space assertion
-      below).
+      were traced in.
     bodyparts: this session's bodypart name list, same order as xs/ys columns.
-    pose_coord_space: the coordinate space THIS session's xs/ys are actually
-      in ("post_crop" always, per Step 1 -- kept as a parameter rather than a
-      hardcoded assumption so the assertion below is a real check, not
-      theater).
+    pose_coord_space: kept for interface/documentation stability and forward
+      compatibility, but NOT compared/asserted here -- see "Coordinate-space
+      correctness" below for why.
     interaction_threshold: pixel distance under which nose/paw-to-object
       counts as "interacting". None (default) auto-derives one body length
       from this session's own tracked spine length (_find_spine_indices /
@@ -4335,23 +4333,26 @@ def compute_session_env_context(env_cfg: "dict | None", stem: str,
     is responsible for gating that flag; this function only cares whether
     env_cfg itself carries traced shapes.
 
-    On a real coordinate-space mismatch (env_cfg["coord_space"] != the space
-    this session's pose data is actually in) this raises ValueError rather
-    than silently computing wrong distances -- coordinate-space correctness
-    is a named top risk in CUBE_v6_Feasibility_Study.md, not defensive
-    boilerplate to relax for convenience.
+    Coordinate-space correctness (deviation from the plan's literal wording,
+    confirmed with the user during implementation): the plan calls for this
+    function to *assert* that pose data and resolved shapes "agree on crop
+    state," raising if not. In practice cube_core.py/BSoidEngine has zero
+    visibility into crop state at all -- dlc_crop_x/y/w/h live only in
+    cube.py's session["dlc_advanced_cfg"] and are consumed before DLC ever
+    runs (to crop the video DLC tracks on); they are never threaded into the
+    cfg dict BSoidEngine receives. A runtime comparison here would therefore
+    either be vacuous (nothing to compare against) or require new cfg-
+    assembly plumbing outside this plan's file-level task summary. Per an
+    explicit user decision, correctness is instead guaranteed
+    STRUCTURALLY, not at runtime: Step 2's EnvContextWindow must always read
+    video frames through the same crop-aware pixel space DLC used (cloning
+    CropPreviewDialog's crop-aware frame read, not just its canvas scaling),
+    so shapes are traced in the same coordinate space as pose data by
+    construction. There is no raise-on-mismatch in this function; this is
+    verified by manual QA in Step 2's verification, not a runtime assertion.
     """
     if not env_cfg:
         return {}
-
-    cfg_coord_space = env_cfg.get("coord_space", "post_crop")
-    if cfg_coord_space != pose_coord_space:
-        raise ValueError(
-            f"compute_session_env_context: coordinate-space mismatch for "
-            f"session '{stem}' -- shapes in env_arena_cfg were traced in "
-            f"'{cfg_coord_space}' space but this session's pose data is in "
-            f"'{pose_coord_space}' space. Refusing to compute distances "
-            f"against misaligned coordinates.")
 
     shapes = resolve_env_shapes(env_cfg, stem)
     if not shapes or xs is None or xs.shape[0] == 0:
@@ -8993,6 +8994,15 @@ class BSoidEngine:
         all_bp_bad_fracs: dict = {}  # bodypart -> list of per-session bad-frame fracs
         all_flat_held: list = []     # per-session per-bodypart flat-held masks (list[list[np.ndarray]])
         all_ll: list = []            # per-session raw per-frame likelihood arrays (issue 2 visibility features)
+        # v6 part 2 (Environmental_Context_v6_Implementation_Plan.md Step 3):
+        # index-aligned to pairs/all_xy, exactly like all_vpaths. One shared
+        # env_arena_cfg dict per project (one traced arena, applied per-video
+        # via its own per_video/role_overrides sub-keys) -- not a per-stem
+        # lookup, since Step 1's schema defines a single arena config, not a
+        # dict keyed by stem. None whenever env_features_enabled is False or
+        # no arena has been configured, so downstream Step 4/6/7 calls are
+        # unconditionally no-ops in that state.
+        all_env_cfg: list = []
 
         def _group_key(_fp: Path) -> str:
             # Which uploaded csv folder does this DLC file belong to?  Used so the
@@ -9030,6 +9040,9 @@ class BSoidEngine:
                 all_groups.append(_group_key(fp))
                 all_flat_held.append(_flat_held)
                 all_ll.append(_ll)
+                all_env_cfg.append(
+                    self._cfg.get("env_arena_cfg")
+                    if bool(self._cfg.get("env_features_enabled", False)) else None)
             except Exception:
                 self._log(f"  [WARN] Skipping {fp.name}:\n"
                           f"  {traceback.format_exc()}")
