@@ -4459,6 +4459,14 @@ def compute_session_env_context(env_cfg: "dict | None", stem: str,
         "dist_to_nearest_object_nose": dist_to_nearest_object_nose,
         "dist_to_nearest_object_paw": dist_to_nearest_object_paw,
         "heading_angle_to_nearest_object": heading_angle_to_nearest_object,
+        # Per-bin centroid position, same pixel/coordinate space as the traced
+        # shapes (see "Coordinate-space correctness" above). Added for
+        # CUBE_Analyser_Paradigm_Reporting_Plan.md's occupancy heatmaps --
+        # every other per_bin series here is a derived distance/membership
+        # value, none of which alone lets a caller reconstruct where the
+        # animal actually was, which the occupancy heatmap needs directly.
+        "centroid_x": _bin_agg(cx),
+        "centroid_y": _bin_agg(cy),
     }
     summary = {
         "time_in_region_sec": time_in_region_sec,
