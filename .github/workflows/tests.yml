@@ -1,0 +1,79 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Full suite (including the slow end-to-end regression) nightly, in
+    # addition to running it on every push to main below.
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+
+# Cancel superseded runs on the same branch/PR to keep CI queues short.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast-tests:
+    # Runs on every push and PR: everything except the `slow` marker
+    # (Phase T2-T6 + T9), so PR feedback stays fast.
+    name: fast tests (not slow)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash -l {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up CUBE conda environment
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: CUBE
+          environment-file: environment.yml
+          python-version: "3.12"
+          miniforge-version: latest
+          use-mamba: true
+
+      - name: Verify environment
+        run: |
+          python -c "import cube_core; import umap; import hdbscan; import hmmlearn; print('OK')"
+
+      - name: Run fast test suite (not slow)
+        run: |
+          python -m pytest tests/ -v -m "not slow" --cov=cube_core --cov=cube_analyser --cov-report=term-missing
+
+  full-suite:
+    # Full suite including the slow end-to-end regression (Phase T7):
+    # only on push to main, on the nightly schedule, or when manually
+    # dispatched -- kept off PRs so PR feedback stays fast (see fast-tests).
+    name: full suite (including slow)
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash -l {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up CUBE conda environment
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: CUBE
+          environment-file: environment.yml
+          python-version: "3.12"
+          miniforge-version: latest
+          use-mamba: true
+
+      - name: Verify environment
+        run: |
+          python -c "import cube_core; import umap; import hdbscan; import hmmlearn; print('OK')"
+
+      - name: Run full test suite (including slow)
+        run: |
+          python -m pytest tests/ -v --cov=cube_core --cov=cube_analyser --cov-report=term-missing
