@@ -96,3 +96,72 @@ class TestEnrichBoutsFromBinSource:
             df, self.ARR, bin_offset=self.BIN_OFFSET, win=self.WIN,
             agg_fns=lambda s: s.mean(), out_col_names="mean_val")
         assert list(df.columns) == cols_before
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  compute_bout_directedness (Step 3)
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestComputeBoutDirectedness:
+    FPS = 30
+
+    def test_straight_line_path_has_straightness_near_one(self):
+        n = 100
+        xy = np.column_stack([np.arange(n, dtype=float), np.zeros(n)])
+        df = bout_df([(0, 0, 100)])
+        out = cc.compute_bout_directedness(df, xy, self.FPS)
+        assert out.loc[0, "straightness_ratio"] == pytest.approx(1.0)
+        assert out.loc[0, "heading_consistency"] > 0.99
+        assert out.loc[0, "net_displacement_px"] == pytest.approx(99.0)
+        assert out.loc[0, "path_length_px"] == pytest.approx(99.0)
+        assert out.loc[0, "mean_speed_px_s"] == pytest.approx(99.0 / (100 / self.FPS))
+
+    def test_random_walk_path_has_low_straightness(self):
+        n = 100
+        rng = np.random.default_rng(42)
+        steps = rng.normal(0, 1, size=(n - 1, 2))
+        xy = np.vstack([np.zeros((1, 2)), np.cumsum(steps, axis=0)])
+        df = bout_df([(0, 0, 100)])
+        out = cc.compute_bout_directedness(df, xy, self.FPS)
+        # A random walk's net displacement grows like sqrt(n) while path
+        # length grows like n, so straightness/heading consistency should be
+        # well below the straight-line path's ~1.0.
+        assert out.loc[0, "straightness_ratio"] < 0.5
+        assert out.loc[0, "heading_consistency"] < 0.5
+
+    def test_min_bout_length_guard_produces_nan_on_short_bout(self):
+        # default min_bout_frames=5; this bout has only 3 frames.
+        xy = np.column_stack([np.arange(3, dtype=float), np.zeros(3)])
+        df = bout_df([(0, 0, 3)])
+        out = cc.compute_bout_directedness(df, xy, self.FPS)
+        assert np.isnan(out.loc[0, "straightness_ratio"])
+        assert np.isnan(out.loc[0, "heading_consistency"])
+        # net displacement/path length/mean speed remain well-defined and computed
+        assert out.loc[0, "net_displacement_px"] == pytest.approx(2.0)
+        assert out.loc[0, "path_length_px"] == pytest.approx(2.0)
+
+    def test_single_frame_bout_no_crash(self):
+        xy = np.array([[5.0, 5.0]])
+        df = bout_df([(0, 0, 1)])
+        out = cc.compute_bout_directedness(df, xy, self.FPS)
+        assert out.loc[0, "net_displacement_px"] == 0.0
+        assert out.loc[0, "path_length_px"] == 0.0
+        assert np.isnan(out.loc[0, "straightness_ratio"])
+
+    def test_empty_bout_df_returns_empty_with_columns_present(self):
+        xy = np.zeros((10, 2))
+        out = cc.compute_bout_directedness(bout_df([]), xy, self.FPS)
+        assert out.empty
+        for col in ("net_displacement_px", "path_length_px", "straightness_ratio",
+                    "mean_speed_px_s", "heading_consistency"):
+            assert col in out.columns
+
+    def test_zero_path_length_yields_nan_straightness_not_divzero(self):
+        # bout stays perfectly still -- path_length is 0, so straightness
+        # (net/path) must be NaN rather than a ZeroDivisionError/inf.
+        xy = np.full((10, 2), 3.0)
+        df = bout_df([(0, 0, 10)])
+        out = cc.compute_bout_directedness(df, xy, self.FPS)
+        assert out.loc[0, "path_length_px"] == 0.0
+        assert np.isnan(out.loc[0, "straightness_ratio"])
+        assert np.isnan(out.loc[0, "heading_consistency"])

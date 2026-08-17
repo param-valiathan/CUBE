@@ -4039,6 +4039,101 @@ def compute_cluster_kinematics(all_xy: list, all_frame_labels: list,
     return df
 
 
+def compute_bout_directedness(bout_df: "pd.DataFrame", xy: np.ndarray, fps: float,
+                               min_bout_frames: int = 5) -> "pd.DataFrame":
+    """
+    Per-bout kinematic directedness metrics for ONE session (v6 K2 Step 3).
+
+    Unlike Step 2's enrich_bouts_from_bin_source (bin-scoped join), this
+    computes directly over each bout's own frame range against the
+    already-loaded per-frame centroid trajectory -- no bin lookup needed,
+    since the computation is naturally bout-scoped.
+
+    bout_df: raw *_bout_lengths[_hmm].csv-shaped bout table for this session
+      ("B-SOiD labels", "Start time (frames)", "Run lengths").
+    xy: (n_frames, 2) per-frame centroid trajectory (x, y) for this same
+      session, derived the same way compute_cluster_kinematics derives its
+      centroid (mean of bodypart x / y columns each frame).
+    fps: this session's frame rate.
+    min_bout_frames: bouts spanning fewer frames than this skip
+      straightness_ratio and heading_consistency (NaN) -- both are noisy or
+      undefined on a 2-3 frame bout (flagged as a risk in the original design
+      doc's verification section). net_displacement_px, path_length_px, and
+      mean_speed_px_s remain well-defined at any bout length and are always
+      computed.
+
+    Returns a copy of bout_df with five new columns appended:
+      net_displacement_px, path_length_px, straightness_ratio,
+      mean_speed_px_s, heading_consistency.
+    straightness_ratio = net_displacement / path_length (1.0 = perfectly
+      straight line, ~0 = meandering/returns near start). heading_consistency
+      is the mean resultant length of the bout's unit step-heading vectors
+      (1.0 = every step points the same direction, ~0 = directionally
+      random) -- both NaN when path_length is 0 (no net motion) or the bout
+      is shorter than min_bout_frames.
+    net_rotation_index is deferred to v7+ alongside Morris Water Maze (see
+    Kinematic_Transition_v6_Implementation_Plan.md Step 3).
+    """
+    out = bout_df.copy()
+    if out.empty:
+        for col in ("net_displacement_px", "path_length_px", "straightness_ratio",
+                    "mean_speed_px_s", "heading_consistency"):
+            out[col] = pd.Series(dtype=float)
+        return out
+
+    n_frames_total = xy.shape[0]
+    start_frames = out["Start time (frames)"].astype(int).to_numpy()
+    run_lens     = out["Run lengths"].astype(int).to_numpy()
+
+    net_disp, path_len, straight, mean_spd, head_con = [], [], [], [], []
+
+    for sf, rl in zip(start_frames, run_lens):
+        sf = max(0, min(int(sf), n_frames_total - 1))
+        ef = max(0, min(sf + int(rl) - 1, n_frames_total - 1))
+        if ef < sf:
+            sf, ef = ef, sf
+        seg = xy[sf:ef + 1]
+        n_pts = seg.shape[0]
+        if n_pts < 2:
+            net_disp.append(0.0)
+            path_len.append(0.0)
+            mean_spd.append(0.0)
+            straight.append(np.nan)
+            head_con.append(np.nan)
+            continue
+
+        deltas    = np.diff(seg, axis=0)
+        step_dist = np.hypot(deltas[:, 0], deltas[:, 1])
+        pl        = float(step_dist.sum())
+        nd        = float(np.hypot(seg[-1, 0] - seg[0, 0], seg[-1, 1] - seg[0, 1]))
+        dur_s     = n_pts / fps
+
+        net_disp.append(nd)
+        path_len.append(pl)
+        mean_spd.append(pl / dur_s if dur_s > 0 else 0.0)
+
+        if (ef - sf + 1) < min_bout_frames or pl == 0:
+            straight.append(np.nan)
+            head_con.append(np.nan)
+            continue
+
+        straight.append(nd / pl)
+        nz = step_dist > 0
+        if nz.any():
+            unit     = deltas[nz] / step_dist[nz, None]
+            mean_vec = unit.mean(axis=0)
+            head_con.append(float(np.hypot(mean_vec[0], mean_vec[1])))
+        else:
+            head_con.append(np.nan)
+
+    out["net_displacement_px"] = net_disp
+    out["path_length_px"]      = path_len
+    out["straightness_ratio"]  = straight
+    out["mean_speed_px_s"]     = mean_spd
+    out["heading_consistency"] = head_con
+    return out
+
+
 def compute_cluster_confidence_profile(vis_feats: np.ndarray, vis_col_names: list,
                                         labels: np.ndarray, out_path: Path,
                                         low_conf_floor: float = 0.40) -> "pd.DataFrame":
