@@ -7979,6 +7979,19 @@ class BSoidEngine:
         #   path's, instead of being a refinement/validation-free black box
         #   scored only by separation_ratio.
         consensus_auto_threshold     = 0.55,
+        # kinematic_directedness_enabled (v6 K2, Kinematic_Transition_v6_
+        #   Implementation_Plan.md): off by default, opt-in only. When True,
+        #   writes an additional per-session sidecar CSV,
+        #   <stem>_bout_lengths_hmm_enriched.csv, alongside the canonical
+        #   *_bout_lengths_hmm.csv -- the canonical 3-column B-SOiD-format
+        #   file plus five new per-bout directedness columns from
+        #   compute_bout_directedness() (net_displacement_px, path_length_px,
+        #   straightness_ratio, mean_speed_px_s, heading_consistency). The
+        #   canonical bout CSV itself is never touched, in either state of
+        #   this flag -- when False (default), no sidecar is written at all
+        #   (not written empty), and every existing output file is
+        #   byte-identical to pre-v6 output.
+        kinematic_directedness_enabled = False,
         # ── Body-region feature weighting (issue 1b) ──────────────────────────
         # bodypart_weights: {bodypart_name: multiplier}.  {} (default) = every
         #   multiplier is exactly 1.0 -> bit-identical output to unweighted
@@ -10260,6 +10273,26 @@ class BSoidEngine:
                     _bout_hmm.to_csv(
                         str(self._out_bouts / f"{_name}_bout_lengths_hmm.csv"),
                         index=False)
+                    # v6 K2 sidecar (opt-in, off by default): per-bout
+                    # kinematic directedness metrics, written as a SEPARATE
+                    # file so the canonical 3-column bout CSV above is never
+                    # touched. See kinematic_directedness_enabled in DEFAULTS.
+                    if bool(self._cfg.get("kinematic_directedness_enabled", False)):
+                        try:
+                            _xy_k = all_xy[_hi]
+                            _centroid_xy = np.column_stack([
+                                _xy_k[:, 0::2].mean(axis=1),
+                                _xy_k[:, 1::2].mean(axis=1)])
+                            _bout_hmm_enriched = compute_bout_directedness(
+                                _bout_hmm, _centroid_xy, _file_fps)
+                            _bout_hmm_enriched.to_csv(
+                                str(self._out_bouts /
+                                    f"{_name}_bout_lengths_hmm_enriched.csv"),
+                                index=False)
+                        except Exception:
+                            self._log(
+                                f"  [WARN] kinematic directedness sidecar "
+                                f"({_name}): {traceback.format_exc()}")
                     pd.DataFrame({
                         "frame":               np.arange(len(_hmm_display)),
                         "time_s":              np.arange(len(_hmm_display)) / _file_fps,
@@ -10830,6 +10863,21 @@ class BSoidEngine:
             bp    = engine._out_bouts / f"{fp.stem}_bout_lengths.csv"
             bd.to_csv(str(bp), index=False)
             bout_paths.append(bp)
+            # v6 K2 sidecar consistency: this path has no _hmm bout variant
+            # at all (predict_from_saved_model skips HMM smoothing), so the
+            # enriched sidecar pairs with the raw bout CSV above --
+            # "<stem>_bout_lengths_enriched.csv", not "..._hmm_enriched.csv".
+            if bool(_mcfg.get("kinematic_directedness_enabled", False)):
+                try:
+                    _centroid_xy = np.column_stack([
+                        xy[:, 0::2].mean(axis=1), xy[:, 1::2].mean(axis=1)])
+                    _bd_enriched = compute_bout_directedness(bd, _centroid_xy, fps)
+                    _bd_enriched.to_csv(
+                        str(engine._out_bouts / f"{fp.stem}_bout_lengths_enriched.csv"),
+                        index=False)
+                except Exception:
+                    log(f"  [WARN] kinematic directedness sidecar "
+                        f"({fp.stem}): {traceback.format_exc()}")
             fd    = pd.DataFrame({"frame": np.arange(len(fl)),
                                   "time_s": np.arange(len(fl)) / fps,
                                   "label": fl})
