@@ -91,6 +91,13 @@ _CORE_ERR    = ""
 PipelineLogger = BSoidEngine = run_bsoid_prep = run_bsoid_prep_batch = None
 filter_dlc_h5 = cleanup_video_byproducts = create_umap_evolution_video = None
 find_dlc_files = peek_dlc_bodyparts = group_bodyparts_by_region = None
+# v6 part 2 (Environmental_Context_v6_Implementation_Plan.md Step 2):
+# resolve_env_shapes + the paradigm/role vocabulary constants are the single
+# source of truth shared with cube_core.py's compute_session_env_context();
+# EnvContextWindow's paradigm screen, role dropdowns, and naming suggestions
+# read directly from these rather than duplicating the vocabulary here.
+resolve_env_shapes = None
+ENV_PARADIGMS = ENV_PARADIGM_ROLE_VOCAB = ENV_PARADIGM_MIN_ROLES = None
 
 #  " "   optional companion scripts  " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " " "
 HERE = Path(__file__).resolve().parent
@@ -3588,6 +3595,12 @@ class AdvancedCUBEWindow(tk.Toplevel):
         hdbscan_split_max_subclusters = 3,
         hdbscan_split_min_points     = 250,
         recluster_max_iterations     = 2,
+        # Environmental context & object interaction (v6 part 2). env_arena_cfg
+        # and env_interaction_threshold are NOT simple scalar widgets (a
+        # nested dict and an optional-float respectively) so they bypass the
+        # generic self._vars loop entirely, same as bodypart_weights above —
+        # see self._env_arena_cfg / _open_env_context / _apply below.
+        env_features_enabled  = False,
     )
     try:
         # Engine defaults win for every shared key; GUI-only keys persist.
@@ -3784,6 +3797,45 @@ class AdvancedCUBEWindow(tk.Toplevel):
                   relief="flat", padx=10, pady=4, cursor="hand2",
                   command=self._open_bodypart_weights).pack(anchor="w", padx=8, pady=(4, 0))
         self._bpw_status.pack(anchor="w", padx=8, pady=(0, 4))
+
+        # ── Environmental context & object interaction (v6 part 2) ─────────────
+        s_env = _adv_section(p, "ENVIRONMENTAL CONTEXT  (opt-in)", C["cyan"])
+        _env_row = tk.Frame(s_env, bg=C["card"])
+        _env_row.pack(anchor="w", padx=8, pady=(2, 0), fill="x")
+        _env_v = self._v("env_features_enabled",
+                          tk.BooleanVar(value=bool(self.DEFAULTS.get(
+                              "env_features_enabled", False))))
+        tk.Checkbutton(_env_row, text="Enable environmental context features",
+                        variable=_env_v, bg=C["card"], fg=C["green"],
+                        selectcolor=C["card2"], activebackground=C["card"],
+                        command=self._refresh_env_status).pack(side="left")
+        tk.Label(s_env,
+                 text="    Trace an arena boundary / regions / objects and pick a behavioral\n"
+                      "    paradigm; adds region/object time, entries, and paradigm-specific\n"
+                      "    indices (alternation %, discrimination index, etc). Off by default --\n"
+                      "    with the checkbox unticked, nothing about this feature runs or is\n"
+                      "    written, and output is byte-identical to a pre-this-feature run.",
+                 font=("Segoe UI", 7), bg=C["card"],
+                 fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
+        _thr_row = tk.Frame(s_env, bg=C["card"])
+        _thr_row.pack(anchor="w", padx=8, pady=(2, 0))
+        tk.Label(_thr_row, text="Interaction threshold (px, blank = auto):",
+                 font=("Segoe UI", 8), bg=C["card"], fg=C["text"]).pack(side="left")
+        self._env_thresh_var = tk.StringVar(value="")
+        tk.Entry(_thr_row, textvariable=self._env_thresh_var, width=8,
+                 bg=C["card2"], fg=C["text"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(6, 0))
+        self._env_status = tk.Label(s_env, text="Arena: not configured",
+                                     font=("Segoe UI", 7, "italic"),
+                                     bg=C["card"], fg=C["dim"])
+        self._env_btn = tk.Button(
+            s_env, text="Environmental Context...",
+            font=("Segoe UI", 9), bg=C["btn"], fg=C["yellow"],
+            relief="flat", padx=10, pady=4, cursor="hand2",
+            command=self._open_env_context)
+        self._env_btn.pack(anchor="w", padx=8, pady=(6, 0))
+        self._env_status.pack(anchor="w", padx=8, pady=(0, 4))
+        self._env_arena_cfg: "dict | None" = None
 
         # ── UMAP ─────────────────────────────────────────────────────────────
         s2 = _adv_section(p, "UMAP EMBEDDING  (Hsu & Yttri 2021 reference)", C["cyan"])
@@ -4067,6 +4119,44 @@ class AdvancedCUBEWindow(tk.Toplevel):
                     pass
         self._bodypart_weights = dict(cfg.get("bodypart_weights") or {})
         self._refresh_bpw_status()
+        self._env_arena_cfg = cfg.get("env_arena_cfg") or None
+        _thr = cfg.get("env_interaction_threshold")
+        self._env_thresh_var.set("" if _thr is None else str(_thr))
+        self._refresh_env_status()
+
+    def _refresh_env_status(self):
+        if not hasattr(self, "_env_status"):
+            return
+        enabled = bool(self._vars.get(
+            "env_features_enabled",
+            tk.BooleanVar(value=False)).get()) if "env_features_enabled" in self._vars else False
+        self._env_btn.configure(state=("normal" if enabled else "disabled"))
+        if not enabled:
+            self._env_status.configure(text="Arena: not configured (enable the checkbox above)")
+            return
+        cfg = self._env_arena_cfg or {}
+        n_reg = len((cfg.get("reference_shapes") or {}).get("regions") or [])
+        n_obj = len((cfg.get("reference_shapes") or {}).get("objects") or [])
+        has_bound = bool((cfg.get("reference_shapes") or {}).get("boundary"))
+        if not cfg or (n_reg == 0 and n_obj == 0 and not has_bound):
+            self._env_status.configure(text="Arena: not configured yet")
+        else:
+            self._env_status.configure(
+                text=f"Arena: {cfg.get('paradigm', 'custom')} paradigm, "
+                     f"{n_reg} region(s), {n_obj} object(s)"
+                     f"{' + boundary' if has_bound else ''}")
+
+    def _open_env_context(self):
+        try:
+            win = EnvContextWindow(self, self._session, self._env_arena_cfg)
+            self.wait_window(win)
+            result = getattr(win, "result", None)
+            if result is not None:      # None = Cancel; keep previous config
+                self._env_arena_cfg = result
+            self._refresh_env_status()
+        except Exception as e:
+            messagebox.showerror("Environmental Context",
+                                  f"Could not open the environmental context editor:\n{e}")
 
     def _refresh_bpw_status(self):
         if not hasattr(self, "_bpw_status"):
@@ -4131,6 +4221,16 @@ class AdvancedCUBEWindow(tk.Toplevel):
             if default is None or val != default:
                 cfg[k] = val
         cfg["bodypart_weights"] = getattr(self, "_bodypart_weights", {}) or {}
+        _env_cfg = getattr(self, "_env_arena_cfg", None)
+        if _env_cfg:
+            cfg["env_arena_cfg"] = _env_cfg
+        _thr_raw = (getattr(self, "_env_thresh_var", None).get()
+                    if hasattr(self, "_env_thresh_var") else "").strip()
+        if _thr_raw:
+            try:
+                cfg["env_interaction_threshold"] = float(_thr_raw)
+            except ValueError:
+                pass
         self._session["engine_cfg"] = cfg
         self.destroy()
 
@@ -6636,6 +6736,7 @@ def _deferred_imports():
     global PipelineLogger, BSoidEngine, run_bsoid_prep, run_bsoid_prep_batch
     global filter_dlc_h5, cleanup_video_byproducts, create_umap_evolution_video
     global find_dlc_files, peek_dlc_bodyparts, group_bodyparts_by_region
+    global resolve_env_shapes, ENV_PARADIGMS, ENV_PARADIGM_ROLE_VOCAB, ENV_PARADIGM_MIN_ROLES
     global _MOD_VIDEO, _PATH_VIDEO, _MOD_ANALYSER, _PATH_ANALYSER
 
     try:
@@ -6643,6 +6744,8 @@ def _deferred_imports():
             PipelineLogger, BSoidEngine, run_bsoid_prep, run_bsoid_prep_batch,
             filter_dlc_h5, cleanup_video_byproducts, create_umap_evolution_video,
             find_dlc_files, peek_dlc_bodyparts, group_bodyparts_by_region,
+            resolve_env_shapes, ENV_PARADIGMS, ENV_PARADIGM_ROLE_VOCAB,
+            ENV_PARADIGM_MIN_ROLES,
         )
         CORE_OK = True
     except ImportError as _ce:
