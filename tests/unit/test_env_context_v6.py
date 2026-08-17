@@ -233,7 +233,9 @@ class TestDetectApproachAvoidEvents:
             "mean_speed_px_s": [200.0, 3.0, 4.0],
         })
 
-    def _env_pb(self, n_bins=37):
+    def _env_pb_approach(self, n_bins=37):
+        # object far (50.0, > default 50px threshold boundary... exactly at
+        # it) at the start of bout0, close (5.0) by its terminal window.
         dist = [50.0] * n_bins
         for b in range(8, 12):
             if b < n_bins:
@@ -241,22 +243,59 @@ class TestDetectApproachAvoidEvents:
         return {"current_region": [None] * n_bins,
                 "dist_to_nearest_object_nose": {"Obj A": dist}}
 
-    def test_detects_one_event_with_correct_target(self):
-        out = cc.detect_approach_avoid_events(self._bout_df(), self._env_pb(), self.FPS, self.WIN)
-        assert len(out) == 1
-        row = out.iloc[0]
-        assert row["approach_target_object"] == "Obj A"
+    def _env_pb_avoid(self, n_bins=30):
+        # object close (5.0) at the start of bout0 (bins 0-1), far (100.0) by
+        # its terminal window (bins 8-9, bout0 spans frames 0-29 = bins 0-9).
+        dist = [50.0] * n_bins
+        for b in (0, 1):
+            dist[b] = 5.0
+        for b in (8, 9):
+            dist[b] = 100.0
+        return {"current_region": [None] * n_bins,
+                "dist_to_nearest_object_nose": {"Obj A": dist}}
+
+    def _env_pb_avoid_region(self, n_bins=30):
+        # animal is inside region "R1" at the start of bout0, no longer in
+        # any traced region by its terminal window.
+        current_region = [None] * n_bins
+        current_region[0] = current_region[1] = "R1"
+        return {"current_region": current_region, "dist_to_nearest_object_nose": {}}
+
+    def test_detects_approach_event_with_correct_target(self):
+        out = cc.detect_approach_avoid_events(self._bout_df(), self._env_pb_approach(), self.FPS, self.WIN)
+        approach = out[out["classification"] == "approach"]
+        assert len(approach) == 1
+        row = approach.iloc[0]
+        assert row["target_object"] == "Obj A"
         assert row["start_frame"] == 0 and row["end_frame"] == 29
         assert row["next_bout_label"] == 2
+        assert out[out["classification"] == "avoid"].empty
+
+    def test_detects_avoid_event_with_correct_object_target(self):
+        out = cc.detect_approach_avoid_events(self._bout_df(), self._env_pb_avoid(), self.FPS, self.WIN)
+        avoid = out[out["classification"] == "avoid"]
+        assert len(avoid) == 1
+        row = avoid.iloc[0]
+        assert row["target_object"] == "Obj A"
+        assert row["start_frame"] == 0 and row["end_frame"] == 29
+        # terminal distance (100px) is beyond the closeness gate, so this
+        # bout must NOT also register as an approach toward the same object.
+        assert out[out["classification"] == "approach"].empty
+
+    def test_detects_avoid_event_with_correct_region_target(self):
+        out = cc.detect_approach_avoid_events(self._bout_df(), self._env_pb_avoid_region(), self.FPS, self.WIN)
+        avoid = out[out["classification"] == "avoid"]
+        assert len(avoid) == 1
+        assert avoid.iloc[0]["target_region"] == "R1"
 
     def test_missing_kinematics_columns_is_noop(self):
         df = self._bout_df().drop(columns=["straightness_ratio"])
-        out = cc.detect_approach_avoid_events(df, self._env_pb(), self.FPS, self.WIN)
+        out = cc.detect_approach_avoid_events(df, self._env_pb_approach(), self.FPS, self.WIN)
         assert out.empty
         assert list(out.columns) == [
-            "start_frame", "end_frame", "duration_s", "straightness_ratio",
-            "mean_speed_px_s", "next_bout_label", "next_bout_mean_speed_px_s",
-            "approach_target_region", "approach_target_object"]
+            "start_frame", "end_frame", "duration_s", "classification",
+            "straightness_ratio", "mean_speed_px_s", "next_bout_label",
+            "next_bout_mean_speed_px_s", "target_region", "target_object"]
 
     def test_empty_env_pb_is_noop(self):
         out = cc.detect_approach_avoid_events(self._bout_df(), {}, self.FPS, self.WIN)
@@ -265,5 +304,5 @@ class TestDetectApproachAvoidEvents:
     def test_no_directed_bout_followed_by_slow_bout_yields_no_events(self):
         df = self._bout_df().copy()
         df["straightness_ratio"] = [0.1, 0.1, 0.1]  # nothing qualifies as directed
-        out = cc.detect_approach_avoid_events(df, self._env_pb(), self.FPS, self.WIN)
+        out = cc.detect_approach_avoid_events(df, self._env_pb_approach(), self.FPS, self.WIN)
         assert out.empty

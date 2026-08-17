@@ -4431,7 +4431,12 @@ class EnvContextWindow(tk.Toplevel):
 
         card = tk.Frame(self, bg=C["card"])
         card.pack(fill="both", expand=True, padx=16, pady=(0, 8))
-        var = tk.StringVar(value="open_field")
+        # Pre-select the CURRENT paradigm when re-entering via "Change
+        # Paradigm" on an existing config, rather than always defaulting to
+        # "open_field" -- a user who re-opens this screen just to look
+        # should see their actual current choice highlighted, not a reset.
+        _current_paradigm = (self._cfg.get("paradigm") if self._cfg else None) or "open_field"
+        var = tk.StringVar(value=_current_paradigm)
         for key in ENV_PARADIGMS or list(_ENV_PARADIGM_LABELS.keys()):
             row = tk.Frame(card, bg=C["card"])
             row.pack(anchor="w", fill="x", padx=12, pady=4)
@@ -4444,7 +4449,15 @@ class EnvContextWindow(tk.Toplevel):
         ref_stem = others[0][0] if others else "reference"
 
         def _confirm():
-            self._cfg = self._new_cfg(var.get(), ref_stem)
+            # Switching paradigm on an EXISTING config must never delete
+            # already-traced reference_shapes/per_video (per the plan's Step 1
+            # non-destructive-switch requirement, and this screen's own
+            # confirmation dialog text in _change_paradigm below) -- only
+            # build a fresh config from scratch on true first-time setup.
+            if self._cfg:
+                self._cfg["paradigm"] = var.get()
+            else:
+                self._cfg = self._new_cfg(var.get(), ref_stem)
             self._build_main_ui()
 
         btn_f = tk.Frame(self, bg=C["bg"])
@@ -5043,8 +5056,19 @@ class EnvContextWindow(tk.Toplevel):
                         "shapes": {"boundary": boundary, "regions": regions, "objects": objects},
                         "role_overrides": existing_roles}
         else:
+            # Unchecking discards this video's independent per-shape edits
+            # (reverting to the reference/default alignment) -- confirm
+            # first, same as the explicit "Reset to Reference" button,
+            # rather than silently losing dragged-into-place shapes.
             if stem in pv and pv[stem].get("mode") == "override":
-                del pv[stem]
+                if messagebox.askyesno(
+                        "Discard Individual Shape Edits",
+                        "Turning this off discards this video's independently-adjusted "
+                        "shapes and reverts to the default (reference) alignment. Continue?"):
+                    del pv[stem]
+                else:
+                    self._tab2_edit_var.set(True)
+                    return
         self._refresh_tab2_canvas()
         self._refresh_tab2_list()
 

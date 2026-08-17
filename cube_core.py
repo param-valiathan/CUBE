@@ -4573,7 +4573,8 @@ def _compute_env_derived_metrics(paradigm: str, regions: list,
 def detect_approach_avoid_events(bout_df: "pd.DataFrame", env_pb: dict, fps: float,
                                   win: int, straightness_thresh: float = 0.6,
                                   low_speed_pct: float = 50.0,
-                                  terminal_bins: int = 2) -> "pd.DataFrame":
+                                  terminal_bins: int = 2,
+                                  interaction_threshold_px: float = 50.0) -> "pd.DataFrame":
     """
     Rule-based approach/avoid event detector (v6 part 2, Step 7 / Phase 3.5).
     Pure function -- no new fusion, no new environmental computation: reuses
@@ -4582,37 +4583,54 @@ def detect_approach_avoid_events(bout_df: "pd.DataFrame", env_pb: dict, fps: flo
     through Kinematic_Transition_v6_Implementation_Plan.md's
     compute_bout_directedness()) and Step 4's per-bin region/object distance
     series (env_pb, compute_session_env_context()'s "per_bin" output), joined
-    via enrich_bouts_from_bin_source() applied to just the LAST
-    terminal_bins bins of each candidate bout (its terminal window) rather
-    than a whole-bout average, so the reported approach target reflects
-    where the bout was actually heading, not diluted by its earlier frames.
+    via enrich_bouts_from_bin_source() applied to just the bout's INITIAL and
+    TERMINAL windows (first/last terminal_bins bins) rather than a
+    whole-bout average, so both directions of movement are judged from where
+    the bout actually started/ended, not diluted by its middle frames.
 
-    Rule: a bout is "directed locomotion" if straightness_ratio >=
-    straightness_thresh AND mean_speed_px_s is at/above this bout table's
-    own low_speed_pct percentile (default: median -- "faster than a typical
-    bout in this session", a session-relative threshold rather than an
-    arbitrary absolute pixel speed). A detected approach EVENT additionally
-    requires the immediately following bout to be "investigation-type":
-    mean_speed_px_s below that same percentile. This codebase has no
-    separate HMM state/syntax classifier of "investigation" states to key
-    off (the plan's "existing HMM state/syntax info" phrasing), so bout-own
-    speed is the rule-based proxy used here -- flagged explicitly since this
-    is a simplification of the plan's literal wording, not a literal reuse
-    of an existing classifier that doesn't exist in this codebase.
+    Both directions share the same "directed locomotion" gate: straightness
+    _ratio >= straightness_thresh AND mean_speed_px_s at/above this bout
+    table's own low_speed_pct percentile (default: median -- "faster than a
+    typical bout in this session," a session-relative threshold rather than
+    an arbitrary absolute pixel speed). A single directed-locomotion bout
+    can independently produce an "approach" row, an "avoid" row, both, or
+    neither -- they are not mutually exclusive (e.g. a bout can approach one
+    object while leaving a region at the same time).
 
-    Returns a DataFrame (possibly empty, same columns either way) with one
-    row per detected approach event: start_frame, end_frame, duration_s,
-    straightness_ratio, mean_speed_px_s, next_bout_label,
-    next_bout_mean_speed_px_s, approach_target_region,
-    approach_target_object. Region/object targets are None when nothing
-    resolvable at the bout's terminal window. Returns an empty (zero-row,
-    correctly-columned) DataFrame when bout_df lacks the required kinematics
-    columns or env_pb has no usable region/object series -- both real no-op
-    preconditions, not errors.
+    - **approach**: additionally requires the immediately following bout to
+      be "investigation-type" (mean_speed_px_s below the same percentile).
+      Target = whichever traced region/object is closest at the terminal
+      window (region: current region; object: minimum mean nose-to-object
+      distance, and only counted if that distance is actually within
+      interaction_threshold_px -- "nearest of several far-away objects"
+      is not a meaningful approach target). This codebase has no separate HMM
+      state/syntax classifier of "investigation" states to key off (the
+      plan's "existing HMM state/syntax info" phrasing), so bout-own speed
+      is the rule-based proxy used here.
+    - **avoid**: for each traced object, if the mean nose-to-object distance
+      at the bout's INITIAL window was within interaction_threshold_px (the
+      animal started the bout near it) and increased by the terminal
+      window (net retreat), that object is a candidate avoid target -- the
+      one with the largest increase wins. Independently, if current_region
+      at the initial window was a named region and current_region at the
+      terminal window is a *different* region (or none), that initial
+      region is reported as an avoided region (the animal left it during a
+      directed-locomotion bout). No following-bout requirement -- fleeing
+      is not expected to be followed by investigation.
+
+    Returns a DataFrame (possibly empty, same columns either way), one row
+    per detected event: start_frame, end_frame, duration_s, classification
+    ("approach"|"avoid"), straightness_ratio, mean_speed_px_s,
+    next_bout_label, next_bout_mean_speed_px_s (context; not part of the
+    avoid rule), target_region, target_object. A row's target_region and/or
+    target_object may be None when only one of the two resolved. Returns an
+    empty (zero-row, correctly-columned) DataFrame when bout_df lacks the
+    required kinematics columns or env_pb has no usable region/object
+    series -- both real no-op preconditions, not errors.
     """
-    _cols = ["start_frame", "end_frame", "duration_s", "straightness_ratio",
-             "mean_speed_px_s", "next_bout_label", "next_bout_mean_speed_px_s",
-             "approach_target_region", "approach_target_object"]
+    _cols = ["start_frame", "end_frame", "duration_s", "classification",
+             "straightness_ratio", "mean_speed_px_s", "next_bout_label",
+             "next_bout_mean_speed_px_s", "target_region", "target_object"]
     if bout_df is None or bout_df.empty or \
        "straightness_ratio" not in bout_df.columns or \
        "mean_speed_px_s" not in bout_df.columns:
@@ -4627,24 +4645,10 @@ def detect_approach_avoid_events(bout_df: "pd.DataFrame", env_pb: dict, fps: flo
                    & (speed >= speed_thresh))
     next_speed = speed.shift(-1)
     next_is_investigation = next_speed < speed_thresh
-    is_event = is_directed & next_is_investigation & next_speed.notna()
 
-    event_idx = df.index[is_event].tolist()
-    if not event_idx:
+    directed_idx = df.index[is_directed].tolist()
+    if not directed_idx:
         return pd.DataFrame(columns=_cols)
-
-    start_frames = df["Start time (frames)"].astype(int)
-    run_lens     = df["Run lengths"].astype(int)
-    term_rows = []
-    for i in event_idx:
-        sf, rl = int(start_frames[i]), int(run_lens[i])
-        ef = sf + rl - 1
-        term_len_frames = max(1, terminal_bins * win)
-        term_sf = max(sf, ef - term_len_frames + 1)
-        term_rows.append({"B-SOiD labels": int(df.loc[i, "B-SOiD labels"]),
-                           "Start time (frames)": term_sf,
-                           "Run lengths": ef - term_sf + 1})
-    term_df = pd.DataFrame(term_rows)
 
     region_names = sorted({v for v in (env_pb.get("current_region") or [])
                             if v is not None})
@@ -4652,42 +4656,95 @@ def detect_approach_avoid_events(bout_df: "pd.DataFrame", env_pb: dict, fps: flo
     if not region_names and not object_names:
         return pd.DataFrame(columns=_cols)
 
-    src, agg, out_names = {}, {}, {}
-    if region_names:
-        src["current_region"] = np.array(env_pb.get("current_region") or [], dtype=object)
-        agg["current_region"] = lambda seg: (
-            pd.Series([v for v in seg if v is not None]).mode().iloc[0]
-            if len(seg) and any(v is not None for v in seg) else None)
-        out_names["current_region"] = "approach_target_region"
-    for _on in object_names:
-        _k = f"dist__{_on}"
-        src[_k] = np.array(env_pb["dist_to_nearest_object_nose"].get(_on, []), dtype=float)
-        agg[_k] = np.nanmean
-        out_names[_k] = f"__meandist__{_on}"
+    start_frames = df["Start time (frames)"].astype(int)
+    run_lens     = df["Run lengths"].astype(int)
 
-    joined = enrich_bouts_from_bin_source(
-        term_df, src, bin_offset=0, win=win, agg_fns=agg, out_col_names=out_names)
+    def _window_df(indices, from_start: bool) -> pd.DataFrame:
+        rows = []
+        wlen = max(1, terminal_bins * win)
+        for i in indices:
+            sf, rl = int(start_frames[i]), int(run_lens[i])
+            ef = sf + rl - 1
+            if from_start:
+                w_sf, w_ef = sf, min(ef, sf + wlen - 1)
+            else:
+                w_sf, w_ef = max(sf, ef - wlen + 1), ef
+            rows.append({"B-SOiD labels": int(df.loc[i, "B-SOiD labels"]),
+                         "Start time (frames)": w_sf,
+                         "Run lengths": w_ef - w_sf + 1})
+        return pd.DataFrame(rows)
 
-    dist_cols = [c for c in joined.columns if c.startswith("__meandist__")]
-    approach_target_object = []
-    for _, row in joined.iterrows():
-        vals = {c[len("__meandist__"):]: row[c] for c in dist_cols if pd.notna(row[c])}
-        approach_target_object.append(min(vals, key=vals.get) if vals else None)
+    def _join(window_df: pd.DataFrame) -> pd.DataFrame:
+        src, agg, out_names = {}, {}, {}
+        if region_names:
+            src["current_region"] = np.array(env_pb.get("current_region") or [], dtype=object)
+            agg["current_region"] = lambda seg: (
+                pd.Series([v for v in seg if v is not None]).mode().iloc[0]
+                if len(seg) and any(v is not None for v in seg) else None)
+            out_names["current_region"] = "region"
+        for _on in object_names:
+            _k = f"dist__{_on}"
+            src[_k] = np.array(env_pb["dist_to_nearest_object_nose"].get(_on, []), dtype=float)
+            agg[_k] = np.nanmean
+            out_names[_k] = f"__dist__{_on}"
+        return enrich_bouts_from_bin_source(
+            window_df, src, bin_offset=0, win=win, agg_fns=agg, out_col_names=out_names)
+
+    initial_join  = _join(_window_df(directed_idx, from_start=True))
+    terminal_join = _join(_window_df(directed_idx, from_start=False))
+    dist_cols = [c for c in terminal_join.columns if c.startswith("__dist__")]
 
     out_rows = []
-    for j, i in enumerate(event_idx):
+    for j, i in enumerate(directed_idx):
         sf, rl = int(start_frames[i]), int(run_lens[i])
-        out_rows.append({
-            "start_frame": sf, "end_frame": sf + rl - 1,
-            "duration_s": rl / fps,
-            "straightness_ratio": float(df.loc[i, "straightness_ratio"]),
-            "mean_speed_px_s": float(df.loc[i, "mean_speed_px_s"]),
-            "next_bout_label": int(df.loc[i + 1, "B-SOiD labels"]),
-            "next_bout_mean_speed_px_s": float(next_speed.loc[i]),
-            "approach_target_region": (joined.loc[j, "approach_target_region"]
-                                        if "approach_target_region" in joined.columns else None),
-            "approach_target_object": approach_target_object[j],
-        })
+        base = dict(
+            start_frame=sf, end_frame=sf + rl - 1, duration_s=rl / fps,
+            straightness_ratio=float(df.loc[i, "straightness_ratio"]),
+            mean_speed_px_s=float(df.loc[i, "mean_speed_px_s"]),
+            next_bout_label=(int(df.loc[i + 1, "B-SOiD labels"]) if i + 1 < len(df) else None),
+            next_bout_mean_speed_px_s=(float(next_speed.loc[i])
+                                        if pd.notna(next_speed.loc[i]) else None))
+
+        # -- approach: next bout investigation-type, target = closest at
+        #    terminal window AND actually within interaction_threshold_px
+        #    (otherwise "nearest of several far-away objects" would get
+        #    reported as an approach target, which isn't a meaningful claim).
+        if i + 1 < len(df) and bool(next_is_investigation.loc[i]) and pd.notna(next_speed.loc[i]):
+            vals = {c[len("__dist__"):]: terminal_join.loc[j, c] for c in dist_cols
+                    if pd.notna(terminal_join.loc[j, c])
+                    and terminal_join.loc[j, c] <= interaction_threshold_px}
+            approach_obj = min(vals, key=vals.get) if vals else None
+            approach_region = (terminal_join.loc[j, "region"]
+                                if "region" in terminal_join.columns
+                                and pd.notna(terminal_join.loc[j, "region"]) else None)
+            if approach_obj is not None or approach_region is not None:
+                row = dict(base, classification="approach",
+                           target_region=approach_region, target_object=approach_obj)
+                out_rows.append(row)
+
+        # -- avoid: object near at the start, meaningfully farther by the end
+        avoid_obj, avoid_delta = None, 0.0
+        for c in dist_cols:
+            d0 = initial_join.loc[j, c] if c in initial_join.columns else np.nan
+            d1 = terminal_join.loc[j, c] if c in terminal_join.columns else np.nan
+            if pd.notna(d0) and pd.notna(d1) and d0 <= interaction_threshold_px:
+                delta = d1 - d0
+                if delta > 0 and delta > avoid_delta:
+                    avoid_obj, avoid_delta = c[len("__dist__"):], delta
+        # -- avoid: was inside a named region at the start, not inside it by the end
+        avoid_region = None
+        if "region" in initial_join.columns and "region" in terminal_join.columns:
+            r0 = initial_join.loc[j, "region"]
+            r1 = terminal_join.loc[j, "region"]
+            if pd.notna(r0) and r0 is not None and r0 != r1:
+                avoid_region = r0
+        if avoid_obj is not None or avoid_region is not None:
+            row = dict(base, classification="avoid",
+                       target_region=avoid_region, target_object=avoid_obj)
+            out_rows.append(row)
+
+    if not out_rows:
+        return pd.DataFrame(columns=_cols)
     return pd.DataFrame(out_rows, columns=_cols)
 
 
@@ -11004,7 +11061,10 @@ class BSoidEngine:
                             _win_bin = max(1, int(round(
                                 _file_fps * (_env_sec.get("bin_ms", 100.0) / 1000.0))))
                             _approach_df = detect_approach_avoid_events(
-                                _bout_hmm_enriched, _env_pb, _file_fps, _win_bin)
+                                _bout_hmm_enriched, _env_pb, _file_fps, _win_bin,
+                                interaction_threshold_px=float(
+                                    (_env_sec.get("summary") or {}).get(
+                                        "interaction_threshold_px", 50.0)))
                             if not _approach_df.empty:
                                 _approach_df.to_csv(
                                     str(self._out_bouts /
