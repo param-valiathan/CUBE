@@ -1,0 +1,15 @@
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "slow: marks tests as slow (end-to-end regression, deselect with -m \"not slow\")",
+    "integration: marks tests that exercise multiple CUBE stages together",
+]
+addopts = "-ra"
+
+[tool.coverage.run]
+source = ["cube_core", "cube_analyser"]
+omit = ["tests/*"]

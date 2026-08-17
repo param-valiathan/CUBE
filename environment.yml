@@ -1,0 +1,21 @@
+name: CUBE
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - numpy=2.4.*
+  - pandas=2.3.*
+  - scipy=1.17.*
+  - scikit-learn=1.8.*
+  - hdbscan=0.8.*
+  - pip:
+      - pillow
+      - opencv-python-headless
+      - umap-learn==0.5.12
+      - customtkinter==5.2.2
+      - plotly==6.8.0
+      - hmmlearn==0.3.3
+      - pytest
+      - pytest-cov
