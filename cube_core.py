@@ -5113,7 +5113,8 @@ def plot_cluster_volatility(sweep: dict, out_path: Path):
 
 
 def plot_cluster_hierarchy(feats_sc, labels, out_path,
-                            bodypart_names=None, linkage_method="ward"):
+                            bodypart_names=None, linkage_method="ward",
+                            centroid_out_path=None):
     """
     Dendrogram of the production clustering result's cluster centroids in
     standardized feature space.  Deliberately uses feature-space distance
@@ -5152,6 +5153,14 @@ def plot_cluster_hierarchy(feats_sc, labels, out_path,
 
     sizes = {c: int((labels == c).sum()) for c in uniq}
     centroids = np.vstack([X[labels == c].mean(axis=0) for c in uniq])
+
+    if centroid_out_path is not None:
+        try:
+            np.savez(centroid_out_path, centroids=centroids,
+                     cluster_ids=np.array(uniq),
+                     linkage_method=np.array(linkage_method))
+        except Exception:
+            pass
 
     Z = linkage(centroids, method=linkage_method)
     leaf_labels = [f"C{c}" for c in uniq]
@@ -8043,7 +8052,21 @@ class BSoidEngine:
         auto_resource_management        = True,
         system_resource_target_pct      = 0.65,   # ideal sustained (60-70% band)
         system_resource_cap_pct         = 0.80,   # hard ceiling, never exceeded
-        hdbscan_sweep_n_jobs            = -1,     # primary sweep parallel workers
+        # hdbscan_sweep_n_jobs: default changed -1 -> 1 (sequential) Aug 2026
+        # after a real crash_diagnostics.log capture of this exact call site
+        # (run_hdbscan's primary sweep, not seed_sweep/consensus) faulting with
+        # "Windows fatal exception: code 0xc0000374" (heap corruption) despite
+        # the _numba_single_thread/_blas_single_thread_for_dispatch
+        # oversubscription guards around _fit_one. seed_sweep_n_jobs and
+        # consensus_n_jobs were already made sequential for the identical
+        # crash signature -- this brings the primary sweep in line with those
+        # two rather than leaving it as the one remaining parallel call site
+        # with the same underlying hazard (joblib threading backend + numba
+        # JIT + HDBSCAN's Cython core all contending under threads on
+        # Windows). Not reliably reproducible on demand, so this is a safety
+        # margin rather than a pinned-down fix, matching the rationale
+        # already applied to seed_sweep_n_jobs/consensus_n_jobs.
+        hdbscan_sweep_n_jobs            = 1,
     )
 
     # Pre-2.1 numeric defaults, restored when cfg["compat_mode"] == "legacy_v2"
@@ -9376,9 +9399,13 @@ class BSoidEngine:
                         plot_cluster_hierarchy(
                             feats_sc.T, hdb_labels,
                             self._out_plots / f"cluster_hierarchy_{_theme_name}.png",
-                            linkage_method=str(self._cfg.get("cluster_hierarchy_linkage", "ward")))
+                            linkage_method=str(self._cfg.get("cluster_hierarchy_linkage", "ward")),
+                            centroid_out_path=(
+                                self._out_model / "cluster_feature_centroids.npz"
+                                if _theme_name == "dark" else None))
                     self._log("  [PLOT] cluster_hierarchy_dark.png + "
                               "cluster_hierarchy_light.png saved")
+                    self._log("  [PLOT] cluster_feature_centroids.npz saved")
                 except Exception:
                     self._log(f"  [WARN] cluster_hierarchy plot: "
                               f"{traceback.format_exc()}")
