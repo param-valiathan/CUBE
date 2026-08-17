@@ -18943,6 +18943,66 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         figs.extend(self._region_crosstab_figs(sessions, t))
         self._show_figures(figs)
 
+    # ── Save All Results integration (BSOiDApp._save_all_results) ──────
+
+    def save_all_figures(self, out_dir: "pathlib.Path", ts: str) -> int:
+        """Generate and save every sub-view's figures to out_dir, mirroring
+        BehavioralExplorerPanel/GroupPredictorPanel's save_all_figures
+        contract used by BSOiDApp._save_all_results. Sub-views with no
+        applicable data for the loaded sessions (paradigm mismatch, no
+        approach/avoid events detected, etc.) are skipped, not errored --
+        same logic _render_current_view() already applies on-screen.
+        Restores whatever sub-view/figures were on screen before returning,
+        so calling Save All Results doesn't change what the user was
+        looking at. Returns the number of figures saved."""
+        if not self._sessions:
+            self._sessions = self._load_sessions()
+        if not any(s["env_ctx"] for s in self._sessions):
+            return 0
+        out_dir.mkdir(parents=True, exist_ok=True)
+        original_view = self._view_var.get()
+        n = 0
+        for view in self._VIEWS:
+            self._view_var.set(view)
+            try:
+                self._render_current_view()
+            except Exception:
+                continue
+            figs = self._current_figs
+            if not figs:
+                continue
+            slug = view.replace("/", "-").replace(" ", "_").lower()
+            for i, fig in enumerate(figs):
+                fig.savefig(str(out_dir / f"paradigm_{slug}_{i}_{ts}.png"),
+                            dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor())
+                n += 1
+        self._view_var.set(original_view)
+        try:
+            self._render_current_view()
+        except Exception:
+            pass
+        return n
+
+    def export_csv_data(self, out_dir: "pathlib.Path") -> int:
+        """Export each loaded session's paradigm + derived-metric summary to
+        one CSV alongside save_all_figures' PNGs. Returns 1 if written, 0
+        if no session has environmental context data."""
+        if not self._sessions:
+            self._sessions = self._load_sessions()
+        with_env = [s for s in self._sessions if s["env_ctx"]]
+        if not with_env:
+            return 0
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rows = []
+        for s in with_env:
+            row = {"session": s["name"], "exp_group": s["exp_group"],
+                   "subject_id": s["subject_id"],
+                   "paradigm": s["env_ctx"].get("paradigm")}
+            row.update(s["env_ctx"].get("derived", {}) or {})
+            rows.append(row)
+        pd.DataFrame(rows).to_csv(out_dir / "paradigm_derived_metrics.csv", index=False)
+        return 1
+
 
 #
 # MAIN APPLICATION
@@ -20013,6 +20073,21 @@ class BSOiDApp(ctk.CTk):
                 skipped.append("Behavioral Explorer — generate a plot first")
         except Exception as exc:
             skipped.append(f"Behavioral Explorer — {exc}")
+
+        # ── Paradigm Results ──────────────────────────────────────────────
+        out_paradigm = out_root / "paradigm_results"
+        try:
+            n_figs = self._paradigm_panel.save_all_figures(out_paradigm, ts)
+            n_csv  = self._paradigm_panel.export_csv_data(out_paradigm)
+            if n_figs or n_csv:
+                saved.append(
+                    f"Paradigm Results ({n_figs} figure(s), {n_csv} CSV(s))")
+            else:
+                skipped.append(
+                    "Paradigm Results — no environmental context data for "
+                    "any loaded session")
+        except Exception as exc:
+            skipped.append(f"Paradigm Results — {exc}")
 
         # ── Summary message ───────────────────────────────────────────────
         msg = f"Results saved to:\n{out_root}\n"
