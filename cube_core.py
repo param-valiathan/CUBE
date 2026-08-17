@@ -9525,6 +9525,30 @@ class BSoidEngine:
         except Exception:
             pass
 
+        # v6 part 2 (Environmental_Context_v6_Implementation_Plan.md Step 5):
+        # session_env_context.json -- NOT written at all when
+        # env_features_enabled is False (not even empty), matching the
+        # "Opt-in guarantee" section's requirement that a user who never
+        # opens EnvContextWindow sees zero new files in model/. When the flag
+        # IS on, per-session entries are still {} for any session lacking
+        # traced shapes (env_arena_cfg unset or no reference_shapes) -- the
+        # flag-on-but-empty no-op case produces an (almost) empty JSON file,
+        # not a crash and not a skipped write.
+        if bool(self._cfg.get("env_features_enabled", False)):
+            try:
+                _env_ctx: dict = {}
+                for _nm, _xy_k, _fps_k, _envcfg in zip(
+                        all_names, all_xy, all_fps_list, all_env_cfg):
+                    _env_ctx[_nm] = compute_session_env_context(
+                        _envcfg, _nm, _xy_k[:, 0::2], _xy_k[:, 1::2], bps_ref,
+                        _fps_k,
+                        interaction_threshold=self._cfg.get("env_interaction_threshold"))
+                (self._out_model / "session_env_context.json").write_text(
+                    json.dumps(_env_ctx, indent=2, default=str))
+            except Exception:
+                self._log(f"  [WARN] session_env_context.json export failed:\n"
+                          f"  {traceback.format_exc()}")
+
         # Use the full dataset when it is small enough (avoids UMAP over-smoothing
         # caused by a large n_neighbors/N_sample ratio); subsample only for large
         # recordings where UMAP runtime becomes a bottleneck.
