@@ -80,7 +80,7 @@ Or run `install_shortcut.ps1` once to create a desktop shortcut.
 | **2** | `cube_core.py` | Load, normalise, filter DLC output; bodypart conservation; confidence report |
 | **3** | `cube_core.py` | Feature extraction → UMAP → HDBSCAN sweep → MLP → HMM smoothing. Optional **Body-Region Weights** panel (Advanced Settings) lets you up/down-weight Head/Mouth, Forelimbs, Hindlimbs, Trunk/Back, Neck, or Tail before clustering |
 | **4** | `cube_video_explorer.py` | Annotate clusters by watching example video clips |
-| **5** | `cube_analyser.py` | Group statistics, ethograms, transition analyses, Group Predictor |
+| **5** | `cube_analyser.py` | Group statistics, ethograms, transition analyses, Group Predictor, Paradigm Results |
 
 See [CUBE_GUIDE.md](CUBE_GUIDE.md) for full details on each step.
 
@@ -557,8 +557,9 @@ With `auto_bsoid = True`, completing the 3D DLC step automatically triggers Step
 - Off by default: with the checkbox unticked, no GUI invitation to configure it, `session_env_context.json`
   is never written (not even empty), and bout-CSV output is byte-identical to a pre-this-feature run.
   Turning the flag on without ever tracing shapes is also a near no-op — empty summaries, no crash.
-- Writes `model/session_env_context.json` (per-bin time series + session summaries + paradigm-gated derived
-  metrics per session — see Output Layout above) and appends region/object columns
+- Writes `model/session_env_context.json` (per-bin time series — including per-bin centroid `x`/`y` position,
+  added for the Paradigm Results tab's occupancy heatmaps (v6 part 3) — plus session summaries and
+  paradigm-gated derived metrics per session — see Output Layout above) and appends region/object columns
   (`pct_time_in_region_<name>`, `pct_time_near_object_<name>`, `mean_heading_angle_to_object_<name>`) to the
   same `*_bout_lengths_hmm_enriched.csv` sidecar the kinematics feature above uses — if both flags are on,
   one sidecar carries both plans' columns with no naming collision.
@@ -574,7 +575,9 @@ With `auto_bsoid = True`, completing the 3D DLC step automatically triggers Step
   check: `EnvContextWindow` always reads video frames through the same crop rectangle DLC tracked on, so
   traced vertices land in the same pixel space as the pose data by construction.
 - See `Environmental_Context_v6_Implementation_Plan.md` and `Environmental_Context_v6_Implementation_Report.md`
-  for the full schema, paradigm/role vocabulary, and verification detail.
+  for the full schema, paradigm/role vocabulary, and verification detail, and
+  `CUBE_Analyser_Paradigm_Reporting_Plan.md` / `Analyser_Paradigm_Reporting_v6_Implementation_Report.md` for
+  how this output is surfaced in the Analyser's Paradigm Results tab (above).
 
 **Iterative split/merge cluster refinement (on by default)**
 - After the HDBSCAN sweep, a bidirectional refinement loop (a) locally re-embeds and re-clusters
@@ -717,6 +720,16 @@ Both Cluster Hierarchy and Guided Merge require `model/cluster_feature_centroids
 - Conditional and nested permutation tests (Phipson & Smyth 2010 p-value correction).
 - Cohen's κ, balanced accuracy, per-animal LOO probability strips, confusion matrices, ROC/AUC curves.
 - Full documentation: [GROUP_PREDICTOR_REFERENCE.md](GROUP_PREDICTOR_REFERENCE.md).
+
+**Paradigm Results tab** (v6 part 3 — requires a run with Environmental Context tracing enabled; see "Environmental context & object interaction" below)
+- Surfaces `session_env_context.json`, the kinematics+env enriched bout sidecar, and `approach_events.csv` as seven sub-views: Generic, Y-Maze Alternation, Elevated Plus Maze, Discrimination Index, Sociability/Social Novelty, Place Preference/CPP, Approach/Avoid Events.
+- Auto-selects the sub-view matching the loaded session's traced paradigm; browsing to a mismatched sub-view (or a session with no environmental context data at all) shows a clear message instead of wrong/empty data — the tab itself is always present, its content is what's data-gated.
+- Every sub-view gets a 2D occupancy density heatmap (region/object outlines are an approximation — the convex hull of positions recorded as belonging to that region/object, since the traced shapes' own vertices aren't exported to any output file) and a shared arena/region cluster-by-region and group-by-region cross-tab (grouped bar chart of % time each HDBSCAN cluster or experimental group spends in each named region).
+- Each paradigm-specific sub-view reports its primary index alongside a **mandatory activity/locomotor control metric** (e.g. total arm entries for Y-Maze/EPM, total exploration time for Discrimination Index, chamber entry frequency for Sociability) so an index difference can't be silently confounded with a general activity difference.
+- New one-sample-vs-reference statistical test (t-test or Wilcoxon signed-rank against a fixed value — chance level for Discrimination Index, zero for CPP's delta score), Benjamini-Hochberg FDR-corrected the same way as every other test in the app, shown with a dagger (†/††/†††) marker distinct from the pink/red star convention used for between-group comparisons.
+- Place Preference/CPP reuses the existing Experimental Design (Independent/Repeated Measures) and Group by controls for its paired pre/post comparison — no separate CPP-specific toggle.
+- Approach/Avoid Events shows a trajectory plot with each detected event drawn as a start→end arrow, color-coded approach (green) vs. avoid (red); this sub-view carries a stronger validation caveat than the others (rule-based heuristic, not yet validated against expert human scoring).
+- Group-aware throughout via the same Label 1/experimental-group-color mechanism every other tab uses. Included in "Save All Results".
 
 ---
 
