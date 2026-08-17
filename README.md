@@ -519,6 +519,32 @@ With `auto_bsoid = True`, completing the 3D DLC step automatically triggers Step
   turned-away (typically 8–15% in validation data), which is a denominator change worth knowing about when
   comparing against pre-feature runs or across animals/groups that may turn away at different rates.
 
+**Per-cluster kinematic signatures in the Analyser (K1, always on)**
+- `cluster_kinematics.csv` (mean centroid speed, body elongation, body-axis angular velocity per cluster —
+  see Output Layout above) is now loaded automatically by `cube_analyser.py` and joined into the per-cluster
+  metrics table alongside `total_duration`/`frequency`/`mean_bout`. The three new metric names
+  (`mean_speed_px_s`, `mean_body_elongation_px`, `mean_angular_velocity_rad_s`) appear in the "Metric:"
+  selector for the Top-N Bar, Volcano, and Heatmap plot modes. Runs predating this file simply show `NaN`
+  for these metrics — no crash, no change to any existing metric. This is a pure data-loading addition with
+  no gating flag (it reads a file that only exists once the pipeline has already produced it).
+
+**Per-bout kinematic directedness (K2, opt-in — `kinematic_directedness_enabled`, default `False`)**
+- When enabled, writes an additional sidecar CSV per session, `<stem>_bout_lengths_hmm_enriched.csv`
+  (see Output Layout above): the canonical 3-column bout schema plus 5 new per-bout columns —
+  `net_displacement_px`, `path_length_px`, `straightness_ratio` (net displacement ÷ path length; ~1.0 =
+  straight-line movement, ~0 = meandering/returning near the start), `mean_speed_px_s`, and
+  `heading_consistency` (mean resultant length of the bout's frame-to-frame heading vectors; 1.0 = every
+  step points the same direction). Bouts shorter than 5 frames skip `straightness_ratio`/
+  `heading_consistency` (`NaN`) rather than reporting a noisy value on too little data.
+- The canonical `*_bout_lengths_hmm.csv` file is **never modified** by this flag, in either state — verified
+  byte-identical whether the flag is on or off. When off (the default), no sidecar file is written at all.
+- `predict_from_saved_model` also honors this flag from the saved model's own config, writing
+  `<stem>_bout_lengths_enriched.csv` (no `_hmm` in the name, since that prediction path has no HMM-smoothed
+  bout variant to pair with).
+- Off by default and stays off unless explicitly enabled — this changes visible output schema, so (per the
+  Kinematic_Transition_v6_Implementation_Plan.md's opt-in guarantee) it never auto-enables based on data
+  characteristics the way `consensus_clustering_enabled`'s auto-threshold trigger does.
+
 **Iterative split/merge cluster refinement (on by default)**
 - After the HDBSCAN sweep, a bidirectional refinement loop (a) locally re-embeds and re-clusters
   low-mean-silhouette ("impure") clusters that mix distinct behaviours (`hdbscan_split_silhouette_thresh`,
@@ -701,6 +727,10 @@ Both Cluster Hierarchy and Guided Merge require `model/cluster_feature_centroids
 <output_dir>/
   bout_lengths/
     <stem>_bout_lengths.csv / _hmm.csv     ← MLP / HMM bouts (preferred: _hmm)
+    <stem>_bout_lengths_hmm_enriched.csv   ← (if kinematic_directedness_enabled) canonical
+                                              3 columns + net_displacement_px, path_length_px,
+                                              straightness_ratio, mean_speed_px_s,
+                                              heading_consistency; never written by default
     <stem>_frame_labels.csv / _hmm.csv     ← per-frame labels
     <stem>_epochs.csv / _hmm.csv
   model/

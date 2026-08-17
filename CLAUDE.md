@@ -99,6 +99,9 @@ The entire analysis is one class, `BSoidEngine` (line ~3955). Its `run()` method
   bout_lengths/
     <stem>_bout_lengths.csv          # raw MLP bouts
     <stem>_bout_lengths_hmm.csv      # HMM-smoothed bouts  (preferred by analyser)
+    <stem>_bout_lengths_hmm_enriched.csv  # (if kinematic_directedness_enabled, off by default)
+                                           # canonical 3 cols + net_displacement_px, path_length_px,
+                                           # straightness_ratio, mean_speed_px_s, heading_consistency
     <stem>_frame_labels.csv          # per-frame: frame,time_s,label
     <stem>_frame_labels_hmm.csv
     <stem>_epochs.csv / _epochs_hmm.csv
@@ -141,6 +144,10 @@ Loads `*_bout_lengths[_hmm].csv` from a user-selected folder → builds per-anim
 ### Compatibility / reproducibility
 
 `BSoidEngine.DEFAULTS["compat_mode"] = "current"` (v2.1). Set `"legacy_v2"` to restore pre-2.1 numeric defaults (different `umap_min_dist`, `hdbscan_mcs_anchor`, `angular_fallback`). Only keys the caller did not explicitly pass are reverted — explicit overrides always win.
+
+### Kinematic directedness (v6 K1/K2, opt-in)
+
+`BSoidEngine.DEFAULTS["kinematic_directedness_enabled"] = False`. When `True`, writes the `*_bout_lengths_hmm_enriched.csv` sidecar above per session (via `compute_bout_directedness()` in `cube_core.py`); the canonical `*_bout_lengths_hmm.csv` is never modified in either state. `enrich_bouts_from_bin_source()` (also in `cube_core.py`, a generalization of `attach_centroid_distance`) is the shared per-bin-to-bout join utility this and the environmental-context work build on. `cube_analyser.py` also unconditionally (no flag) joins `cluster_kinematics.csv`'s per-cluster kinematic signatures into `compute_per_cluster_metrics()`'s output, surfaced in the Top-N Bar/Volcano/Heatmap "Metric:" selector. See `Kinematic_Transition_v6_Implementation_Plan.md` and `Kinematics_v6_Implementation_Report.md` for full detail.
 
 ### Planned 3D dual-camera extension
 
