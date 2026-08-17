@@ -4134,6 +4134,441 @@ def compute_bout_directedness(bout_df: "pd.DataFrame", xy: np.ndarray, fps: floa
     return out
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Environmental context & object interaction (v6 part 2)
+# See Environmental_Context_v6_Implementation_Plan.md. Every function below is
+# pure (no I/O, no self) and gated end-to-end behind
+# BSoidEngine.DEFAULTS["env_features_enabled"] (default False) at the caller.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# schema_version 3 paradigm enum (env_arena_cfg["paradigm"]) -- single source
+# of truth shared by cube.py's EnvContextWindow (role dropdowns, naming
+# suggestions) and the derived-metric functions below.
+ENV_PARADIGMS = (
+    "open_field", "novel_object", "y_maze", "elevated_plus_maze",
+    "three_chamber", "place_preference", "custom",
+)
+
+# Per-paradigm role vocabulary. None = no role dropdown shown / no role-based
+# derived metric for that shape kind under that paradigm.
+ENV_PARADIGM_ROLE_VOCAB = {
+    "open_field":         {"regions": None, "objects": None},
+    "novel_object":       {"regions": None, "objects": ("familiar", "novel")},
+    "y_maze":             {"regions": ("arm", "hub"), "objects": None},
+    "elevated_plus_maze": {"regions": ("open_arm", "closed_arm", "center"), "objects": None},
+    "three_chamber":      {"regions": None, "objects": ("stranger", "empty", "novel_stranger")},
+    "place_preference":   {"regions": ("paired", "unpaired", "neutral"), "objects": None},
+    "custom":             {"regions": None, "objects": None},
+}
+
+# Minimum role-tagged shape counts for each paradigm's specialized derived
+# metric to compute at all (Step 2's non-blocking warning banner, and Step 4's
+# silent-skip guard, both read this table).
+ENV_PARADIGM_MIN_ROLES = {
+    "y_maze":             {"arm": 3},
+    "elevated_plus_maze": {"open_arm": 1, "closed_arm": 1},
+    "novel_object":       {"novel": 1, "familiar": 1},
+    "three_chamber":      {"stranger": 1, "empty": 1},
+    "place_preference":   {"paired": 1, "unpaired": 1},
+}
+
+
+def resolve_env_shapes(env_cfg: "dict | None", stem: str) -> list:
+    """
+    Resolve one session's effective flat shape list from env_arena_cfg
+    (Environmental_Context_v6_Implementation_Plan.md Step 1's schema).
+
+    Starts from reference_shapes, then applies per_video[stem] if present:
+    "transform" mode translates every shape's vertices by [dx, dy];
+    "override" mode substitutes a fully independent shape set for this video.
+    role_overrides (independent of position mode) then replaces individual
+    shapes' "role" by name. A video with no per_video entry inherits the
+    reference shapes and roles unchanged (identity default).
+
+    Returns a list of {"name", "kind", "vertices": [(x,y),...], "role"}
+    dicts (boundary first if present, then regions, then objects). Never
+    mutates env_cfg. Returns [] for env_cfg=None/empty or no traced shapes.
+    """
+    if not env_cfg:
+        return []
+    ref = env_cfg.get("reference_shapes") or {}
+    per_video = (env_cfg.get("per_video") or {}).get(stem)
+
+    def _flatten(shape_src: dict) -> list:
+        out = []
+        b = shape_src.get("boundary")
+        if b:
+            out.append(dict(b))
+        for r in shape_src.get("regions") or []:
+            out.append(dict(r))
+        for o in shape_src.get("objects") or []:
+            out.append(dict(o))
+        return out
+
+    if per_video and per_video.get("mode") == "override" and per_video.get("shapes"):
+        shapes = _flatten(per_video["shapes"])
+    else:
+        shapes = _flatten(ref)
+        if per_video and per_video.get("mode") == "transform":
+            dx, dy = per_video.get("translate", [0, 0])
+            for s in shapes:
+                s["vertices"] = [(vx + dx, vy + dy) for vx, vy in s["vertices"]]
+
+    role_overrides = (per_video or {}).get("role_overrides") or {}
+    for s in shapes:
+        nm = s.get("name")
+        if nm in role_overrides:
+            s["role"] = role_overrides[nm]
+    return shapes
+
+
+def _points_in_polygon(xs: np.ndarray, ys: np.ndarray, vertices: list) -> np.ndarray:
+    """Vectorized point-in-polygon test (matplotlib.path, same primitive used
+    elsewhere in this module e.g. ~L3461). vertices: list of (x, y) with
+    >= 3 points (a traced circle is stored pre-approximated as a many-vertex
+    polygon by the GUI). Returns a boolean array, one per (xs[i], ys[i])."""
+    if len(vertices) < 3:
+        return np.zeros(len(xs), dtype=bool)
+    from matplotlib.path import Path as _MPath
+    path = _MPath(np.asarray(vertices, dtype=float))
+    pts = np.column_stack([np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)])
+    return path.contains_points(pts)
+
+
+def _nearest_edge_distances(xs: np.ndarray, ys: np.ndarray, vertices: list) -> np.ndarray:
+    """Vectorized distance from each (xs[i], ys[i]) to the nearest edge of the
+    polygon described by vertices. Works identically for boundary, region, and
+    object shapes -- geometry doesn't care about the kind label."""
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    verts = np.asarray(vertices, dtype=float)
+    n = len(verts)
+    if n == 0:
+        return np.full(len(xs), np.nan)
+    if n == 1:
+        return np.hypot(xs - verts[0, 0], ys - verts[0, 1])
+    best = np.full(len(xs), np.inf)
+    for i in range(n):
+        x1, y1 = verts[i]
+        x2, y2 = verts[(i + 1) % n]
+        dx, dy = x2 - x1, y2 - y1
+        seg_len2 = dx * dx + dy * dy
+        if seg_len2 == 0:
+            d = np.hypot(xs - x1, ys - y1)
+        else:
+            t = np.clip(((xs - x1) * dx + (ys - y1) * dy) / seg_len2, 0.0, 1.0)
+            d = np.hypot(xs - (x1 + t * dx), ys - (y1 + t * dy))
+        best = np.minimum(best, d)
+    return best
+
+
+def _find_env_landmarks(bodyparts: list):
+    """
+    nose index + forepaw indices for the object-interaction distance
+    computations, using the same keyword-matching style as
+    _find_spine_indices (~L537). Returns {"nose": int|None, "paws": [int,...]}.
+    Falls back gracefully (nose=None -> caller uses centroid instead) rather
+    than raising, since not every DLC skeleton labels a nose point.
+    """
+    if not bodyparts:
+        return {"nose": None, "paws": []}
+    bp_lower = [str(b).lower() for b in bodyparts]
+    nose_idx = next(
+        (i for kw in ("nose", "snout") for i, b in enumerate(bp_lower) if kw in b),
+        None)
+    paw_kw = ("forepaw", "fore_paw", "front_paw", "frontpaw", "hand", "paw_l", "paw_r")
+    paw_idxs = [i for i, b in enumerate(bp_lower)
+                if any(kw in b for kw in paw_kw) and "hind" not in b and "rear" not in b]
+    return {"nose": nose_idx, "paws": paw_idxs}
+
+
+def _run_length_sequence(values: list) -> list:
+    """
+    Collapse a list of per-bin categorical values (e.g. current_region names,
+    possibly containing None) into an ordered sequence of (value, count)
+    runs -- the same run-length pattern as labels_to_bouts() (~L3920) applied
+    to region membership instead of behavior labels.
+    """
+    runs = []
+    i, n = 0, len(values)
+    while i < n:
+        v = values[i]
+        j = i + 1
+        while j < n and values[j] == v:
+            j += 1
+        runs.append((v, j - i))
+        i = j
+    return runs
+
+
+def compute_session_env_context(env_cfg: "dict | None", stem: str,
+                                 xs: np.ndarray, ys: np.ndarray, bodyparts: list,
+                                 fps: float, pose_coord_space: str = "post_crop",
+                                 interaction_threshold: "float | None" = None,
+                                 bin_ms: float = 100.0) -> dict:
+    """
+    Per-session environmental-context computation (v6 part 2, Step 4).
+    Pure function -- no file I/O, no self, decoupled from
+    extract_features_v2/_3d (Mode A: no clustering-feature-contract change).
+
+    xs, ys: (n_frames, n_bodyparts) already-smoothed per-frame pose arrays for
+      this session, in the SAME pixel coordinate space the shapes in env_cfg
+      were traced in (post-crop by construction -- see coord-space assertion
+      below).
+    bodyparts: this session's bodypart name list, same order as xs/ys columns.
+    pose_coord_space: the coordinate space THIS session's xs/ys are actually
+      in ("post_crop" always, per Step 1 -- kept as a parameter rather than a
+      hardcoded assumption so the assertion below is a real check, not
+      theater).
+    interaction_threshold: pixel distance under which nose/paw-to-object
+      counts as "interacting". None (default) auto-derives one body length
+      from this session's own tracked spine length (_find_spine_indices /
+      _spine_norm_factor, ~L537-569) -- a physically meaningful,
+      arena-independent default, per the plan's Step 4.
+    bin_ms: bin width in ms; 100.0 matches session_bin_ranges.json's grid
+      everywhere else in this pipeline.
+
+    Returns {} for env_cfg=None (flag off) or empty (schema present, master
+    switch on, this session has no reference_shapes traced) -- this is the
+    documented no-op contract from the plan's "Opt-in guarantee" section,
+    exercised end-to-end regardless of env_features_enabled since the caller
+    is responsible for gating that flag; this function only cares whether
+    env_cfg itself carries traced shapes.
+
+    On a real coordinate-space mismatch (env_cfg["coord_space"] != the space
+    this session's pose data is actually in) this raises ValueError rather
+    than silently computing wrong distances -- coordinate-space correctness
+    is a named top risk in CUBE_v6_Feasibility_Study.md, not defensive
+    boilerplate to relax for convenience.
+    """
+    if not env_cfg:
+        return {}
+
+    cfg_coord_space = env_cfg.get("coord_space", "post_crop")
+    if cfg_coord_space != pose_coord_space:
+        raise ValueError(
+            f"compute_session_env_context: coordinate-space mismatch for "
+            f"session '{stem}' -- shapes in env_arena_cfg were traced in "
+            f"'{cfg_coord_space}' space but this session's pose data is in "
+            f"'{pose_coord_space}' space. Refusing to compute distances "
+            f"against misaligned coordinates.")
+
+    shapes = resolve_env_shapes(env_cfg, stem)
+    if not shapes or xs is None or xs.shape[0] == 0:
+        return {}
+
+    paradigm = env_cfg.get("paradigm", "custom")
+    n_frames = xs.shape[0]
+    frames_per_bin = max(1, int(round(fps * (bin_ms / 1000.0))))
+    n_bins = int(np.ceil(n_frames / frames_per_bin))
+
+    cx = np.nanmean(xs, axis=1)
+    cy = np.nanmean(ys, axis=1)
+    landmarks = _find_env_landmarks(bodyparts)
+    nose_idx = landmarks["nose"]
+    nose_x = xs[:, nose_idx] if nose_idx is not None else cx
+    nose_y = ys[:, nose_idx] if nose_idx is not None else cy
+    if landmarks["paws"]:
+        paw_x = np.nanmean(xs[:, landmarks["paws"]], axis=1)
+        paw_y = np.nanmean(ys[:, landmarks["paws"]], axis=1)
+    else:
+        paw_x, paw_y = nose_x, nose_y
+
+    if interaction_threshold is None:
+        head_idx, tail_idx = _find_spine_indices(bodyparts)
+        if head_idx is not None and tail_idx is not None:
+            spine_len = float(np.nanmedian(_spine_norm_factor(xs, ys, head_idx, tail_idx)))
+        else:
+            spine_len = 50.0  # fallback when no nose/tailbase keyword match
+        interaction_threshold = spine_len
+
+    def _bin_agg(per_frame: np.ndarray, categorical: bool = False):
+        out = []
+        for b in range(n_bins):
+            seg = per_frame[b * frames_per_bin: min((b + 1) * frames_per_bin, n_frames)]
+            if len(seg) == 0:
+                out.append(None if categorical else np.nan)
+                continue
+            if categorical:
+                vals, counts = np.unique(seg[seg != None], return_counts=True)  # noqa: E711
+                out.append(vals[np.argmax(counts)] if len(vals) else None)
+            else:
+                out.append(float(np.nanmean(seg)))
+        return out
+
+    regions  = [s for s in shapes if s["kind"] == "region"]
+    objects  = [s for s in shapes if s["kind"] == "object"]
+
+    # current_region: first region (in trace order) containing the centroid,
+    # per frame; None if outside every region. Ties (overlapping regions) go
+    # to the first-listed region, a documented deterministic tie-break.
+    region_membership = np.full(n_frames, None, dtype=object)
+    dist_to_region_boundary = {}
+    for r in regions:
+        inside = _points_in_polygon(cx, cy, r["vertices"])
+        still_unassigned = region_membership == None  # noqa: E711
+        region_membership[inside & still_unassigned] = r["name"]
+        dist_to_region_boundary[r["name"]] = _bin_agg(_nearest_edge_distances(cx, cy, r["vertices"]))
+
+    dist_to_nearest_object_nose = {}
+    dist_to_nearest_object_paw = {}
+    heading_angle_to_nearest_object = {}
+    interacting_by_object = {}
+    for o in objects:
+        d_nose = _nearest_edge_distances(nose_x, nose_y, o["vertices"])
+        d_paw  = _nearest_edge_distances(paw_x, paw_y, o["vertices"])
+        dist_to_nearest_object_nose[o["name"]] = _bin_agg(d_nose)
+        dist_to_nearest_object_paw[o["name"]]  = _bin_agg(d_paw)
+        overts = np.asarray(o["vertices"], dtype=float)
+        ocx, ocy = float(np.mean(overts[:, 0])), float(np.mean(overts[:, 1]))
+        heading_dx = nose_x - cx
+        heading_dy = nose_y - cy
+        to_obj_dx = ocx - cx
+        to_obj_dy = ocy - cy
+        heading_mag = np.hypot(heading_dx, heading_dy)
+        obj_mag = np.hypot(to_obj_dx, to_obj_dy)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cos_ang = (heading_dx * to_obj_dx + heading_dy * to_obj_dy) / (heading_mag * obj_mag)
+        cos_ang = np.clip(cos_ang, -1.0, 1.0)
+        heading_angle_to_nearest_object[o["name"]] = _bin_agg(np.degrees(np.arccos(cos_ang)))
+        interacting_by_object[o["name"]] = (d_nose <= interaction_threshold) | (d_paw <= interaction_threshold)
+
+    current_region_bins = _bin_agg(region_membership, categorical=True)
+    bin_dur_sec = frames_per_bin / fps
+
+    time_in_region_sec = {r["name"]: 0.0 for r in regions}
+    region_entries_count = {r["name"]: 0 for r in regions}
+    for val, cnt in _run_length_sequence(current_region_bins):
+        if val is not None:
+            time_in_region_sec[val] = time_in_region_sec.get(val, 0.0) + cnt * bin_dur_sec
+            region_entries_count[val] = region_entries_count.get(val, 0) + 1
+
+    object_interaction_bouts = {}
+    total_interaction_time_sec = {}
+    for o in objects:
+        per_bin_flag = _bin_agg(interacting_by_object[o["name"]].astype(float))
+        per_bin_bool = [bool(v) and v >= 0.5 for v in per_bin_flag]
+        runs = _run_length_sequence(per_bin_bool)
+        object_interaction_bouts[o["name"]] = sum(1 for v, _ in runs if v)
+        total_interaction_time_sec[o["name"]] = sum(cnt * bin_dur_sec for v, cnt in runs if v)
+
+    per_bin = {
+        "current_region": current_region_bins,
+        "dist_to_region_boundary": dist_to_region_boundary,
+        "dist_to_nearest_object_nose": dist_to_nearest_object_nose,
+        "dist_to_nearest_object_paw": dist_to_nearest_object_paw,
+        "heading_angle_to_nearest_object": heading_angle_to_nearest_object,
+    }
+    summary = {
+        "time_in_region_sec": time_in_region_sec,
+        "region_entries_count": region_entries_count,
+        "object_interaction_bouts": object_interaction_bouts,
+        "total_interaction_time_sec": total_interaction_time_sec,
+        "interaction_threshold_px": float(interaction_threshold),
+    }
+
+    derived = _compute_env_derived_metrics(
+        paradigm, regions, objects, current_region_bins, summary, bin_dur_sec)
+
+    return {"per_bin": per_bin, "summary": summary, "derived": derived,
+            "paradigm": paradigm, "bin_ms": bin_ms}
+
+
+def _region_entry_sequence(current_region_bins: list, regions: list, role_filter: set) -> list:
+    """
+    Ordered sequence of distinct region-name entries from current_region's
+    per-bin series, filtered to only regions whose resolved role is in
+    role_filter (e.g. {"arm"} for Y-Maze, excluding "hub") -- shared
+    foundation for Y-Maze alternation, EPM entry/latency metrics, and (via
+    time_in_region_sec, not this sequence) Place Preference's index.
+    """
+    role_by_name = {r["name"]: r.get("role") for r in regions}
+    filtered = [v for v in current_region_bins
+                if v is not None and role_by_name.get(v) in role_filter]
+    seq = [v for v, _ in _run_length_sequence(filtered)]
+    return seq
+
+
+def _compute_env_derived_metrics(paradigm: str, regions: list,
+                                  objects: list, current_region_bins: list,
+                                  summary: dict, bin_dur_sec: float) -> dict:
+    """
+    Paradigm-gated specialized summaries (Step 4's third bullet). The
+    underlying geometry/time-in-region/entries-count computations above run
+    identically regardless of paradigm; only these derived formulas are
+    gated, and each is silently omitted (not computed as a meaningless
+    value) when its role-tagging prerequisite isn't met -- see
+    ENV_PARADIGM_MIN_ROLES.
+    """
+    out = {}
+    time_in_region = summary["time_in_region_sec"]
+    entries = summary["region_entries_count"]
+    interaction_time = summary["total_interaction_time_sec"]
+
+    if paradigm == "y_maze":
+        arm_seq = _region_entry_sequence(current_region_bins, regions, {"arm"})
+        n_arms = sum(1 for r in regions if r.get("role") == "arm")
+        if n_arms >= 3 and len(arm_seq) >= 3:
+            triplets = [arm_seq[i:i + 3] for i in range(len(arm_seq) - 2)]
+            n_alt = sum(1 for t in triplets if len(set(t)) == 3)
+            out["spontaneous_alternation_pct"] = 100.0 * n_alt / len(triplets)
+            out["n_arm_entries"] = len(arm_seq)
+
+    elif paradigm == "elevated_plus_maze":
+        open_names   = {r["name"] for r in regions if r.get("role") == "open_arm"}
+        closed_names = {r["name"] for r in regions if r.get("role") == "closed_arm"}
+        if open_names and closed_names:
+            t_open   = sum(time_in_region.get(n, 0.0) for n in open_names)
+            t_closed = sum(time_in_region.get(n, 0.0) for n in closed_names)
+            e_open   = sum(entries.get(n, 0) for n in open_names)
+            e_closed = sum(entries.get(n, 0) for n in closed_names)
+            if (t_open + t_closed) > 0:
+                out["pct_time_open_arms"] = 100.0 * t_open / (t_open + t_closed)
+            if (e_open + e_closed) > 0:
+                out["pct_open_arm_entries"] = 100.0 * e_open / (e_open + e_closed)
+            role_by_name = {r["name"]: r.get("role") for r in regions}
+            first_open_bin = next(
+                (i for i, nm in enumerate(current_region_bins)
+                 if nm is not None and role_by_name.get(nm) == "open_arm"), None)
+            if first_open_bin is not None:
+                out["latency_to_first_open_arm_entry_sec"] = first_open_bin * bin_dur_sec
+
+    elif paradigm == "novel_object":
+        novel   = [o["name"] for o in objects if o.get("role") == "novel"]
+        familiar = [o["name"] for o in objects if o.get("role") == "familiar"]
+        if novel and familiar:
+            t_n = sum(interaction_time.get(n, 0.0) for n in novel)
+            t_f = sum(interaction_time.get(n, 0.0) for n in familiar)
+            if (t_n + t_f) > 0:
+                out["discrimination_index"] = (t_n - t_f) / (t_n + t_f)
+
+    elif paradigm == "three_chamber":
+        stranger = [o["name"] for o in objects if o.get("role") == "stranger"]
+        empty    = [o["name"] for o in objects if o.get("role") == "empty"]
+        novel_s  = [o["name"] for o in objects if o.get("role") == "novel_stranger"]
+        if stranger and empty:
+            t_s, t_e = (sum(interaction_time.get(n, 0.0) for n in stranger),
+                        sum(interaction_time.get(n, 0.0) for n in empty))
+            if (t_s + t_e) > 0:
+                out["sociability_index"] = (t_s - t_e) / (t_s + t_e)
+        if stranger and novel_s:
+            t_s, t_ns = (sum(interaction_time.get(n, 0.0) for n in stranger),
+                         sum(interaction_time.get(n, 0.0) for n in novel_s))
+            if (t_s + t_ns) > 0:
+                out["social_novelty_index"] = (t_ns - t_s) / (t_ns + t_s)
+
+    elif paradigm == "place_preference":
+        paired   = [r["name"] for r in regions if r.get("role") == "paired"]
+        unpaired = [r["name"] for r in regions if r.get("role") == "unpaired"]
+        if paired and unpaired:
+            t_p = sum(time_in_region.get(n, 0.0) for n in paired)
+            t_u = sum(time_in_region.get(n, 0.0) for n in unpaired)
+            if (t_p + t_u) > 0:
+                out["preference_index"] = (t_p - t_u) / (t_p + t_u)
+
+    return out
+
+
 def compute_cluster_confidence_profile(vis_feats: np.ndarray, vis_col_names: list,
                                         labels: np.ndarray, out_path: Path,
                                         low_conf_floor: float = 0.40) -> "pd.DataFrame":
@@ -7992,6 +8427,39 @@ class BSoidEngine:
         #   (not written empty), and every existing output file is
         #   byte-identical to pre-v6 output.
         kinematic_directedness_enabled = False,
+        # ── Environmental context & object interaction (v6 part 2) ─────────────
+        # env_features_enabled: master switch, off by default.  With it False
+        #   (the default) none of the following ever runs: no EnvContextWindow
+        #   invitation in the GUI, all_env_cfg is populated with None for every
+        #   session, compute_session_env_context() is never called,
+        #   session_env_context.json is never written (not even empty), and
+        #   the Step 6/7 bout-CSV enrichment / approach-avoid detection are
+        #   both skipped entirely. See Environmental_Context_v6_Implementation
+        #   _Plan.md's "Opt-in guarantee" section -- this flag being False
+        #   must reproduce byte-identical output to a pre-this-feature run.
+        env_features_enabled = False,
+        # env_arena_cfg: None (default) = no shapes traced for any session.
+        #   When set, schema is:
+        #     {"schema_version": 3, "paradigm": <enum str>,
+        #      "reference_stem": str, "coord_space": "post_crop",
+        #      "reference_shapes": {"boundary": {...}|None,
+        #                           "regions": [...], "objects": [...]},
+        #      "per_video": {"<stem>": {"mode": "transform"|"override", ...,
+        #                               "role_overrides": {...}|None}}}
+        #   See Environmental_Context_v6_Implementation_Plan.md Step 1 for the
+        #   full shape/role vocabulary.  Turning env_features_enabled on with
+        #   env_arena_cfg left at None (or with no traced shapes for a given
+        #   session) must still be a no-op -- empty summaries, no crash.
+        env_arena_cfg = None,
+        # env_interaction_threshold: pixel distance under which the animal is
+        #   considered "interacting" with an object, for object_interaction
+        #   _bouts/total_interaction_time_sec bout detection.  None (default)
+        #   = auto-computed per-session as a small multiple of the animal's
+        #   own tracked spine length (see compute_session_env_context()),
+        #   giving a physically meaningful, arena-independent default instead
+        #   of an arbitrary raw pixel number the user would have to guess.
+        #   Still overridable by an explicit user-supplied pixel value.
+        env_interaction_threshold = None,
         # ── Body-region feature weighting (issue 1b) ──────────────────────────
         # bodypart_weights: {bodypart_name: multiplier}.  {} (default) = every
         #   multiplier is exactly 1.0 -> bit-identical output to unweighted
