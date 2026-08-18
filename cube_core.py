@@ -1563,6 +1563,109 @@ _patch_pynndescent_thread_safety()
 #  HDBSCAN  (auto-sweep min_cluster_size - B-SOiD default strategy)
 #
 
+def _dbcv_from_mst(labels: np.ndarray, mst_edges: np.ndarray) -> float:
+    """Hand-port of `hdbscan.hdbscan_.HDBSCAN.relative_validity_`'s property
+    body (hdbscan 0.8.43, ~hdbscan_.py:1605-1673), operating directly on a
+    raw `(n-1, 3)` MST ndarray (`from, to, distance` columns -- the exact
+    format `hdbscan.hdbscan_.hdbscan()`'s `result_min_span_tree` return value
+    and `HDBSCAN.minimum_spanning_tree_.to_pandas()` both share, confirmed by
+    reading `hdbscan/plots.py`'s `MinimumSpanningTree.to_pandas()`) instead of
+    a pandas-wrapped `MinimumSpanningTree` object. Used by `_fit_one` (Option
+    3, HDBSCAN sweep tree-reuse perf work) to score each swept candidate
+    without needing a live `HDBSCAN` estimator per candidate. Returns `nan`
+    when `num_clusters == 0` (all-noise labelling), matching the source
+    property's implicit behaviour (an empty `V_index` list makes `np.sum`
+    return `0.0` there; this port returns `nan` instead since a genuinely
+    undefined DBCV should never silently look like a real zero score to the
+    sweep's `max(s for s, *_ in candidates)` selection).
+    """
+    labels = np.asarray(labels)
+    sizes = np.bincount(labels + 1)
+    noise_size = sizes[0]
+    cluster_size = sizes[1:]
+    total = noise_size + np.sum(cluster_size)
+    num_clusters = len(cluster_size)
+    if num_clusters == 0:
+        return float("nan")
+    DSC = np.zeros(num_clusters)
+    min_outlier_sep = np.inf
+    correction_const = 2
+    DSPC_wrt = np.ones(num_clusters) * np.inf
+    max_distance = 0.0
+
+    mst_edges = np.asarray(mst_edges)
+    for row in mst_edges:
+        label1 = labels[int(row[0])]
+        label2 = labels[int(row[1])]
+        length = float(row[2])
+
+        max_distance = max(max_distance, length)
+
+        if label1 == -1 and label2 == -1:
+            continue
+        elif label1 == -1 or label2 == -1:
+            min_outlier_sep = min(min_outlier_sep, length)
+            continue
+
+        if label1 == label2:
+            DSC[label1] = max(length, DSC[label1])
+        else:
+            DSPC_wrt[label1] = min(length, DSPC_wrt[label1])
+            DSPC_wrt[label2] = min(length, DSPC_wrt[label2])
+
+    min_outlier_sep = max_distance if min_outlier_sep == np.inf else min_outlier_sep
+    correction = correction_const * (
+        max_distance if num_clusters > 1 else min_outlier_sep
+    )
+    DSPC_wrt[np.where(DSPC_wrt == np.inf)] = correction
+
+    V_index = [
+        (DSPC_wrt[i] - DSC[i]) / max(DSPC_wrt[i], DSC[i])
+        for i in range(num_clusters)
+    ]
+    score = np.sum(
+        [(cluster_size[i] * V_index[i]) / total for i in range(num_clusters)]
+    )
+    return float(score)
+
+
+def _build_tree(min_samples, embedding, metric, core_dist_n_jobs, cache):
+    """Build (or retrieve from `cache`) the single-linkage tree + MST for a
+    given `min_samples` value, independent of `min_cluster_size` /
+    `cluster_selection_method` (confirmed by reading `hdbscan.hdbscan_.hdbscan()`:
+    tree construction depends only on `min_samples`, `alpha`, `metric`, `p`,
+    `leaf_size` -- never on `min_cluster_size`, which only affects the later,
+    separate `_tree_to_labels()` extraction step). Part of Option 3 (HDBSCAN
+    sweep tree-reuse perf work): reused across every swept candidate sharing
+    the same `min_samples` bucket instead of rebuilding from scratch per
+    candidate.
+
+    `cache` is a plain dict keyed by `min_samples`, scoped to a single
+    `run_hdbscan()` call (one embedding). Do not hoist this cache to
+    module/engine scope spanning multiple calls or seeds -- different seeds
+    use different embeddings, and a cross-seed cache keyed only on
+    `min_samples` would silently reuse the wrong embedding's tree. Do not
+    combine with process-based (loky) dispatch without re-deriving a
+    pickling strategy for the cached tree objects.
+
+    Returns (single_linkage_tree, min_spanning_tree) -- the same two objects
+    `HDBSCAN.fit()` itself would produce for this `min_samples`/`metric`.
+    """
+    key = min_samples
+    if key in cache:
+        return cache[key]
+    import hdbscan as _hdb
+    (_labels, _prob, _stab, _cond, sl_tree, mst) = _hdb.hdbscan_.hdbscan(
+        embedding,
+        min_samples=min_samples,
+        metric=metric,
+        gen_min_span_tree=True,
+        core_dist_n_jobs=core_dist_n_jobs if core_dist_n_jobs is not None else 4,
+    )
+    cache[key] = (sl_tree, mst)
+    return sl_tree, mst
+
+
 def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None,
                 log_fn=None):
     """
@@ -1733,7 +1836,7 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None,
     # concurrency must stay bounded by the resolved budget alone.
     _core_dist_n_jobs = 1 if _sweep_n_jobs != 1 else None
 
-    def _fit_one(method, pct):
+    def _fit_one_legacy(method, pct):
         mcs = max(2, int(round(0.001 * pct * ref_n)))
         _kwargs = dict(
             prediction_data          = True,
@@ -1770,6 +1873,58 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None,
 
         score = getattr(clf, "relative_validity_", -np.inf)
         return (score, n_cl, clf.labels_.copy(), clf, method)
+
+    # ── Option 3 (HDBSCAN sweep perf): reuse the single-linkage tree/MST
+    # across every swept candidate sharing the same min_samples bucket,
+    # instead of rebuilding it from scratch per candidate (tree construction
+    # depends only on min_samples/metric, never on min_cluster_size/
+    # cluster_selection_method -- see _build_tree's docstring). Candidates
+    # remain 5-tuples -- (score, n_cl, labels, meta, method) -- to preserve
+    # every existing unpack site's arity; `meta` is a cheap (mcs, min_samples)
+    # pair replacing the live clf object for the ~79 discarded candidates.
+    # Only the winner is ever refit into a real HDBSCAN object (below).
+    _tree_reuse = bool(cfg.get("hdbscan_tree_reuse_enabled", True))
+    _tree_cache = {}
+    # Guards cache build-and-store only for the rare non-default parallel
+    # case (_sweep_n_jobs != 1) -- cheap, unconditionally safe to add even
+    # though the default sequential path never contends. Do not hoist this
+    # cache/lock pair to module/engine scope; see _build_tree's docstring.
+    _tree_cache_lock = _threading.Lock() if _sweep_n_jobs != 1 else None
+
+    def _fit_one_new(method, pct):
+        mcs = max(2, int(round(0.001 * pct * ref_n)))
+        min_samples = max(5, mcs // 5)
+        metric = cfg.get("hdbscan_metric", "euclidean")
+        with _numba_single_thread():
+            if _tree_cache_lock is not None:
+                with _tree_cache_lock:
+                    sl_tree, mst = _build_tree(
+                        min_samples, embedding, metric, _core_dist_n_jobs,
+                        _tree_cache)
+            else:
+                sl_tree, mst = _build_tree(
+                    min_samples, embedding, metric, _core_dist_n_jobs,
+                    _tree_cache)
+        labels, _prob, _stab, _cond, _sl = _hdb.hdbscan_._tree_to_labels(
+            None, sl_tree, min_cluster_size=mcs,
+            cluster_selection_method=method)
+        labels = np.asarray(labels)
+        n_cl = len(set(labels)) - (1 if -1 in labels else 0)
+        if n_cl < 2:
+            return None
+        # NOTE: score is returned exactly as computed, nan included -- do NOT
+        # coerce nan to -inf here. relative_validity_ (the legacy path's
+        # score source) itself returns real nan (0/0 in its V_index division)
+        # when the mutual-reachability graph is degenerate (e.g. exact-
+        # duplicate embedding points), and downstream code's
+        # `max(s for s, *_ in candidates)` + `np.isfinite()` degenerate-DBCV
+        # detection depends on seeing that same nan, not a substituted -inf,
+        # to match legacy candidate-selection behaviour bit-for-bit when
+        # candidates are a mix of valid and degenerate scores.
+        score = _dbcv_from_mst(labels, mst)
+        return (score, n_cl, labels.copy(), (mcs, min_samples), method)
+
+    _fit_one = _fit_one_new if _tree_reuse else _fit_one_legacy
 
     _tasks = [(method, pct) for method in methods for pct in pcts]
     if _sweep_n_jobs != 1 and len(_tasks) > 1:
@@ -2013,6 +2168,45 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None,
                      sorted(candidates, key=lambda c: -c[0])[0]
 
     best_score, _, best_labels, best_clf, _ = chosen
+    if _tree_reuse:
+        # Under Option 3, `chosen`'s 4th element is `meta = (mcs, min_samples)`
+        # (a cheap pair), not a live clf -- the winner is the only candidate
+        # ever refit into a real HDBSCAN object. Identical cost to what this
+        # function always paid for the winner even before Option 3 (it was
+        # always fully refit); the ~79 discarded candidates never get a real
+        # clf, since they only ever needed (score, n_cl, labels).
+        chosen_mcs, chosen_min_samples = best_clf
+        chosen_method = chosen[4]
+        _winner_kwargs = dict(
+            prediction_data          = True,
+            min_cluster_size         = chosen_mcs,
+            min_samples              = chosen_min_samples,
+            metric                   = cfg.get("hdbscan_metric", "euclidean"),
+            cluster_selection_method = chosen_method,
+            gen_min_span_tree        = True,
+        )
+        if _core_dist_n_jobs is not None:
+            _winner_kwargs["core_dist_n_jobs"] = _core_dist_n_jobs
+        with _numba_single_thread():
+            best_clf = _hdb.HDBSCAN(**_winner_kwargs).fit(embedding)
+        best_labels = best_clf.labels_.copy()
+        # Canary, not a hard failure: the sweep's ported _dbcv_from_mst score
+        # (used only to rank/select candidates) vs. the refit winner's real
+        # relative_validity_ should agree to within float precision -- a
+        # mismatch beyond this tolerance would mean the ported DBCV diverged
+        # from the library's own computation without ever having broken
+        # selection correctness (the *returned* score always comes from the
+        # real refit below, never from the ported one).
+        _refit_score = getattr(best_clf, "relative_validity_", best_score)
+        if (log_fn and np.isfinite(best_score) and np.isfinite(_refit_score)
+                and abs(_refit_score - best_score) > 1e-6):
+            log_fn(f"  [DIAG] tree-reuse DBCV canary: swept score={best_score:.6f} "
+                   f"vs refit relative_validity_={_refit_score:.6f} "
+                   f"(diff={_refit_score - best_score:.2e}) -- ported "
+                   f"_dbcv_from_mst may have diverged from the library's own "
+                   f"computation; selection itself is unaffected since this "
+                   f"score is only used for ranking, not the returned value.")
+        best_score = _refit_score
     # Non-selected candidates' clf objects (each retains a condensed tree /
     # minimum spanning tree; up to ~80 coexist in `candidates` by construction)
     # need no explicit release here: they're plain refcounted objects with no
@@ -8542,6 +8736,17 @@ class BSoidEngine:
         cv_folds              = 5,
         # ── HDBSCAN options ───────────────────────────────────────────────────
         hdbscan_methods_to_try = "eom,leaf",  # both tried; selection logic picks best
+        # hdbscan_tree_reuse_enabled (Option 3, HDBSCAN sweep perf, Aug 2026):
+        #   True (default) reuses the single-linkage tree/MST across every
+        #   swept candidate sharing the same min_samples bucket, instead of
+        #   rebuilding it from scratch per candidate -- tree construction
+        #   depends only on min_samples/metric, never on min_cluster_size/
+        #   cluster_selection_method. Only the winning candidate is ever
+        #   refit into a real HDBSCAN object; output is equivalence-tested
+        #   to be identical to the pre-change behaviour. Set False to use
+        #   the verbatim pre-change per-candidate full-refit path
+        #   (_fit_one_legacy) as an escape hatch.
+        hdbscan_tree_reuse_enabled = True,
         # ── Cluster count guidance ────────────────────────────────────────────
         target_n_clusters     = 0,    # 0 = auto; >0 = user-requested cluster count
         preferred_clusters_lo = 12,   # auto-mode: prefer cluster count ≥ this

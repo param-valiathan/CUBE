@@ -113,6 +113,30 @@ class TestCompatModeLegacyV2:
         assert expected_keys == set(cc.BSoidEngine._LEGACY_V2_DEFAULTS.keys())
 
 
+class TestHdbscanSweepPerfCfgKeys:
+    """HDBSCAN_Sweep_Performance_Implementation_Plan.md's new cfg keys
+    must default to true no-ops and must NOT collide with
+    _LEGACY_V2_DEFAULTS -- Option 3 changes *how* output is computed, not
+    numeric defaults. (Options 4/5 keys are added in follow-up phases and
+    get their own tests in this class then.)
+    """
+
+    def test_hdbscan_tree_reuse_enabled_default_true_not_in_legacy_defaults(self):
+        assert cc.BSoidEngine.DEFAULTS["hdbscan_tree_reuse_enabled"] is True
+        assert "hdbscan_tree_reuse_enabled" not in cc.BSoidEngine._LEGACY_V2_DEFAULTS
+
+    def test_pinned_five_key_legacy_defaults_set_undisturbed(self):
+        # Re-assert the exact same pinned set as
+        # test_legacy_v2_all_five_documented_keys_present_in_legacy_defaults
+        # (this plan's own keys must not have been added to it).
+        expected_keys = {
+            "umap_min_dist", "hdbscan_mcs_anchor", "angular_fallback",
+            "hdbscan_merge_thresh", "hdbscan_split_silhouette_thresh",
+            "auto_bodypart_weighting", "turned_away_exclude_from_bad_frac",
+        }
+        assert expected_keys == set(cc.BSoidEngine._LEGACY_V2_DEFAULTS.keys())
+
+
 class TestEngineConstructionSideEffects:
     def test_output_subdirs_created(self, tmp_path):
         eng = make_engine(tmp_path)

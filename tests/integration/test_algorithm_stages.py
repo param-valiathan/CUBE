@@ -94,6 +94,175 @@ class TestRunHdbscan:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+#  run_hdbscan -- Option 3 (HDBSCAN sweep tree-reuse perf) equivalence suite
+#
+#  hdbscan_tree_reuse_enabled=True (_fit_one_new, default) must produce
+#  BIT-FOR-BIT identical labels/scores to hdbscan_tree_reuse_enabled=False
+#  (_fit_one_legacy, verbatim pre-change path) for the same embedding/cfg.
+#  This is the mandatory gate for Option 3 -- see
+#  HDBSCAN_Sweep_Performance_Implementation_Plan.md's "Verification" section.
+# ──────────────────────────────────────────────────────────────────────────
+
+import pytest
+
+
+def _wide_bucket_cfg(selection_mode="legacy"):
+    # hdbscan_pct_lo/hi spread wide enough that mcs // 5 crosses several
+    # integer-division boundaries -- exercises real multi-bucket reuse.
+    return dict(
+        hdbscan_sweep_n_steps=20,
+        hdbscan_pct_lo=2,
+        hdbscan_pct_hi=40,
+        hdbscan_method="both",
+        target_n_clusters=0,
+        preferred_clusters_lo=2,
+        preferred_clusters_hi=6,
+        hdbscan_selection_mode=selection_mode,
+    )
+
+
+def _one_bucket_cfg(selection_mode="legacy"):
+    # Narrow pct range -- every mcs collapses to one min_samples bucket.
+    return dict(
+        hdbscan_sweep_n_steps=6,
+        hdbscan_pct_lo=10,
+        hdbscan_pct_hi=12,
+        hdbscan_method="both",
+        target_n_clusters=0,
+        preferred_clusters_lo=2,
+        preferred_clusters_hi=6,
+        hdbscan_selection_mode=selection_mode,
+    )
+
+
+def _unique_bucket_cfg(selection_mode="legacy"):
+    # A grid where one step's min_samples value is unique (isolated bucket
+    # among otherwise-clustered mcs steps).
+    return dict(
+        hdbscan_sweep_n_steps=8,
+        hdbscan_pct_lo=5,
+        hdbscan_pct_hi=45,
+        hdbscan_method="eom",
+        target_n_clusters=0,
+        preferred_clusters_lo=2,
+        preferred_clusters_hi=6,
+        hdbscan_selection_mode=selection_mode,
+    )
+
+
+def _degenerate_embedding(seed=5):
+    # Reuses the existing tiny/near-duplicate blob pattern from
+    # test_tolerates_tiny_degenerate_input.
+    return make_blob_embedding(n_per_blob=10, n_blobs=2, seed=seed, spread=0.01)
+
+
+def _assert_equivalent(embedding, cfg):
+    cfg_new = dict(cfg, hdbscan_tree_reuse_enabled=True)
+    cfg_old = dict(cfg, hdbscan_tree_reuse_enabled=False)
+    clf_new, labels_new, score_new, label_kind_new = cc.run_hdbscan(
+        embedding.copy(), cfg_new)
+    clf_old, labels_old, score_old, label_kind_old = cc.run_hdbscan(
+        embedding.copy(), cfg_old)
+    assert np.array_equal(labels_new, labels_old)
+    assert label_kind_new == label_kind_old
+    if np.isnan(score_old):
+        assert np.isnan(score_new)
+    else:
+        assert score_new == pytest.approx(score_old, abs=1e-9)
+    return clf_new, labels_new, score_new
+
+
+class TestRunHdbscanTreeReuseEquivalence:
+    """Option 3 mandatory equivalence gate: hdbscan_tree_reuse_enabled=True
+    vs False must select the same winner and produce identical output."""
+
+    # -- Case 1: standard, wide bucket spread, both eom/leaf --------------
+    def test_case1_standard_wide_bucket_spread(self):
+        embedding = make_blob_embedding(n_per_blob=60, n_blobs=3, seed=3)
+        _assert_equivalent(embedding, _wide_bucket_cfg())
+
+    # -- Case 2: all candidates collapse to one min_samples bucket --------
+    def test_case2_all_candidates_one_bucket(self):
+        embedding = make_blob_embedding(n_per_blob=60, n_blobs=3, seed=3)
+        _assert_equivalent(embedding, _one_bucket_cfg())
+
+    # -- Case 3: a bucket of size 1 (unique min_samples step) --------------
+    def test_case3_unique_size_one_bucket(self):
+        embedding = make_blob_embedding(n_per_blob=60, n_blobs=3, seed=3)
+        _assert_equivalent(embedding, _unique_bucket_cfg())
+
+    # -- Case 4: degenerate embedding -- both paths hit the same fallback --
+    def test_case4_degenerate_embedding(self):
+        embedding = _degenerate_embedding()
+        _assert_equivalent(embedding, _wide_bucket_cfg())
+
+    # -- Case 5: best_clf functional check (real refit, not just a tuple) --
+    def test_case5_best_clf_is_fully_functional(self):
+        import hdbscan as _hdb
+        embedding = make_blob_embedding(n_per_blob=60, n_blobs=3, seed=3)
+        clf, labels, score, _ = cc.run_hdbscan(
+            embedding.copy(), dict(_wide_bucket_cfg(), hdbscan_tree_reuse_enabled=True))
+        assert clf.condensed_tree_ is not None
+        pred, strengths = _hdb.approximate_predict(clf, embedding[:5])
+        assert pred.shape[0] == 5
+
+    # -- Case 6: non-mutation of the cached tree/MST across repeated reuse -
+    def test_case6_cached_tree_not_mutated_across_reuse(self):
+        import hdbscan as _hdb
+        embedding = make_blob_embedding(n_per_blob=60, n_blobs=3, seed=3)
+        sl_tree, mst = cc._build_tree(
+            min_samples=5, embedding=embedding, metric="euclidean",
+            core_dist_n_jobs=None, cache={})
+        sl_tree_before = sl_tree.copy()
+        mst_before = mst.copy()
+        _hdb.hdbscan_._tree_to_labels(
+            None, sl_tree, min_cluster_size=5, cluster_selection_method="eom")
+        _hdb.hdbscan_._tree_to_labels(
+            None, sl_tree, min_cluster_size=15, cluster_selection_method="leaf")
+        assert np.array_equal(sl_tree, sl_tree_before)
+        assert np.array_equal(mst, mst_before)
+
+    # -- Case 7: determinism under tree_reuse=True -------------------------
+    def test_case7_determinism_under_tree_reuse(self):
+        embedding = make_blob_embedding(n_per_blob=60, n_blobs=3, seed=3)
+        cfg = dict(_wide_bucket_cfg(), hdbscan_tree_reuse_enabled=True)
+        _, labels1, score1, _ = cc.run_hdbscan(embedding.copy(), cfg)
+        _, labels2, score2, _ = cc.run_hdbscan(embedding.copy(), cfg)
+        assert np.array_equal(labels1, labels2)
+        if np.isnan(score1):
+            assert np.isnan(score2)
+        else:
+            assert score2 == pytest.approx(score1, abs=1e-9)
+
+    # -- Case 8: _dbcv_from_mst isolated unit test vs real relative_validity_
+    def test_case8_dbcv_from_mst_matches_relative_validity(self):
+        import hdbscan as _hdb
+        embedding = make_blob_embedding(n_per_blob=40, n_blobs=3, seed=9)
+        clf = _hdb.HDBSCAN(min_cluster_size=10, min_samples=5,
+                            gen_min_span_tree=True).fit(embedding)
+        mst_raw = clf.minimum_spanning_tree_.to_numpy()
+        ported_score = cc._dbcv_from_mst(clf.labels_, mst_raw)
+        real_score = clf.relative_validity_
+        if np.isnan(real_score):
+            assert np.isnan(ported_score)
+        else:
+            assert ported_score == pytest.approx(real_score, abs=1e-9)
+
+    # -- Case 9: cases 1-4 under BOTH hdbscan_selection_mode values --------
+    @pytest.mark.parametrize("selection_mode", ["legacy", "floor_soft_cap"])
+    @pytest.mark.parametrize("cfg_factory,embedding_factory", [
+        (_wide_bucket_cfg, lambda: make_blob_embedding(n_per_blob=60, n_blobs=3, seed=3)),
+        (_one_bucket_cfg, lambda: make_blob_embedding(n_per_blob=60, n_blobs=3, seed=3)),
+        (_unique_bucket_cfg, lambda: make_blob_embedding(n_per_blob=60, n_blobs=3, seed=3)),
+        (_wide_bucket_cfg, _degenerate_embedding),
+    ])
+    def test_case9_both_selection_modes(self, selection_mode, cfg_factory, embedding_factory):
+        embedding = embedding_factory()
+        cfg = cfg_factory(selection_mode=selection_mode)
+        _assert_equivalent(embedding, cfg)
+
+
+# ──────────────────────────────────────────────────────────────────────────
 #  train_mlp
 # ──────────────────────────────────────────────────────────────────────────
 
