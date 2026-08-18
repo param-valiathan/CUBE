@@ -371,6 +371,117 @@ class TestOption4SeedConsensusSweepNSteps:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+#  Option 5 -- shared-subsample opt-in for seed_sweep_stability() only.
+#  seed_sweep_train_frac=1.0 (default) must be a true no-op: the default-
+#  is-a-true-no-op guarantee is the one thing that must be airtight here,
+#  per the plan's Verification section.
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestOption5SeedSweepTrainFrac:
+    def test_default_train_frac_is_true_noop_full_array_used(self, monkeypatch):
+        # No seed_sweep_train_frac key at all -- every seed must still see
+        # the FULL, unsubsampled feats_sc_T array (identical to pre-Option-5
+        # behaviour, which never subsampled at all).
+        feats = make_blob_features(n_per_blob=40, n_blobs=3, seed=1)
+        cfg = dict(SEED_SWEEP_CFG)  # seed_sweep_train_frac absent
+        captured = []
+        orig = cc._seed_sweep_one_seed
+
+        def spy(s, feats_sc_T, cfg_, n_total, progress_cb=None):
+            captured.append(feats_sc_T.shape[0])
+            return orig(s, feats_sc_T, cfg_, n_total, progress_cb=progress_cb)
+
+        monkeypatch.setattr(cc, "_seed_sweep_one_seed", spy)
+        cc.seed_sweep_stability(feats, cfg, n_seeds=3)
+        assert len(captured) == 3
+        assert all(n == feats.shape[0] for n in captured)
+
+    def test_explicit_train_frac_one_matches_unset(self, monkeypatch):
+        feats = make_blob_features(n_per_blob=40, n_blobs=3, seed=1)
+        cfg = dict(SEED_SWEEP_CFG, seed_sweep_train_frac=1.0)
+        captured = []
+        orig = cc._seed_sweep_one_seed
+
+        def spy(s, feats_sc_T, cfg_, n_total, progress_cb=None):
+            captured.append(feats_sc_T.shape[0])
+            return orig(s, feats_sc_T, cfg_, n_total, progress_cb=progress_cb)
+
+        monkeypatch.setattr(cc, "_seed_sweep_one_seed", spy)
+        cc.seed_sweep_stability(feats, cfg, n_seeds=3)
+        assert all(n == feats.shape[0] for n in captured)
+
+    def test_subsample_size_matches_train_frac(self):
+        feats = make_blob_features(n_per_blob=100, n_blobs=3, seed=1)
+        cfg = dict(SEED_SWEEP_CFG, seed_sweep_train_frac=0.5, seed_sweep_n_jobs=1)
+        result = cc.seed_sweep_stability(feats, cfg, n_seeds=3)
+        assert result != {}
+        expected_n = int(round(feats.shape[0] * 0.5))
+        for lbls in result["labels"]:
+            assert lbls.shape[0] == expected_n
+
+    def test_same_subsample_used_across_all_seeds_within_one_call(self, monkeypatch):
+        feats = make_blob_features(n_per_blob=100, n_blobs=3, seed=1)
+        cfg = dict(SEED_SWEEP_CFG, seed_sweep_train_frac=0.5, seed_sweep_n_jobs=1)
+        captured = []
+        orig = cc._seed_sweep_one_seed
+
+        def spy(s, feats_sc_T, cfg_, n_total, progress_cb=None):
+            captured.append(feats_sc_T.copy())
+            return orig(s, feats_sc_T, cfg_, n_total, progress_cb=progress_cb)
+
+        monkeypatch.setattr(cc, "_seed_sweep_one_seed", spy)
+        cc.seed_sweep_stability(feats, cfg, n_seeds=3)
+        assert len(captured) == 3
+        for arr in captured[1:]:
+            assert np.array_equal(arr, captured[0])
+
+    def test_subsample_deterministic_across_separate_calls(self, monkeypatch):
+        feats = make_blob_features(n_per_blob=100, n_blobs=3, seed=1)
+        cfg = dict(SEED_SWEEP_CFG, seed_sweep_train_frac=0.5, seed_sweep_n_jobs=1)
+        orig = cc._seed_sweep_one_seed
+
+        def make_spy(bucket):
+            def spy(s, feats_sc_T, cfg_, n_total, progress_cb=None):
+                bucket.append(feats_sc_T.copy())
+                return orig(s, feats_sc_T, cfg_, n_total, progress_cb=progress_cb)
+            return spy
+
+        bucket1 = []
+        monkeypatch.setattr(cc, "_seed_sweep_one_seed", make_spy(bucket1))
+        cc.seed_sweep_stability(feats, cfg, n_seeds=2)
+
+        bucket2 = []
+        monkeypatch.setattr(cc, "_seed_sweep_one_seed", make_spy(bucket2))
+        cc.seed_sweep_stability(feats, cfg, n_seeds=2)
+
+        assert np.array_equal(bucket1[0], bucket2[0])
+
+    def test_train_frac_with_mcs_anchor_full_behaves_sanely(self):
+        # Interaction case flagged by the plan's Risk Assessment: mcs
+        # anchored to the ORIGINAL n_total (not the subsample) combined with
+        # a subsample must not crash or produce a nonsensical (empty/wrong-
+        # shape) result.
+        feats = make_blob_features(n_per_blob=100, n_blobs=3, seed=1)
+        cfg = dict(SEED_SWEEP_CFG, seed_sweep_train_frac=0.5,
+                    hdbscan_mcs_anchor="full", seed_sweep_n_jobs=1)
+        result = cc.seed_sweep_stability(feats, cfg, n_seeds=3)
+        assert result != {}
+        expected_n = int(round(feats.shape[0] * 0.5))
+        for lbls in result["labels"]:
+            assert lbls.shape[0] == expected_n
+
+    def test_seed_sweep_stability_bootstrap_untouched(self):
+        # Regression guard: seed_sweep_stability_bootstrap() must remain
+        # standalone -- zero cfg keys introduced by this plan, and this
+        # option's key must never be referenced inside it (conflating the
+        # two would silently change what seed_sweep_stability_bootstrap
+        # measures).
+        import inspect
+        src = inspect.getsource(cc.seed_sweep_stability_bootstrap)
+        assert "seed_sweep_train_frac" not in src
+
+
+# ──────────────────────────────────────────────────────────────────────────
 #  train_mlp
 # ──────────────────────────────────────────────────────────────────────────
 

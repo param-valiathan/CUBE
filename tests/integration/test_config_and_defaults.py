@@ -133,6 +133,10 @@ class TestHdbscanSweepPerfCfgKeys:
         assert cc.BSoidEngine.DEFAULTS["hdbscan_consensus_sweep_n_steps"] == 0
         assert "hdbscan_consensus_sweep_n_steps" not in cc.BSoidEngine._LEGACY_V2_DEFAULTS
 
+    def test_seed_sweep_train_frac_default_one_not_in_legacy_defaults(self):
+        assert cc.BSoidEngine.DEFAULTS["seed_sweep_train_frac"] == 1.0
+        assert "seed_sweep_train_frac" not in cc.BSoidEngine._LEGACY_V2_DEFAULTS
+
     def test_pinned_five_key_legacy_defaults_set_undisturbed(self):
         # Re-assert the exact same pinned set as
         # test_legacy_v2_all_five_documented_keys_present_in_legacy_defaults

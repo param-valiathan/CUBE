@@ -5409,6 +5409,22 @@ def seed_sweep_stability(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
     except Exception:
         return {}
     base_seed = int(cfg.get("umap_random_state", 42))
+    # Option 5 (HDBSCAN sweep perf, Aug 2026): draw ONE shared subsample of
+    # bins, deterministically from base_seed, when opted into via
+    # seed_sweep_train_frac < 1.0. Every seed below still clusters this SAME
+    # subsample -- only umap_random_state varies per seed, exactly as
+    # today -- preserving this function's "pure seed-effect" meaning while
+    # cutting UMAP+HDBSCAN cost by ~train_frac. NOT a fresh subsample per
+    # seed (that's seed_sweep_stability_bootstrap()'s job, a different
+    # statistical question -- do not conflate the two). 1.0 (default) is a
+    # true no-op: every existing caller's behaviour is unchanged.
+    _train_frac = float(cfg.get("seed_sweep_train_frac", 1.0) or 1.0)
+    if _train_frac < 1.0:
+        n_total_bins = feats_sc_T.shape[0]
+        n_samp = min(n_total_bins, max(2, int(round(n_total_bins * _train_frac))))
+        _sub_idx = np.random.default_rng(base_seed).choice(
+            n_total_bins, n_samp, replace=False)
+        feats_sc_T = feats_sc_T[_sub_idx]
     seeds = [base_seed + i for i in range(int(n_seeds))]
     n_jobs = resolve_n_jobs(cfg, "seed_sweep_n_jobs", log_fn=log_fn)
     all_labels, counts, dbcv_scores = [], [], []
@@ -8914,6 +8930,18 @@ class BSoidEngine:
         #   range). Degenerate seeds are still logged and counted, just
         #   excluded from the ARI mean itself.
         seed_sweep_min_valid_clusters = 6,
+        # seed_sweep_train_frac (Option 5, HDBSCAN sweep perf, Aug 2026): 1.0
+        #   (default) = today's full-array behaviour for every existing user,
+        #   zero change unless opted into. When < 1.0, seed_sweep_stability()
+        #   draws ONE shared subsample of bins (deterministically from
+        #   umap_random_state), and every seed in the sweep clusters that
+        #   SAME subsample -- only umap_random_state varies per seed, exactly
+        #   as today, cutting UMAP+HDBSCAN cost by ~this fraction. This is
+        #   NOT the same thing as seed_sweep_stability_bootstrap() (a
+        #   separate, standalone diagnostic that draws a FRESH subsample per
+        #   seed to measure combined subsample+seed variance) -- do not
+        #   conflate the two; this key has zero effect on that function.
+        seed_sweep_train_frac = 1.0,
         # ── Consensus/co-association clustering (opt-in, Aug 2026) ────────────
         # consensus_clustering_enabled: False (default) = current behavior,
         #   the primary run_hdbscan() fit on umap_random_state's single seed
