@@ -261,6 +261,33 @@ class TestRunHdbscanTreeReuseEquivalence:
         cfg = cfg_factory(selection_mode=selection_mode)
         _assert_equivalent(embedding, cfg)
 
+    # -- Case 10 (regression, found on real data): the DBCV canary must not
+    # false-fire under the DEFAULT hdbscan_merge_thresh=0.08 config when the
+    # winning candidate is a "leaf" method -- the pre-existing (pre-Option-3)
+    # eom/leaf tie-breaking nudge adds +hdbscan_leaf_bonus to leaf candidates'
+    # ranking score, which the canary must subtract back out before comparing
+    # against the refit's real (bonus-free) relative_validity_. Confirmed on
+    # a real 29k-bin dataset: swept score - refit score == hdbscan_leaf_bonus
+    # (0.03) exactly, whenever the winner was a leaf candidate -- not a real
+    # DBCV divergence.
+    def test_case10_leaf_bonus_does_not_trigger_canary_false_positive(self):
+        embedding = make_blob_embedding(n_per_blob=200, n_blobs=5, seed=11)
+        logs = []
+        cfg = dict(
+            hdbscan_sweep_n_steps=20, hdbscan_pct_lo=2, hdbscan_pct_hi=40,
+            hdbscan_method="leaf",   # force the winner to be a leaf candidate
+            target_n_clusters=0, preferred_clusters_lo=2, preferred_clusters_hi=8,
+            hdbscan_merge_thresh=0.08, hdbscan_leaf_bonus=0.03,   # real defaults
+            hdbscan_tree_reuse_enabled=True,
+        )
+        clf, labels, score, _ = cc.run_hdbscan(embedding.copy(), cfg, log_fn=logs.append)
+        canary_lines = [l for l in logs if "tree-reuse DBCV canary" in l]
+        assert canary_lines == [], (
+            f"canary false-fired despite the leaf-bonus offset being a known, "
+            f"non-buggy ranking-only nudge: {canary_lines}")
+        # The returned score is still the real (bonus-free) relative_validity_.
+        assert score == pytest.approx(clf.relative_validity_, abs=1e-9)
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  seed_sweep_stability -- zero prior coverage (per the perf plan's own

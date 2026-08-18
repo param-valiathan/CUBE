@@ -2217,12 +2217,27 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None,
         # from the library's own computation without ever having broken
         # selection correctness (the *returned* score always comes from the
         # real refit below, never from the ported one).
-        _refit_score = getattr(best_clf, "relative_validity_", best_score)
-        if (log_fn and np.isfinite(best_score) and np.isfinite(_refit_score)
-                and abs(_refit_score - best_score) > 1e-6):
-            log_fn(f"  [DIAG] tree-reuse DBCV canary: swept score={best_score:.6f} "
+        #
+        # `best_score` (== chosen[0]) may already include the eom/leaf
+        # tie-breaking nudge applied above (+hdbscan_leaf_bonus when this
+        # candidate's method is "leaf" and hdbscan_merge_thresh > 0 -- the
+        # DEFAULT config, pre-dating Option 3 entirely) -- that nudge is a
+        # ranking-only heuristic, never reflected in a real HDBSCAN object's
+        # relative_validity_. Subtract it back out before comparing, or every
+        # real run whose winner is a leaf candidate under the default
+        # hdbscan_merge_thresh=0.08 logs a spurious ~hdbscan_leaf_bonus-sized
+        # "divergence" that isn't one (confirmed on real data: swept
+        # score - refit score == hdbscan_leaf_bonus exactly, to full float
+        # precision, whenever this fires -- not a genuine DBCV mismatch).
+        _bonus_applied = (_leaf_bonus if (_merge_thresh_cfg > 0 and _leaf_bonus
+                                           and chosen_method == "leaf") else 0.0)
+        _comparable_score = best_score - _bonus_applied
+        _refit_score = getattr(best_clf, "relative_validity_", _comparable_score)
+        if (log_fn and np.isfinite(_comparable_score) and np.isfinite(_refit_score)
+                and abs(_refit_score - _comparable_score) > 1e-6):
+            log_fn(f"  [DIAG] tree-reuse DBCV canary: swept score={_comparable_score:.6f} "
                    f"vs refit relative_validity_={_refit_score:.6f} "
-                   f"(diff={_refit_score - best_score:.2e}) -- ported "
+                   f"(diff={_refit_score - _comparable_score:.2e}) -- ported "
                    f"_dbcv_from_mst may have diverged from the library's own "
                    f"computation; selection itself is unaffected since this "
                    f"score is only used for ranking, not the returned value.")
