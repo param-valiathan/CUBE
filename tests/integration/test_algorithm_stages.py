@@ -285,8 +285,33 @@ class TestRunHdbscanTreeReuseEquivalence:
         assert canary_lines == [], (
             f"canary false-fired despite the leaf-bonus offset being a known, "
             f"non-buggy ranking-only nudge: {canary_lines}")
-        # The returned score is still the real (bonus-free) relative_validity_.
-        assert score == pytest.approx(clf.relative_validity_, abs=1e-9)
+        # The RETURNED score matches legacy's own (bonus-inclusive) convention
+        # -- it is NOT expected to equal the refit clf's raw relative_validity_
+        # when the leaf bonus was applied (see case 12: that's the whole point
+        # -- the returned value must match _tree_reuse=False, not "the most
+        # numerically pure" value). Sanity-check the bonus relationship directly.
+        assert score - clf.relative_validity_ == pytest.approx(0.03, abs=1e-9)
+
+    # -- Case 12 (regression, found on real data): the RETURNED score, not
+    # just the labels, must be equivalent between hdbscan_tree_reuse_enabled
+    # =True and =False when the winner is a leaf candidate under the default
+    # hdbscan_merge_thresh=0.08. An earlier version of the winner-refit block
+    # reassigned best_score to the refit's own (bonus-free) relative_validity_
+    # -- labels stayed identical, but the returned SCORE silently diverged
+    # from legacy by exactly hdbscan_leaf_bonus (confirmed on a real 29k-bin
+    # dataset: True returned 0.151, False returned 0.181, same winning
+    # candidate/labels). Case 10 alone couldn't catch this -- it only checks
+    # tree_reuse=True's internal self-consistency, never compares against
+    # tree_reuse=False directly under leaf-bonus conditions.
+    def test_case12_returned_score_equivalent_under_leaf_bonus(self):
+        embedding = make_blob_embedding(n_per_blob=200, n_blobs=5, seed=11)
+        cfg = dict(
+            hdbscan_sweep_n_steps=20, hdbscan_pct_lo=2, hdbscan_pct_hi=40,
+            hdbscan_method="leaf",   # force the winner to be a leaf candidate
+            target_n_clusters=0, preferred_clusters_lo=2, preferred_clusters_hi=8,
+            hdbscan_merge_thresh=0.08, hdbscan_leaf_bonus=0.03,   # real defaults
+        )
+        _assert_equivalent(embedding, cfg)
 
     # -- Case 11 (regression, Aug 2026): the sequential sweep branch must
     # log progress too, not just the parallel branch. hdbscan_sweep_n_jobs

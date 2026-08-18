@@ -2229,25 +2229,35 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None,
         with _numba_single_thread():
             best_clf = _hdb.HDBSCAN(**_winner_kwargs).fit(embedding)
         best_labels = best_clf.labels_.copy()
-        # Canary, not a hard failure: the sweep's ported _dbcv_from_mst score
-        # (used only to rank/select candidates) vs. the refit winner's real
-        # relative_validity_ should agree to within float precision -- a
-        # mismatch beyond this tolerance would mean the ported DBCV diverged
-        # from the library's own computation without ever having broken
-        # selection correctness (the *returned* score always comes from the
-        # real refit below, never from the ported one).
+        # `best_score` stays exactly `chosen[0]` -- the SAME bonus-inclusive
+        # (see below) value the legacy (_tree_reuse=False) path has always
+        # returned as its best_score, since legacy never refits/reassigns it
+        # either. This is required for true equivalence: EARLIER versions of
+        # this block reassigned best_score to the winner's real (bonus-free)
+        # relative_validity_, which is arguably "more correct" in isolation
+        # but silently broke the returned-score equivalence between
+        # hdbscan_tree_reuse_enabled=True/False whenever the winner was a
+        # "leaf" candidate under the DEFAULT hdbscan_merge_thresh=0.08 --
+        # confirmed on real data: True returned 0.151 (bonus-free refit
+        # score) vs False returned 0.181 (bonus-inclusive chosen[0]) for the
+        # IDENTICAL winning candidate/labels (labels were byte-identical;
+        # only the reported score diverged) -- exactly hdbscan_leaf_bonus's
+        # value (0.03), every time. Labels/clf are still genuinely refit for
+        # real above (necessary since _fit_one_new's candidates never build
+        # one); only the *returned score number* must match legacy's
+        # long-standing (bonus-inclusive) convention, not the refit's own
+        # internal DBCV.
         #
-        # `best_score` (== chosen[0]) may already include the eom/leaf
-        # tie-breaking nudge applied above (+hdbscan_leaf_bonus when this
-        # candidate's method is "leaf" and hdbscan_merge_thresh > 0 -- the
-        # DEFAULT config, pre-dating Option 3 entirely) -- that nudge is a
-        # ranking-only heuristic, never reflected in a real HDBSCAN object's
-        # relative_validity_. Subtract it back out before comparing, or every
-        # real run whose winner is a leaf candidate under the default
-        # hdbscan_merge_thresh=0.08 logs a spurious ~hdbscan_leaf_bonus-sized
-        # "divergence" that isn't one (confirmed on real data: swept
-        # score - refit score == hdbscan_leaf_bonus exactly, to full float
-        # precision, whenever this fires -- not a genuine DBCV mismatch).
+        # Canary, not a hard failure: the sweep's ported _dbcv_from_mst score
+        # vs. the refit winner's real relative_validity_ should agree to
+        # within float precision once the SAME eom/leaf tie-breaking nudge
+        # (+hdbscan_leaf_bonus when this candidate's method is "leaf" and
+        # hdbscan_merge_thresh > 0 -- pre-dating Option 3 entirely) is
+        # subtracted back out of best_score for a fair comparison. A mismatch
+        # beyond that would mean the ported DBCV diverged from the library's
+        # own computation -- non-fatal, logged only, since the RETURNED
+        # score/labels never depend on _dbcv_from_mst's accuracy (they come
+        # from chosen[0]/the real refit clf, not the ported score).
         _bonus_applied = (_leaf_bonus if (_merge_thresh_cfg > 0 and _leaf_bonus
                                            and chosen_method == "leaf") else 0.0)
         _comparable_score = best_score - _bonus_applied
@@ -2258,9 +2268,9 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None,
                    f"vs refit relative_validity_={_refit_score:.6f} "
                    f"(diff={_refit_score - _comparable_score:.2e}) -- ported "
                    f"_dbcv_from_mst may have diverged from the library's own "
-                   f"computation; selection itself is unaffected since this "
-                   f"score is only used for ranking, not the returned value.")
-        best_score = _refit_score
+                   f"computation; selection/returned-score correctness is "
+                   f"unaffected since both come from chosen[0]/the real refit "
+                   f"clf, never from this ported score.")
     # Non-selected candidates' clf objects (each retains a condensed tree /
     # minimum spanning tree; up to ~80 coexist in `candidates` by construction)
     # need no explicit release here: they're plain refcounted objects with no
