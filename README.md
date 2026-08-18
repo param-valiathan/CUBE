@@ -111,12 +111,25 @@ target directly rather than through a pipeline rewrite:
   `cluster_validity.png` silhouette + condensed-tree plot) and acts on it (the merge pass), instead of discarding
   it after label extraction — the same "use the hierarchy you already built" spirit behind MotionMapper-style
   multi-resolution behavioural analysis.
+- **None of B-SOiD, VAME, keypoint-MoSeq, or MotionMapper has any concept of arena/region/object in their
+  clustering step at all** — every one of them classifies behaviour from pose dynamics alone. A real
+  experimental effect that is spatially rather than kinematically defined (an anxious variant of a behaviour
+  that only occurs in an EPM open arm, an arm-specific grooming pattern in a Y-Maze) can, in those pipelines,
+  only ever show up downstream as a usage-rate difference for one shared cluster — never as a distinct
+  discovered behaviour. CUBE's **region-aware cluster splitting** (opt-in, see v5 Feature Summary below) closes
+  that gap directly inside clustering, while keeping the same position-dominance-free guarantee the
+  Environmental Context feature already established for post-hoc analysis: traced-region membership only ever
+  *selects which clusters get a second look*, never enters the UMAP/HDBSCAN feature space itself. To our
+  knowledge this makes CUBE the only pipeline in this comparison where an experiment's spatial structure can
+  change what gets labelled as a distinct behaviour without position ever substituting for movement as the
+  classification signal.
 - **Net positioning:** these additions keep CUBE's core B-SOiD architecture (minutes, not hours, per run, no GPU
   training loop) while borrowing the *diagnosis* behind VAME's and keypoint-MoSeq's improvements and applying the
-  cheapest available fix inside the existing pipeline for each one. All of it is additive and off-by-default
-  except the visibility features (see Advanced Settings below) — a full temporal re-embedding (VAME-style) or
-  generative uncertainty model (keypoint-MoSeq-style) would be the next escalation if these mitigations prove
-  insufficient for a given dataset, not something attempted here.
+  cheapest available fix inside the existing pipeline for each one, and adding a spatial-awareness capability
+  none of the compared pipelines have at all. All of it is additive and off-by-default except the visibility
+  features (see Advanced Settings below) — a full temporal re-embedding (VAME-style) or generative uncertainty
+  model (keypoint-MoSeq-style) would be the next escalation if these mitigations prove insufficient for a given
+  dataset, not something attempted here.
 
 ---
 
