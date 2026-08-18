@@ -53,6 +53,28 @@ for _k_env in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS",
 # prevent this; only disabling the duplicate-runtime abort does.
 _os_env.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+# "Fatal Python error: Aborted" crashes (Aug 2026) traced to LLVM itself,
+# inside numba/llvmlite's FIRST JIT compilation of a given function
+# (pynndescent's nn_descent during run_umap; separately, HDBSCAN's own
+# numba-jitted core-distance/boruvka code during run_hdbscan) -- always in
+# LLVM's optimizer (numba/core/codegen.py:_optimize_final_module ->
+# llvmlite's newpassmanagers.py -> ffi.py's raw ctypes call into LLVM),
+# never on a warm/cached recompile, so ordinary try/except cannot catch it.
+# Root cause: llvmlite auto-detects this machine's exact CPU
+# (llvmlite.binding.get_host_cpu_name() == "raptorlake", an Intel 13th/14th-
+# gen i9 hybrid P-core/E-core target) and JIT-compiles CPU-specific code
+# against it. numba's own avx_default() (numba/core/config.py) only disables
+# known-buggy AVX codegen for a small, stale, pre-2016 CPU blocklist
+# (sandybridge/ivybridge/etc.) that predates "raptorlake" entirely, so this
+# CPU's comparatively new/less-mature LLVM codegen support is left enabled
+# and hits a real LLVM optimizer bug. Forcing a conservative "generic"
+# target sidesteps CPU-specific codegen entirely (NUMBA_CPU_FEATURES
+# defaults to "" automatically once CPU_NAME="generic", per numba's own
+# config.py) -- a one-time compile-speed/numeric-throughput cost per unique
+# JIT'd function signature (cached in-process after first compile), not a
+# per-call one, in exchange for not natively aborting the process.
+_os_env.environ.setdefault("NUMBA_CPU_NAME", "generic")
+
 # DO NOT set NUMBA_THREADING_LAYER=workqueue here (tried and reverted, Aug
 # 2026): it was meant to fix a video-export crash later traced to an
 # unrelated pynndescent bug (see _patch_pynndescent_thread_safety() in

@@ -16,11 +16,31 @@ Handles:
     Full audit-trail JSON summary + validation_report.json
 """
 
-#   stdlib  
+#   stdlib
 import gc, json, os, pickle, re, shutil, time, traceback, warnings
 from datetime import datetime
 from itertools import combinations
 from pathlib import Path
+
+# "Fatal Python error: Aborted" crashes (Aug 2026) during numba/llvmlite's
+# FIRST JIT compilation of a given function (pynndescent's nn_descent inside
+# run_umap; HDBSCAN's own numba-jitted core-distance/boruvka code inside
+# run_hdbscan) -- native, uncatchable, and only on a cold compile, never a
+# warm/cached recompile. Root cause: llvmlite auto-detects this machine's
+# exact CPU (llvmlite.binding.get_host_cpu_name() == "raptorlake", a recent
+# Intel hybrid P-core/E-core target) and JIT-compiles CPU-specific code
+# against it; numba's own known-buggy-AVX-CPU blocklist
+# (numba/core/config.py's avx_default()) is a small, stale, pre-2016 list
+# that predates this CPU entirely, so the bug goes undisabled. Forcing a
+# conservative "generic" compile target (NUMBA_CPU_FEATURES defaults to ""
+# automatically once CPU_NAME="generic") sidesteps it. Set here too (not
+# just cube.py/cube_analyser.py's own copies of this same var) so any
+# process that imports cube_core.py directly -- the pytest suite, standalone
+# scripts -- gets the same protection; numba reads this env var once, the
+# first time numba.core.config is imported anywhere in the process, and
+# numba itself is always lazy-imported inside this module's functions, so
+# setting it here at module load time is early enough.
+os.environ.setdefault("NUMBA_CPU_NAME", "generic")
 
 #   science (always available in a DLC/BSOID conda env)  
 import numpy as np

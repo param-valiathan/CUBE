@@ -59,6 +59,15 @@ for _k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
 # the duplicate-runtime abort does.
 _os_early.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+# "Fatal Python error: Aborted" crashes (Aug 2026), traced to LLVM itself
+# inside numba/llvmlite's FIRST JIT compilation of a given function (never a
+# warm/cached recompile) -- root cause and full rationale in the matching
+# block in cube.py. Short version: this machine's CPU (llvmlite auto-
+# detects "raptorlake") isn't on numba's stale pre-2016 known-buggy-AVX-CPU
+# blocklist, so it gets CPU-specific JIT codegen that hits a real LLVM
+# optimizer bug. Forcing "generic" avoids it.
+_os_early.environ.setdefault("NUMBA_CPU_NAME", "generic")
+
 # NOTE (reverted, Aug 2026): this block previously also forced
 # NUMBA_THREADING_LAYER=workqueue here -- see the matching comment in
 # cube.py for why that theory was wrong and the override actively harmful
