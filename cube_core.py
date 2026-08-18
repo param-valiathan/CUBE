@@ -5327,6 +5327,11 @@ def _seed_sweep_one_seed(s: int, feats_sc_T: np.ndarray, cfg: dict, n_total: int
         if s in (cfg.get("_debug_fail_seeds") or ()):
             raise RuntimeError(f"[debug] injected failure for seed {s}")
         c2 = dict(cfg); c2["umap_random_state"] = s
+        # Option 4: let this seed's run_hdbscan() sweep at a different
+        # (typically coarser) grid density than the primary production sweep.
+        # 0 (default) = inherit hdbscan_sweep_n_steps -- true no-op.
+        if cfg.get("hdbscan_seed_sweep_n_steps"):
+            c2["hdbscan_sweep_n_steps"] = int(cfg["hdbscan_seed_sweep_n_steps"])
         # Force per-seed HDBSCAN work sequential: seed_sweep_n_jobs already
         # parallelizes across seeds, so letting each seed's own run_hdbscan()
         # (below) OR refine_clusters_iterative()'s split pass (which calls
@@ -5644,6 +5649,14 @@ def _consensus_one_seed(s: int, feats_sc_T: np.ndarray, cfg: dict, n_samp: int,
     """
     try:
         c2 = dict(cfg); c2["umap_random_state"] = s
+        # Option 4: let this seed's run_hdbscan() sweep at a different
+        # (typically coarser) grid density than the primary production sweep.
+        # 0 (default) = inherit hdbscan_sweep_n_steps -- true no-op. Kept as
+        # its own key (not shared with hdbscan_seed_sweep_n_steps) since
+        # consensus and seed-stability are different call sites that may
+        # want independently tunable sweep density.
+        if cfg.get("hdbscan_consensus_sweep_n_steps"):
+            c2["hdbscan_sweep_n_steps"] = int(cfg["hdbscan_consensus_sweep_n_steps"])
         # Force per-seed HDBSCAN sweep sequential: consensus_n_jobs already
         # parallelizes across seeds, so letting each seed's own run_hdbscan()
         # also spawn a thread pool would nest parallelism and oversubscribe
@@ -9283,6 +9296,19 @@ class BSoidEngine:
         hdbscan_split_candidate_cutoff  = 0,
         hdbscan_split_sweep_n_steps     = 12,
         hdbscan_split_n_jobs            = -1,
+        # hdbscan_seed_sweep_n_steps / hdbscan_consensus_sweep_n_steps
+        #   (Option 4, HDBSCAN sweep perf, Aug 2026): 0 (default) = inherit
+        #   hdbscan_sweep_n_steps (the primary sweep's own 40-step grid) for
+        #   seed_sweep_stability()'s and consensus_cluster()'s per-seed
+        #   run_hdbscan() calls, respectively -- a true no-op until explicitly
+        #   set to a nonzero coarser (or finer) value. Kept as two separate
+        #   keys rather than one shared override since seed-stability and
+        #   consensus are different call sites that may want independently
+        #   tunable sweep density. Does NOT touch run_hdbscan()'s own primary-
+        #   sweep grid construction, so the shipped clustering result is
+        #   unaffected regardless of this key's value.
+        hdbscan_seed_sweep_n_steps      = 0,
+        hdbscan_consensus_sweep_n_steps = 0,
         # recluster_max_iterations: cap on the split -> merge -> repeat
         #   refinement loop (both passes are individually gated above).
         #   2 = one split pass to resolve impurity, one merge pass to

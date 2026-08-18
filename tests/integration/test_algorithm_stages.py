@@ -263,6 +263,114 @@ class TestRunHdbscanTreeReuseEquivalence:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+#  seed_sweep_stability -- zero prior coverage (per the perf plan's own
+#  research findings); this is the foundational smoke-test baseline that
+#  Option 4's tests diff against, added before layering Option 4 on top.
+# ──────────────────────────────────────────────────────────────────────────
+
+def make_blob_features(n_per_blob=50, n_blobs=3, n_features=8, seed=0, spread=1.0):
+    rng = np.random.default_rng(seed)
+    centers = rng.uniform(-5, 5, size=(n_blobs, n_features))
+    parts = [centers[i] + rng.normal(0, spread, size=(n_per_blob, n_features))
+             for i in range(n_blobs)]
+    return np.vstack(parts).astype(float)
+
+
+SEED_SWEEP_CFG = dict(
+    umap_n_neighbors=10, umap_n_components=2, umap_min_dist=0.1,
+    umap_random_state=42, umap_n_jobs=1, pca_n_components="off",
+    hdbscan_sweep_n_steps=6, hdbscan_pct_lo=5, hdbscan_pct_hi=20,
+    hdbscan_method="eom", target_n_clusters=0,
+    preferred_clusters_lo=2, preferred_clusters_hi=4,
+    seed_sweep_n_jobs=1,
+)
+
+
+class TestSeedSweepStabilityFoundational:
+    def test_n_seeds_below_2_returns_empty_dict(self):
+        feats = make_blob_features(n_per_blob=40, n_blobs=3, seed=1)
+        assert cc.seed_sweep_stability(feats, SEED_SWEEP_CFG, n_seeds=1) == {}
+        assert cc.seed_sweep_stability(feats, SEED_SWEEP_CFG, n_seeds=0) == {}
+
+    def test_return_shape_and_keys(self):
+        feats = make_blob_features(n_per_blob=40, n_blobs=3, seed=1)
+        result = cc.seed_sweep_stability(feats, SEED_SWEEP_CFG, n_seeds=3)
+        assert result != {}
+        for key in ("seeds", "counts", "ari", "labels", "mean_ari",
+                    "stable_counts", "dbcv"):
+            assert key in result
+        assert len(result["seeds"]) == len(result["counts"]) == len(result["labels"])
+        assert result["ari"].shape == (len(result["seeds"]), len(result["seeds"]))
+
+    def test_mean_ari_in_valid_range(self):
+        feats = make_blob_features(n_per_blob=40, n_blobs=3, seed=1)
+        result = cc.seed_sweep_stability(feats, SEED_SWEEP_CFG, n_seeds=3)
+        mean_ari = result["mean_ari"]
+        if not np.isnan(mean_ari):
+            assert -1.0 <= mean_ari <= 1.0
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Option 4 -- coarser grid for diagnostic (seed/consensus) sweeps only.
+#  Both new *_sweep_n_steps keys default to 0 = inherit hdbscan_sweep_n_steps
+#  (true no-op); this suite exercises the nonzero-override plumbing and
+#  confirms the primary run_hdbscan() call path is unaffected either way.
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestOption4SeedConsensusSweepNSteps:
+    def test_seed_sweep_n_steps_override_does_not_crash_shape_unaffected(self):
+        feats = make_blob_features(n_per_blob=40, n_blobs=3, seed=1)
+        cfg = dict(SEED_SWEEP_CFG, hdbscan_seed_sweep_n_steps=3)
+        result = cc.seed_sweep_stability(feats, cfg, n_seeds=3)
+        assert result != {}
+        for key in ("seeds", "counts", "ari", "labels", "mean_ari",
+                    "stable_counts", "dbcv"):
+            assert key in result
+
+    def test_consensus_one_seed_reads_override_key(self):
+        # _consensus_one_seed is the Option 4 call site for consensus_cluster;
+        # exercise it directly (consensus_cluster itself needs no cfg changes
+        # per the plan -- only its per-seed helper reads the new key).
+        feats = make_blob_features(n_per_blob=40, n_blobs=3, seed=2)
+        cfg = dict(SEED_SWEEP_CFG, hdbscan_consensus_sweep_n_steps=3)
+        result = cc._consensus_one_seed(7, feats, cfg, n_samp=feats.shape[0])
+        assert result is not None
+        assert result["labels"].shape[0] == feats.shape[0]
+
+    def test_primary_run_hdbscan_unaffected_by_new_keys_when_unset(self):
+        # run_hdbscan() itself never reads hdbscan_seed_sweep_n_steps /
+        # hdbscan_consensus_sweep_n_steps -- only _seed_sweep_one_seed /
+        # _consensus_one_seed do, building their own cfg overrides. Presence
+        # of the (default, 0) keys in cfg must not change run_hdbscan()'s
+        # own output at all.
+        embedding = make_blob_embedding(n_per_blob=60, n_blobs=3, seed=3)
+        cfg_plain = dict(FAST_HDBSCAN_CFG)
+        cfg_with_keys = dict(FAST_HDBSCAN_CFG,
+                              hdbscan_seed_sweep_n_steps=0,
+                              hdbscan_consensus_sweep_n_steps=0)
+        _, labels_plain, score_plain, _ = cc.run_hdbscan(embedding.copy(), cfg_plain)
+        _, labels_keys, score_keys, _ = cc.run_hdbscan(embedding.copy(), cfg_with_keys)
+        assert np.array_equal(labels_plain, labels_keys)
+        if np.isnan(score_plain):
+            assert np.isnan(score_keys)
+        else:
+            assert score_keys == pytest.approx(score_plain, abs=1e-9)
+
+    def test_seed_sweep_override_zero_is_true_noop_vs_unset(self):
+        # hdbscan_seed_sweep_n_steps=0 (explicit) must behave identically to
+        # the key being absent entirely -- both mean "inherit
+        # hdbscan_sweep_n_steps". Compare _seed_sweep_one_seed's own result
+        # directly (single seed, deterministic).
+        feats = make_blob_features(n_per_blob=40, n_blobs=3, seed=1)
+        cfg_unset = dict(SEED_SWEEP_CFG)
+        cfg_zero = dict(SEED_SWEEP_CFG, hdbscan_seed_sweep_n_steps=0)
+        r_unset = cc._seed_sweep_one_seed(42, feats, cfg_unset, feats.shape[0])
+        r_zero = cc._seed_sweep_one_seed(42, feats, cfg_zero, feats.shape[0])
+        assert r_unset is not None and r_zero is not None
+        assert np.array_equal(r_unset["labels"], r_zero["labels"])
+
+
+# ──────────────────────────────────────────────────────────────────────────
 #  train_mlp
 # ──────────────────────────────────────────────────────────────────────────
 
