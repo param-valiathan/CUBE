@@ -1314,6 +1314,18 @@ def _apply_dlc_monkeypatch(logger):
         logger.warn(f"  [MONKEYPATCH] Could not apply BatchNorm unfreeze: {e}")
 
 
+def _vram_batch_tier(free_gb: float) -> int:
+    """GPU-VRAM-based inference batch-size tier, shared by every DLC
+    auto-batch-size call site (regular path's initial calc and per-video
+    re-check, Smart Adapt's initial calc): 32 if usable free VRAM (85% of
+    `free_gb`, to avoid OOM) is >= 10GB, 16 if >= 5GB, else 8. Callers keep
+    their own torch-availability/exception handling around this -- only the
+    threshold arithmetic itself is centralized here.
+    """
+    usable_gb = free_gb * 0.85
+    return 32 if usable_gb >= 10 else (16 if usable_gb >= 5 else 8)
+
+
 #
 #  STEP IMPLEMENTATIONS  (run in background threads)
 #  
@@ -1418,8 +1430,7 @@ def _run_dlc_step(session: SessionState, settings: SettingsPanel,
         import torch
         if torch.cuda.is_available():
             free_gb = torch.cuda.mem_get_info()[0] / 1024**3
-            usable_gb = free_gb * 0.85
-            inf_batch = 32 if usable_gb >= 10 else (16 if usable_gb >= 5 else 8)
+            inf_batch = _vram_batch_tier(free_gb)
     except Exception:
         pass
     if _inf_batch_ov > 0:
@@ -1523,8 +1534,7 @@ def _run_dlc_step(session: SessionState, settings: SettingsPanel,
                 import torch
                 if torch.cuda.is_available():
                     free_gb = torch.cuda.mem_get_info()[0] / 1024**3
-                    usable_gb = free_gb * 0.85
-                    inf_batch = 32 if usable_gb >= 10 else (16 if usable_gb >= 5 else 8)
+                    inf_batch = _vram_batch_tier(free_gb)
                     det_batch = _det_batch_ov if _det_batch_ov > 0 else inf_batch
                     logger(f"  VRAM: {free_gb:.1f} GB free → batch {inf_batch}")
             except Exception:
@@ -1876,8 +1886,7 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
             import torch
             if torch.cuda.is_available():
                 free_gb = torch.cuda.mem_get_info()[0] / 1024**3
-                usable_gb = free_gb * 0.85
-                inf_batch = 32 if usable_gb >= 10 else (16 if usable_gb >= 5 else 8)
+                inf_batch = _vram_batch_tier(free_gb)
         except Exception:
             pass
     det_batch = _det_batch_ov if _det_batch_ov > 0 else inf_batch
