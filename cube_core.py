@@ -2591,63 +2591,39 @@ def _mean_silhouette_per_cluster(X: np.ndarray, labels: np.ndarray,
     return sil_full, means
 
 
-def split_impure_clusters(feats_sc: np.ndarray, embedding: np.ndarray,
-                           labels: np.ndarray, split_silhouette_thresh,
-                           cfg: dict, log_fn=None) -> np.ndarray:
+def _local_recluster_and_assign(feats_sc: np.ndarray, embedding: np.ndarray,
+                                 labels: np.ndarray, candidate_ids: list,
+                                 local_cfg_fn, cfg: dict, log_fn=None,
+                                 candidate_detail_fn=None) -> np.ndarray:
     """
-    Locally re-clusters any cluster whose MEAN per-bin silhouette falls below
-    split_silhouette_thresh — the "impure/heterogeneous cluster" side of issue
-    4's bidirectional refinement.  For each candidate cluster, re-runs
-    run_umap + run_hdbscan restricted to just that cluster's rows of feats_sc.
-    The split is accepted ONLY when a real, stable multi-cluster local result
-    is found (finite DBCV > 0, >= 2 sub-clusters) — never forced.
+    Shared mechanics behind every "locally re-cluster a subset of impure
+    clusters and splice the result back into the global labels" pass
+    (currently: split_impure_clusters()'s silhouette-based candidates;
+    split_region_impure_clusters()'s region-entropy-based candidates).
+    Extracted from split_impure_clusters()'s original body — see that
+    function's docstring for the perf/mitigation rationale (candidate
+    bounding, cheap local sweep params, parallel dispatch with deterministic
+    sequential id assignment), which is unchanged here, just parameterized.
 
-    split_silhouette_thresh in (None, 0) is a hard no-op — returns `labels`
-    unchanged (matches the "off by default" DEFAULTS key).
+    candidate_ids       : cluster ids to attempt splitting, already selected
+                           and bounded by the caller (this helper does no
+                           further filtering/ranking of ITS OWN).
+    local_cfg_fn(cid)   : builds that candidate's local override cfg dict
+                           (umap_n_neighbors, preferred_clusters_lo/hi,
+                           hdbscan_* local-sweep overrides, etc.). The
+                           returned dict's "preferred_clusters_hi" is also
+                           read here as the local acceptance ceiling on
+                           sub-cluster count.
+    candidate_detail_fn(cid) -> str, optional: extra parenthetical detail
+                           appended to this candidate's log line (e.g. the
+                           silhouette-vs-threshold text split_impure_clusters
+                           logs). Omit for a plain log line.
 
-    Perf (Aug 2026): each candidate's local run_hdbscan() used to run the
-    full production 40-step x 2-method sweep -- fine for the primary
-    whole-session fit, but combinatorially expensive here since it repeats
-    per candidate, per refinement iteration, per seed in any seed-sweep/
-    consensus loop. Confirmed on a real 21-session dataset: one seed with an
-    unusually fragmented raw partition took 25+ minutes in this function
-    alone (vs 1-2 min for every other seed). Three independent mitigations,
-    all opt-out via cfg for exact reproducibility of pre-fix behavior:
-      1. Candidates are filtered to a stricter silhouette cutoff first
-         (hdbscan_split_candidate_cutoff, default split_silhouette_thresh/2)
-         -- only the worst-of-the-worst clusters attempt a split by default.
-         If that cutoff leaves none (too strict for this partition), or still
-         leaves more than hdbscan_split_max_candidates (default 10), falls
-         back to the worst-N candidates by silhouette -- a hard ceiling on
-         candidate count regardless of how fragmented a given partition is.
-      2. Each candidate's local sweep uses hdbscan_split_sweep_n_steps
-         (default 12, vs 40 for the primary fit) and a single method (eom
-         only) -- a local few-hundred-point subset only needs to distinguish
-         "did this split into hdbscan_split_max_subclusters clean pieces",
-         not fine mcs resolution across the full dynamic range.
-      3. Candidates are independent (disjoint point sets) and are attempted
-         in parallel via joblib (hdbscan_split_n_jobs, default -1 = all
-         cores). Sub-cluster id allocation still happens sequentially AFTER
-         all results are collected, in the original candidate order, so
-         results are deterministic regardless of worker scheduling.
+    Returns labels unchanged if candidate_ids is empty.
     """
     labels = np.asarray(labels).copy()
-    if not split_silhouette_thresh:
+    if not candidate_ids:
         return labels
-    _, means = _mean_silhouette_per_cluster(embedding, labels)
-    candidates = [c for c, m in means.items() if m < split_silhouette_thresh]
-    if not candidates:
-        return labels
-
-    # ── Bound worst-case candidate count (mitigation 1) ────────────────────
-    _max_candidates = int(cfg.get("hdbscan_split_max_candidates", 10) or 10)
-    _cutoff_cfg = float(cfg.get("hdbscan_split_candidate_cutoff", 0) or 0)
-    _strict_cutoff = _cutoff_cfg if _cutoff_cfg > 0 else split_silhouette_thresh * 0.5
-    _strict = [c for c in candidates if means[c] < _strict_cutoff]
-    if _strict:
-        candidates = _strict
-    if len(candidates) > _max_candidates:
-        candidates = sorted(candidates, key=lambda c: means[c])[:_max_candidates]
 
     new_labels = labels.copy()
     next_id = (int(labels.max()) + 1) if labels.size and labels.max() >= 0 else 0
@@ -2663,51 +2639,26 @@ def split_impure_clusters(feats_sc: np.ndarray, embedding: np.ndarray,
     # local splits attempted on 90-300 point subsets of a 915-feature space
     # (ratio 0.1-1.1 even after PCA), producing untrustworthy sub-clusters.
     _min_local_pts = int(cfg.get("hdbscan_split_min_points", 250))
-    _base_nn  = int(cfg.get("umap_n_neighbors", 15) or 15)
-    _max_sub  = int(cfg.get("hdbscan_split_max_subclusters", 3))
-    _merge_thresh    = float(cfg.get("hdbscan_merge_thresh", 0.0) or 0.0)
-    _split_n_steps   = int(cfg.get("hdbscan_split_sweep_n_steps", 12) or 12)
+    _merge_thresh  = float(cfg.get("hdbscan_merge_thresh", 0.0) or 0.0)
 
     # ── Precompute each candidate's local inputs (cheap, sequential) ───────
     # Only the small per-candidate slice (not the full feats_sc/labels) is
     # shipped to worker processes below -- keeps parallel-dispatch
     # serialization cost proportional to candidate size, not dataset size.
     tasks = []  # (cid, idx, sub_feats_T, local_cfg)
-    for cid in candidates:
+    for cid in candidate_ids:
         idx = np.flatnonzero(labels == cid)
         if idx.size < _min_local_pts:   # too few points for a meaningful local re-embedding
             continue
         sub_feats_T = feats_sc[:, idx].T   # (n_sub, n_feat)
-        local_cfg = dict(cfg)
-        local_cfg["umap_n_neighbors"] = max(5, min(_base_nn, idx.size // 3))
-        # preferred_clusters_lo/hi (default 8-30) and hdbscan_fine_bias are
-        # calibrated for selecting a cluster count across the WHOLE session
-        # -- both are wrong for locally re-clustering a single impure
-        # cluster's idx.size points.  Inheriting them from cfg unmodified
-        # made fine_bias (active whenever merge_thresh>0, the default)
-        # systematically push local selection toward the TOP of the *global*
-        # preferred range regardless of local scale, producing wild
-        # over-fragmentation in practice (a single cluster split into 29-30
-        # tiny fragments in one pass on a real run). A split should resolve
-        # a handful of distinct sub-behaviours, not fragment extensively --
-        # cap the local target range and disable fine_bias/leaf_bonus.
-        local_cfg["preferred_clusters_lo"] = 2
-        local_cfg["preferred_clusters_hi"] = _max_sub
-        local_cfg["hdbscan_fine_bias"]     = 0.0
-        local_cfg["hdbscan_leaf_bonus"]    = 0.0
-        local_cfg["hdbscan_method"]        = "eom"
-        local_cfg["hdbscan_sweep_n_steps"] = _split_n_steps
-        # Force the LOCAL sweep sequential: hdbscan_split_n_jobs below already
-        # parallelizes across candidates, so letting each candidate's own
-        # run_hdbscan() also spawn a thread pool would nest parallelism and
-        # oversubscribe past the resolved budget.
-        local_cfg["hdbscan_sweep_n_jobs"] = 1
+        local_cfg = local_cfg_fn(cid)
         tasks.append((cid, idx, sub_feats_T, local_cfg))
 
     if not tasks:
         return new_labels
 
     def _attempt_split(sub_feats_T, local_cfg, n_total):
+        _max_sub = int(local_cfg.get("preferred_clusters_hi", 3))
         try:
             with _numba_single_thread():
                 _, sub_embedding = run_umap(sub_feats_T, local_cfg)
@@ -2780,11 +2731,109 @@ def split_impure_clusters(feats_sc: np.ndarray, embedding: np.ndarray,
         new_labels[idx[noise_m]] = -1
 
         if log_fn:
-            log_fn(f"  [split] cluster #{cid} (mean silhouette "
-                   f"{means[cid]:.3f} < {split_silhouette_thresh}) -> "
+            detail = candidate_detail_fn(cid) if candidate_detail_fn else ""
+            log_fn(f"  [split] cluster #{cid}{detail} -> "
                    f"{n_sub_cl} sub-cluster(s) (local DBCV={sub_score:.3f})")
 
     return new_labels
+
+
+def split_impure_clusters(feats_sc: np.ndarray, embedding: np.ndarray,
+                           labels: np.ndarray, split_silhouette_thresh,
+                           cfg: dict, log_fn=None) -> np.ndarray:
+    """
+    Locally re-clusters any cluster whose MEAN per-bin silhouette falls below
+    split_silhouette_thresh — the "impure/heterogeneous cluster" side of issue
+    4's bidirectional refinement.  For each candidate cluster, re-runs
+    run_umap + run_hdbscan restricted to just that cluster's rows of feats_sc.
+    The split is accepted ONLY when a real, stable multi-cluster local result
+    is found (finite DBCV > 0, >= 2 sub-clusters) — never forced.
+
+    split_silhouette_thresh in (None, 0) is a hard no-op — returns `labels`
+    unchanged (matches the "off by default" DEFAULTS key).
+
+    Perf (Aug 2026): each candidate's local run_hdbscan() used to run the
+    full production 40-step x 2-method sweep -- fine for the primary
+    whole-session fit, but combinatorially expensive here since it repeats
+    per candidate, per refinement iteration, per seed in any seed-sweep/
+    consensus loop. Confirmed on a real 21-session dataset: one seed with an
+    unusually fragmented raw partition took 25+ minutes in this function
+    alone (vs 1-2 min for every other seed). Three independent mitigations,
+    all opt-out via cfg for exact reproducibility of pre-fix behavior:
+      1. Candidates are filtered to a stricter silhouette cutoff first
+         (hdbscan_split_candidate_cutoff, default split_silhouette_thresh/2)
+         -- only the worst-of-the-worst clusters attempt a split by default.
+         If that cutoff leaves none (too strict for this partition), or still
+         leaves more than hdbscan_split_max_candidates (default 10), falls
+         back to the worst-N candidates by silhouette -- a hard ceiling on
+         candidate count regardless of how fragmented a given partition is.
+      2. Each candidate's local sweep uses hdbscan_split_sweep_n_steps
+         (default 12, vs 40 for the primary fit) and a single method (eom
+         only) -- a local few-hundred-point subset only needs to distinguish
+         "did this split into hdbscan_split_max_subclusters clean pieces",
+         not fine mcs resolution across the full dynamic range.
+      3. Candidates are independent (disjoint point sets) and are attempted
+         in parallel via joblib (hdbscan_split_n_jobs, default -1 = all
+         cores). Sub-cluster id allocation still happens sequentially AFTER
+         all results are collected, in the original candidate order, so
+         results are deterministic regardless of worker scheduling.
+    """
+    labels = np.asarray(labels).copy()
+    if not split_silhouette_thresh:
+        return labels
+    _, means = _mean_silhouette_per_cluster(embedding, labels)
+    candidates = [c for c, m in means.items() if m < split_silhouette_thresh]
+    if not candidates:
+        return labels
+
+    # ── Bound worst-case candidate count (mitigation 1) ────────────────────
+    _max_candidates = int(cfg.get("hdbscan_split_max_candidates", 10) or 10)
+    _cutoff_cfg = float(cfg.get("hdbscan_split_candidate_cutoff", 0) or 0)
+    _strict_cutoff = _cutoff_cfg if _cutoff_cfg > 0 else split_silhouette_thresh * 0.5
+    _strict = [c for c in candidates if means[c] < _strict_cutoff]
+    if _strict:
+        candidates = _strict
+    if len(candidates) > _max_candidates:
+        candidates = sorted(candidates, key=lambda c: means[c])[:_max_candidates]
+
+    _base_nn  = int(cfg.get("umap_n_neighbors", 15) or 15)
+    _max_sub  = int(cfg.get("hdbscan_split_max_subclusters", 3))
+    _split_n_steps = int(cfg.get("hdbscan_split_sweep_n_steps", 12) or 12)
+
+    def _local_cfg_fn(cid):
+        idx_size = int(np.count_nonzero(labels == cid))
+        local_cfg = dict(cfg)
+        local_cfg["umap_n_neighbors"] = max(5, min(_base_nn, idx_size // 3))
+        # preferred_clusters_lo/hi (default 8-30) and hdbscan_fine_bias are
+        # calibrated for selecting a cluster count across the WHOLE session
+        # -- both are wrong for locally re-clustering a single impure
+        # cluster's idx.size points.  Inheriting them from cfg unmodified
+        # made fine_bias (active whenever merge_thresh>0, the default)
+        # systematically push local selection toward the TOP of the *global*
+        # preferred range regardless of local scale, producing wild
+        # over-fragmentation in practice (a single cluster split into 29-30
+        # tiny fragments in one pass on a real run). A split should resolve
+        # a handful of distinct sub-behaviours, not fragment extensively --
+        # cap the local target range and disable fine_bias/leaf_bonus.
+        local_cfg["preferred_clusters_lo"] = 2
+        local_cfg["preferred_clusters_hi"] = _max_sub
+        local_cfg["hdbscan_fine_bias"]     = 0.0
+        local_cfg["hdbscan_leaf_bonus"]    = 0.0
+        local_cfg["hdbscan_method"]        = "eom"
+        local_cfg["hdbscan_sweep_n_steps"] = _split_n_steps
+        # Force the LOCAL sweep sequential: hdbscan_split_n_jobs already
+        # parallelizes across candidates, so letting each candidate's own
+        # run_hdbscan() also spawn a thread pool would nest parallelism and
+        # oversubscribe past the resolved budget.
+        local_cfg["hdbscan_sweep_n_jobs"] = 1
+        return local_cfg
+
+    def _detail_fn(cid):
+        return f" (mean silhouette {means[cid]:.3f} < {split_silhouette_thresh})"
+
+    return _local_recluster_and_assign(
+        feats_sc, embedding, labels, candidates, _local_cfg_fn, cfg,
+        log_fn=log_fn, candidate_detail_fn=_detail_fn)
 
 
 def refine_clusters_iterative(feats_sc: np.ndarray, embedding: np.ndarray,
