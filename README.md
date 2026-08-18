@@ -322,6 +322,25 @@ With `auto_bsoid = True`, completing the 3D DLC step automatically triggers Step
   `hdbscan_split_n_jobs` (default -1, thread pool — not separate processes, which triggered a real Windows
   crash in testing from a numba JIT-compilation race) together bound this without changing behavior for the
   common case (few impure clusters).
+- **Region-aware cluster splitting (opt-in, `hdbscan_region_split_enabled`, default off):** an additional split
+  pass in the same iterative split/merge refinement loop, run after the existing silhouette-based split and
+  before merge. Where the existing split flags a cluster by low mean silhouette (kinematic impurity), this one
+  flags a cluster whose bins are spatially impure with respect to traced arena regions (`env_arena_cfg`,
+  Environments/Objects/Paradigms window) — e.g. a cluster that is 85% Periphery / 15% Center time might be two
+  behaviourally distinct sub-clusters the feature space alone doesn't separate. Candidate selection uses
+  normalized Shannon entropy of each cluster's region-label distribution (`hdbscan_region_split_impurity_thresh`,
+  default `0.5`) with a minority-region floor (`hdbscan_region_split_min_minority_frac`, default `0.15`) so a
+  cluster is never split over noise-level (e.g. 1%) region contamination. Region data never enters the
+  UMAP/HDBSCAN feature space itself — it only selects which clusters attempt a local re-embed-and-recluster; the
+  local re-clustering still runs purely on kinematic features and is only accepted when HDBSCAN/DBCV find a real,
+  stable local split, exactly like the existing silhouette-based split. Also wired into consensus mode (requires
+  `consensus_refine_enabled`, on by default when consensus runs) and an optional one-shot
+  `region_split_pre_reduction_pct` convenience that multiplies the primary sweep's preferred-cluster-count range
+  for that sweep only (not a target-seeking retry loop — see the logged before/after cluster-count trace line).
+  `validation_report.json` gains a `region_split` block (cluster-count trace, how many clusters were created)
+  when active; `cluster_hierarchy_*.png` gains an optional per-leaf region-composition bar and a star marker on
+  clusters actually created by a region-aware split this run. Off by default — byte-identical output to a run
+  without this feature. See `CUBE_ANALYSIS_METHODOLOGY.md` Section 7 for the full design rationale.
 - **Adaptive parallel HDBSCAN sweep + system resource management (Aug 2026):** the primary `min_cluster_size`
   sweep (up to 40 steps × 2 methods) used to run as a plain sequential loop — most CPU cores sat idle for the
   majority of a run's wall-clock time. It dispatches via the same thread-pool pattern as `hdbscan_split_n_jobs`
@@ -804,6 +823,14 @@ Both Cluster Hierarchy and Guided Merge require `model/cluster_feature_centroids
                                               gated derived metrics; not written at all otherwise
     hmm_model.pkl
     feature_config.json                     ← feature_version: "v2" or "v3d"
+    cluster_feature_centroids.npz           ← (if cluster_hierarchy_enabled) feature-space
+                                              centroids backing cluster_hierarchy_*.png; also
+                                              carries region_names/region_composition_frac/
+                                              region_split_marked_ids when
+                                              hdbscan_region_split_enabled=True
+  validation_report.json                    ← run summary; gains a region_split block (cluster-
+                                              count trace, clusters created) when
+                                              hdbscan_region_split_enabled=True
   plots/
     umap_embedding.png
     umap_3d.html

@@ -59,6 +59,7 @@ both without adopting a different core architecture:
 | Animal turned away from camera degrades face/forepaw tracking confidence, and those frames pollute or fragment real clusters | keypoint-MoSeq models per-keypoint measurement uncertainty generatively | **Adaptive visibility/occlusion features**: per-bin, per-region fraction of bodyparts below an *adaptive* (per-bodypart, per-session percentile-based, not a fixed global constant) confidence threshold, added as explicit feature columns. This lets HDBSCAN isolate low-confidence frames into their own identifiable cluster (flagged in `cluster_confidence.csv` and in the analyser's group editor) instead of scattering them through real behaviour clusters. **On by default** — the one new setting that changes default output, because it is a direct fix for a confirmed contamination pattern rather than a judgment call. |
 | No way to see whether a cluster is internally consistent, only the 2D UMAP scatter | MotionMapper-style multi-resolution hierarchies; standard silhouette diagnostics in clustering generally | A new **`cluster_validity.png`** (silhouette diagram + HDBSCAN condensed-tree plot) generated every run, plus a matching "Cluster Validity" mode in the Step-5 analyser — both fed by data (the fitted `hdb_clf`, the embedding, the labels) that the pipeline already computes but previously discarded after label extraction. |
 | Example clips shown for a cluster look inconsistent even when the cluster itself is fine | — (implementation detail, not a literature gap) | `create_example_clips` now selects clips nearest to the cluster's **feature-space centroid** in the UMAP embedding, instead of nearest to the cluster's *median bout duration* — two clips of "typical length" can sit at opposite ends of a cluster in feature space, which was a direct, fixable contributor to "inconsistent-looking" examples. |
+| A cluster looks kinematically consistent (high silhouette) but is actually two spatially distinct behaviour contexts the feature space doesn't separate | — (CUBE-specific extension of this pipeline's own split mechanism, layered on Section 6's environmental-context data) | **Optional region-aware splitting** (Section 7): the same local re-embed-and-recluster mechanism as the split above, but candidate selection also considers normalized entropy of a cluster's traced-region membership, with a minority-fraction floor against noise-level contamination. Region data never enters the feature space — it only selects which clusters attempt a local re-cluster; HDBSCAN/DBCV still decide on kinematic terms alone. Off by default, requires traced regions (Section 6). |
 
 Every mechanism above operates **after or alongside** the existing UMAP+HDBSCAN+MLP+HMM pipeline — none of it
 replaces a stage or requires retraining a temporal model. That is a deliberate scope limit: it borrows the
@@ -209,6 +210,61 @@ Full parameter reference, per-paradigm tracing requirements, use cases, and shor
 `Behavioral_Paradigms_Reference.md`; implementation detail (schema, deviations, verification) is in
 `Environmental_Context_v6_Implementation_Report.md`, `Kinematics_v6_Implementation_Report.md`, and
 `Analyser_Paradigm_Reporting_v6_Implementation_Report.md`.
+
+---
+
+## 7. Region-aware cluster refinement (v1, opt-in, primary pipeline)
+
+Section 2's iterative split/merge refinement pass (the fragmentation/impurity mitigation adopted from the
+field's general silhouette/condensed-tree diagnostics) flags a candidate for splitting using exactly one
+signal: how internally consistent a cluster looks in **kinematic feature space** (mean per-bin silhouette).
+That signal is blind to a real, common failure mode Section 6's environmental-context work made newly
+visible: a cluster can look kinematically consistent while actually being **two spatially distinct
+behaviours** the feature space doesn't separate cleanly — e.g. a "grooming" cluster that is 85% Periphery
+time and 15% Center time in an Open Field session may really be two different grooming *contexts* (a
+defensive/anxious variant near the wall vs. a relaxed variant in the open), not one behaviour, even though
+their kinematic signatures overlap enough that silhouette alone never flags the cluster as impure.
+
+**Design constraint carried over unchanged from Section 6.** The same "structurally position-dominance-free"
+commitment that keeps `env_features_enabled`'s region/object time series out of the UMAP/HDBSCAN feature
+space applies here without exception: region membership never becomes a clustering feature. It only ever
+**selects which existing clusters attempt a local re-embed-and-recluster**, exactly mirroring the mechanics
+Section 2's silhouette-triggered split already uses — the local re-clustering itself still runs purely on
+kinematic features, and HDBSCAN/DBCV still decide, on their own terms, whether a real stable split exists.
+A cluster is never split just because its bins happen to sit in different regions; it is split only when
+that spatial impurity crosses a threshold *and* a genuine kinematic sub-structure is found locally. This
+keeps the same guarantee Section 6 established for the post-hoc analysis (position never substitutes for
+movement as a behavioral signal) intact for the primary clustering itself.
+
+**Impurity criterion: normalized Shannon entropy, not a hand-tuned position-overlap heuristic.** Each
+candidate cluster's region-label distribution across its own bins is scored by normalized entropy (0 = every
+bin in one region, 1 = maximally mixed across however many regions are represented) — the same
+"cluster-level scalar, threshold-compared" shape `_mean_silhouette_per_cluster` already uses, so it composes
+directly with the existing worst-first candidate-bounding machinery rather than requiring new selection
+logic. A minority-fraction floor (default 15% of a cluster's region-labelled bins) sits alongside the
+entropy threshold specifically to avoid splitting on noise-level contamination — e.g. a cluster that is 99%
+Center / 1% Periphery (likely a single frame's tracking jitter near a region boundary) should not be forced
+into two fragments over 1% of its bins.
+
+**A one-shot convenience, not a target-seeking algorithm.** An earlier design idea — "lower the preferred
+cluster-count range going in, and let region-aware splitting bring the count back up to a similar target" —
+was evaluated and explicitly *not* built as a closed-loop retry mechanism. This codebase has no existing
+precedent for iteratively re-running HDBSCAN toward a target count, and building one introduces real
+oscillation/instability risk with no field precedent motivating it here. What shipped instead
+(`region_split_pre_reduction_pct`) is a single, one-shot multiplier applied to the primary sweep's own
+preferred-cluster-count range, with a clearly logged before/after cluster-count trace — an honestly-scoped
+convenience the user can read and retune, not a promise that the final count lands anywhere specific.
+
+**Consequence for how a region-split-derived cluster is later treated.** Because the split still produces
+ordinary HDBSCAN-style cluster ids from a real local UMAP+HDBSCAN fit, every downstream stage — MLP
+training, HMM smoothing, rare-cluster pruning, and (when active) the existing condensed-tree merge pass —
+treats a region-split-derived cluster identically to a silhouette-split-derived or a directly-selected one.
+No new downstream machinery was needed; this was verified rather than assumed (see the implementation
+report's Phase 6 for the specific test coverage this claim rests on).
+
+Full parameter reference and GUI location are in `CUBE_GUIDE.md`'s Environments/Objects/Paradigms section;
+implementation detail (schema, phased equivalence-test results, deviations from the original plan) is in
+`Region_Aware_Refinement_Implementation_Report.md`.
 
 ---
 
