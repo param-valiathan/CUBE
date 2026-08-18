@@ -4322,6 +4322,19 @@ _ENV_BOUNDARY_HINT = {
     "novel_object": "circle or polygon -- whatever matches your arena",
     "custom": "circle or polygon -- whatever matches your arena",
 }
+# One-sentence draw-order + auto-assumption cheat sheet per paradigm, shown
+# on the tracing screen. Leftover-zone names mirror
+# cube_core.ENV_LEFTOVER_REGION_NAME (boundary minus every traced region is
+# auto-labeled that name at compute time -- see compute_session_env_context).
+_ENV_DRAW_HINT = {
+    "open_field":         "Draw the boundary, then a 'Center' region -- the ring between them is auto-labeled 'Periphery'.",
+    "novel_object":       "Draw the two objects and tag their roles 'familiar' / 'novel' -- no boundary or regions needed.",
+    "y_maze":             "Draw the boundary, then all 3 arms (role 'arm') -- the junction between them is auto-labeled 'Hub'.",
+    "elevated_plus_maze": "Draw the boundary, then the 2 open arms (role 'open_arm') and 2 closed arms (role 'closed_arm') -- the middle square is auto-labeled 'Center'.",
+    "three_chamber":      "Draw the boundary, the Left/Right chambers, then the objects/cups tagged 'stranger' / 'empty' / 'novel_stranger' -- the middle compartment is auto-labeled 'Center Chamber'.",
+    "place_preference":   "Draw the boundary, then Chamber A (role 'paired') and Chamber B (role 'unpaired') -- the connecting zone is auto-labeled 'Middle/Neutral'.",
+    "custom":             "Draw whatever boundary, regions, and objects your setup needs -- nothing is auto-labeled or assumed.",
+}
 _ENV_VIDEO_EXTS = {".avi", ".mp4", ".mov", ".mkv", ".wmv"}
 _ENV_PARADIGM_DESCRIPTIONS = {
     "open_field":         "General region/object time -- no paradigm-specific index.",
@@ -4872,6 +4885,12 @@ class EnvContextWindow(tk.Toplevel):
             _mk_tool_btn(self._adv_btn_frame, secondary,
                          f"Add {'Object' if secondary == 'object' else 'Region'}")
             self._adv_btn_frame.pack_forget()
+
+        _draw_hint = _ENV_DRAW_HINT.get(paradigm)
+        if _draw_hint:
+            tk.Label(left, text=f"{_ENV_PARADIGM_LABELS.get(paradigm, paradigm)}: {_draw_hint}",
+                     font=("Segoe UI", 8, "italic"), bg=C["bg"], fg=C["dim"],
+                     wraplength=520, justify="left").pack(fill="x", pady=(0, 4))
 
         finish_row = tk.Frame(left, bg=C["bg"])
         finish_row.pack(fill="x")

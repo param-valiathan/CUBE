@@ -1775,6 +1775,44 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None,
     if _sweep_n_jobs != 1 and len(_tasks) > 1:
         try:
             from joblib import Parallel, delayed
+            if log_fn:
+                log_fn(f"  [hdbscan-sweep] dispatching {len(_tasks)} candidates "
+                       f"({len(methods)} method(s) x {len(pcts)} min_cluster_size "
+                       f"steps) across n_jobs={_sweep_n_jobs} worker threads...")
+            # Progress + heartbeat: same reasoning/pattern as seed_sweep_
+            # stability() and consensus_cluster()'s dispatch -- this sweep can
+            # take minutes with no output otherwise, indistinguishable from a
+            # hang. Reported every 10 candidates (rather than every one, like
+            # the seed sweeps) since this sweep is 40+ candidates vs. their
+            # handful of seeds, and per-candidate lines would be log spam.
+            _t0 = time.time()
+            _progress_lock = _threading.Lock()
+            _progress_done = [0]
+            def _on_task_done():
+                if not log_fn:
+                    return
+                with _progress_lock:
+                    _progress_done[0] += 1
+                    n_done = _progress_done[0]
+                if n_done % 10 == 0 or n_done == len(_tasks):
+                    log_fn(f"  [hdbscan-sweep] {n_done}/{len(_tasks)} candidates "
+                           f"fit  ({time.time() - _t0:.0f}s elapsed)")
+            _hb_stop = _threading.Event()
+            def _heartbeat():
+                while not _hb_stop.wait(30):
+                    with _progress_lock:
+                        n_done = _progress_done[0]
+                    if log_fn:
+                        log_fn(f"  [hdbscan-sweep] still running — "
+                               f"{n_done}/{len(_tasks)} candidates fit, "
+                               f"{time.time() - _t0:.0f}s elapsed...")
+            _threading.Thread(target=_heartbeat, daemon=True).start()
+
+            def _fit_one_tracked(method, pct):
+                r = _fit_one(method, pct)
+                _on_task_done()
+                return r
+
             # Oversubscription guard (BLAS half): mirrors split_impure_
             # clusters()/seed_sweep_stability()/consensus_cluster(), which
             # all wrap their own Parallel(...) dispatch the same way -- see
@@ -1785,9 +1823,12 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None,
             # inside each worker's own numpy/sklearn steps (PCA, distance
             # computation) would each try to claim all cores on top of the
             # numba contention _fit_one already guards against above.
-            with _blas_single_thread_for_dispatch():
-                _raw = Parallel(n_jobs=_sweep_n_jobs, prefer="threads")(
-                    delayed(_fit_one)(method, pct) for method, pct in _tasks)
+            try:
+                with _blas_single_thread_for_dispatch():
+                    _raw = Parallel(n_jobs=_sweep_n_jobs, prefer="threads")(
+                        delayed(_fit_one_tracked)(method, pct) for method, pct in _tasks)
+            finally:
+                _hb_stop.set()
         except Exception:
             _raw = [_fit_one(method, pct) for method, pct in _tasks]
     else:
@@ -4172,6 +4213,19 @@ ENV_PARADIGM_MIN_ROLES = {
     "place_preference":   {"paired": 1, "unpaired": 1},
 }
 
+# Paradigms whose apparatus has one "leftover" zone geometrically implied by
+# the others (a hole/gap the user shouldn't have to trace by hand): boundary
+# minus every traced region becomes this synthetic region name, IF a
+# boundary was traced and at least one real region was too. Read by
+# compute_session_env_context; see its "Periphery" comment for the rationale.
+ENV_LEFTOVER_REGION_NAME = {
+    "open_field":         "Periphery",
+    "y_maze":              "Hub",
+    "elevated_plus_maze":  "Center",
+    "three_chamber":       "Center Chamber",
+    "place_preference":    "Middle/Neutral",
+}
+
 
 def resolve_env_shapes(env_cfg: "dict | None", stem: str) -> list:
     """
@@ -4428,6 +4482,23 @@ def compute_session_env_context(env_cfg: "dict | None", stem: str,
         # open-arm platform edges) the same way object exploration already
         # uses the nose point instead of the whole-body centroid.
         dist_to_region_boundary_nose[r["name"]] = _bin_agg(_nearest_edge_distances(nose_x, nose_y, r["vertices"]))
+
+    # Some paradigms have one zone that's geometrically implied by the
+    # others -- Open Field's periphery (boundary minus center), Y-Maze's hub
+    # (boundary minus the 3 arms), EPM's center square (boundary minus the 4
+    # arms), Three-Chamber's/Place-Preference's middle compartment (boundary
+    # minus the two end chambers) -- none of which are expressible as a
+    # single traced polygon anyway (a periphery is a hole, not a polygon).
+    # Any frame inside the boundary that fell outside every traced region is
+    # auto-labeled with that paradigm's leftover-zone name (ENV_LEFTOVER_
+    # REGION_NAME), so the user never has to trace it by hand. Frames the
+    # user DID explicitly assign (e.g. their own region using that same
+    # name) are already non-None here and untouched.
+    leftover_name = ENV_LEFTOVER_REGION_NAME.get(paradigm)
+    if leftover_name and boundary is not None and regions:
+        still_unassigned = region_membership == None  # noqa: E711
+        inside_boundary = _points_in_polygon(cx, cy, boundary["vertices"])
+        region_membership[still_unassigned & inside_boundary] = leftover_name
 
     dist_to_nearest_object_nose = {}
     dist_to_nearest_object_paw = {}
