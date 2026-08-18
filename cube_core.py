@@ -4662,6 +4662,88 @@ def _run_length_sequence(values: list) -> list:
     return runs
 
 
+def _compute_region_membership_per_frame(shapes: list, paradigm: str,
+                                          cx: np.ndarray, cy: np.ndarray) -> np.ndarray:
+    """
+    Shared primitive behind compute_session_env_context()'s "current_region"
+    per-frame time series and the early, minimal compute_bin_region_labels()
+    (region-aware cluster refinement, v1 -- see
+    Region_Aware_Refinement_Implementation_Plan.md). Assigns each frame's
+    centroid (cx, cy) to the first traced region (in shapes order, ties to
+    the first-listed region) whose polygon contains it; frames outside every
+    region get the paradigm's implied "leftover" zone
+    (ENV_LEFTOVER_REGION_NAME) when inside a traced boundary, else None.
+    Pure/stateless -- no I/O, no binning.
+    """
+    n_frames = cx.shape[0]
+    regions  = [s for s in shapes if s["kind"] == "region"]
+    boundary = next((s for s in shapes if s["kind"] == "boundary"), None)
+
+    region_membership = np.full(n_frames, None, dtype=object)
+    for r in regions:
+        inside = _points_in_polygon(cx, cy, r["vertices"])
+        still_unassigned = region_membership == None  # noqa: E711
+        region_membership[inside & still_unassigned] = r["name"]
+
+    leftover_name = ENV_LEFTOVER_REGION_NAME.get(paradigm)
+    if leftover_name and boundary is not None and regions:
+        still_unassigned = region_membership == None  # noqa: E711
+        inside_boundary = _points_in_polygon(cx, cy, boundary["vertices"])
+        region_membership[still_unassigned & inside_boundary] = leftover_name
+
+    return region_membership
+
+
+def compute_bin_region_labels(env_cfg: "dict | None", stem: str,
+                               xs: np.ndarray, ys: np.ndarray,
+                               bodyparts: list, fps: float,
+                               bin_ms: float = 100.0) -> "list | None":
+    """
+    Region-aware cluster refinement (v1, opt-in via
+    hdbscan_region_split_enabled): a much smaller, EARLY-computed sibling of
+    compute_session_env_context() that returns ONLY the per-bin
+    "current_region" categorical time series -- the one signal
+    split_region_impure_clusters() needs -- computed at a point in
+    BSoidEngine.run() (the session_bin_ranges.json-building loop) that is
+    well before HDBSCAN/refinement run, unlike compute_session_env_context()
+    itself (see "Pipeline ordering" in
+    Region_Aware_Refinement_Implementation_Plan.md for why that function
+    can't just be moved earlier). Shares the region-membership primitive
+    (_compute_region_membership_per_frame) with compute_session_env_context()
+    so results are identical to that function's own current_region output
+    for the same inputs -- this function just skips every other summary/
+    derived/object computation compute_session_env_context() also does.
+
+    Returns None (not []) for env_cfg=None/empty, no traced shapes, or empty
+    xs -- the same no-op contract as compute_session_env_context(), so a
+    caller can distinguish "not computed" from "computed, all bins None".
+    """
+    if not env_cfg:
+        return None
+    shapes = resolve_env_shapes(env_cfg, stem)
+    if not shapes or xs is None or xs.shape[0] == 0:
+        return None
+
+    paradigm = env_cfg.get("paradigm", "custom")
+    n_frames = xs.shape[0]
+    frames_per_bin = max(1, int(round(fps * (bin_ms / 1000.0))))
+    n_bins = int(np.ceil(n_frames / frames_per_bin))
+
+    cx = np.nanmean(xs, axis=1)
+    cy = np.nanmean(ys, axis=1)
+    region_membership = _compute_region_membership_per_frame(shapes, paradigm, cx, cy)
+
+    out = []
+    for b in range(n_bins):
+        seg = region_membership[b * frames_per_bin: min((b + 1) * frames_per_bin, n_frames)]
+        if len(seg) == 0:
+            out.append(None)
+            continue
+        vals, counts = np.unique(seg[seg != None], return_counts=True)  # noqa: E711
+        out.append(vals[np.argmax(counts)] if len(vals) else None)
+    return out
+
+
 def compute_session_env_context(env_cfg: "dict | None", stem: str,
                                  xs: np.ndarray, ys: np.ndarray, bodyparts: list,
                                  fps: float, pose_coord_space: str = "post_crop",
@@ -4775,13 +4857,13 @@ def compute_session_env_context(env_cfg: "dict | None", stem: str,
     # current_region: first region (in trace order) containing the centroid,
     # per frame; None if outside every region. Ties (overlapping regions) go
     # to the first-listed region, a documented deterministic tie-break.
-    region_membership = np.full(n_frames, None, dtype=object)
+    # Computed via the shared _compute_region_membership_per_frame primitive
+    # (also used by the early, minimal compute_bin_region_labels() for
+    # region-aware cluster refinement) so both stay identical by construction.
+    region_membership = _compute_region_membership_per_frame(shapes, paradigm, cx, cy)
     dist_to_region_boundary = {}
     dist_to_region_boundary_nose = {}
     for r in regions:
-        inside = _points_in_polygon(cx, cy, r["vertices"])
-        still_unassigned = region_membership == None  # noqa: E711
-        region_membership[inside & still_unassigned] = r["name"]
         dist_to_region_boundary[r["name"]] = _bin_agg(_nearest_edge_distances(cx, cy, r["vertices"]))
         # Nose-point (not centroid) distance to this region's edge -- mirrors
         # the per-object nose-distance calc below. Lets callers build a
@@ -4800,12 +4882,8 @@ def compute_session_env_context(env_cfg: "dict | None", stem: str,
     # auto-labeled with that paradigm's leftover-zone name (ENV_LEFTOVER_
     # REGION_NAME), so the user never has to trace it by hand. Frames the
     # user DID explicitly assign (e.g. their own region using that same
-    # name) are already non-None here and untouched.
-    leftover_name = ENV_LEFTOVER_REGION_NAME.get(paradigm)
-    if leftover_name and boundary is not None and regions:
-        still_unassigned = region_membership == None  # noqa: E711
-        inside_boundary = _points_in_polygon(cx, cy, boundary["vertices"])
-        region_membership[still_unassigned & inside_boundary] = leftover_name
+    # name) are already non-None here and untouched. (Handled inside
+    # _compute_region_membership_per_frame() above.)
 
     dist_to_nearest_object_nose = {}
     dist_to_nearest_object_paw = {}
@@ -9481,6 +9559,44 @@ class BSoidEngine:
         hdbscan_split_candidate_cutoff  = 0,
         hdbscan_split_sweep_n_steps     = 12,
         hdbscan_split_n_jobs            = -1,
+        # ── Region-aware cluster refinement (v1, opt-in, Region_Aware_
+        # Refinement_Implementation_Plan.md) ───────────────────────────────
+        # hdbscan_region_split_enabled: master switch, default OFF -- a true
+        #   no-op when False: compute_bin_region_labels() is never even
+        #   called (zero per-session cost for users who never opt in), and
+        #   split_region_impure_clusters() is never invoked. Independent of
+        #   env_features_enabled -- reads env_arena_cfg directly so a user
+        #   can opt into region-aware splitting without also paying for the
+        #   post-hoc session_env_context.json/bout-enrichment machinery.
+        # hdbscan_region_split_signal: list of per-bin signal names to use
+        #   for impurity scoring. v1 only implements the categorical-entropy
+        #   scorer for "current_region" -- other entries are accepted by the
+        #   schema (forward compatibility) but not yet scored.
+        # hdbscan_region_split_impurity_thresh: normalized Shannon entropy
+        #   (0=single region, 1=maximally mixed) at/above which a cluster is
+        #   a region-split candidate. Documented starting point, not an
+        #   empirically validated final value -- see the plan's Risk
+        #   assessment.
+        # hdbscan_region_split_min_minority_frac: every non-dominant region
+        #   in a candidate cluster must represent at least this fraction of
+        #   the cluster's bins, or the cluster is not split (avoids forcing
+        #   noise-level region contamination into its own tiny fragment).
+        # hdbscan_region_split_max_subclusters / _max_candidates: mirror
+        #   hdbscan_split_max_subclusters / hdbscan_split_max_candidates for
+        #   the region-impurity candidate pool.
+        # region_split_pre_reduction_pct: 0.0 (off) = no effect. When set
+        #   (e.g. 0.7) AND hdbscan_region_split_enabled=True, multiplies the
+        #   PRIMARY sweep's preferred_clusters_lo/hi by this fraction for
+        #   that sweep only -- a one-shot, clearly-logged convenience, not a
+        #   closed-loop cluster-count-targeting mechanism. See Design
+        #   decision 4 in the plan for scoping.
+        hdbscan_region_split_enabled           = False,
+        hdbscan_region_split_signal            = ["current_region"],
+        hdbscan_region_split_impurity_thresh   = 0.5,
+        hdbscan_region_split_min_minority_frac = 0.15,
+        hdbscan_region_split_max_subclusters   = 3,
+        hdbscan_region_split_max_candidates    = 10,
+        region_split_pre_reduction_pct         = 0.0,
         # hdbscan_seed_sweep_n_steps / hdbscan_consensus_sweep_n_steps
         #   (Option 4, HDBSCAN sweep perf, Aug 2026): 0 (default) = inherit
         #   hdbscan_sweep_n_steps (the primary sweep's own 40-step grid) for
@@ -10313,6 +10429,52 @@ class BSoidEngine:
                 json.dumps(_sbr, indent=2))
         except Exception:
             pass
+
+        # Region-aware cluster refinement (v1, opt-in -- Region_Aware_
+        # Refinement_Implementation_Plan.md Phase 2). compute_bin_region_labels()
+        # is a much smaller, EARLIER sibling of compute_session_env_context()
+        # (below): it runs here, in the SAME per-session loop that builds
+        # session_bin_ranges.json, well before HDBSCAN/refinement, whereas
+        # compute_session_env_context() itself is not moved (see the plan's
+        # "Pipeline ordering" section). Hard-gated on
+        # hdbscan_region_split_enabled -- False (default) means this block
+        # does not even call compute_bin_region_labels(), so opted-out users
+        # pay zero per-session cost. Reads env_arena_cfg directly (not
+        # all_env_cfg, which is forced to None per-session whenever
+        # env_features_enabled is False) since region-aware refinement is
+        # gated by its OWN flag, independent of env_features_enabled.
+        region_per_bin: "list | None" = None
+        if bool(self._cfg.get("hdbscan_region_split_enabled", False)):
+            try:
+                _arena_cfg = self._cfg.get("env_arena_cfg")
+                _region_chunks = []
+                for _nm, _xy_k, _fps_k, _feat_k in zip(
+                        all_names, all_xy, all_fps_list, all_feats):
+                    _nb_k = _feat_k.shape[1]
+                    _labels_k = compute_bin_region_labels(
+                        _arena_cfg, _nm, _xy_k[:, 0::2], _xy_k[:, 1::2],
+                        bps_ref, _fps_k) or []
+                    if len(_labels_k) < _nb_k:
+                        _labels_k = list(_labels_k) + [None] * (_nb_k - len(_labels_k))
+                    elif len(_labels_k) > _nb_k:
+                        _labels_k = list(_labels_k)[:_nb_k]
+                    _region_chunks.append(_labels_k)
+                _region_per_bin_flat = [v for chunk in _region_chunks for v in chunk]
+                if len(_region_per_bin_flat) == n_bins:
+                    region_per_bin = _region_per_bin_flat
+                else:
+                    # Defensive: length mismatch against the global feature
+                    # matrix -- disable rather than risk misaligned indexing
+                    # downstream (mirrors the turned_away_bin_mask re-align
+                    # pattern above, but here correctness matters more than
+                    # salvaging a partial array).
+                    self._log("  [WARN] region_per_bin length mismatch "
+                               f"({len(_region_per_bin_flat)} vs {n_bins} bins) "
+                               "-- disabling region-aware splitting for this run.")
+            except Exception:
+                self._log(f"  [WARN] region_per_bin computation failed:\n"
+                          f"  {traceback.format_exc()}")
+                region_per_bin = None
 
         # v6 part 2 (Environmental_Context_v6_Implementation_Plan.md Step 5):
         # session_env_context.json -- NOT written at all when

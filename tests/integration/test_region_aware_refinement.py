@@ -1,4 +1,4 @@
-"""Region-aware cluster refinement — Phase 1 equivalence coverage.
+"""Region-aware cluster refinement — Phase 1/2 equivalence coverage.
 
 Phase 1 extracts _local_recluster_and_assign() out of split_impure_clusters()'s
 body with NO intended behavior change. This module's job is to prove that:
@@ -8,6 +8,15 @@ range of synthetic fixtures, and that the new shared helper itself behaves
 correctly in isolation (no candidates / one candidate / multiple candidates /
 a candidate that fails the acceptance gate).
 
+Phase 2 adds compute_bin_region_labels() (an early, minimal sibling of
+compute_session_env_context()) and BSoidEngine.run()'s hard-gated
+region_per_bin computation. This module proves: compute_bin_region_labels()
+agrees with compute_session_env_context()'s own current_region output on
+identical inputs (they share the same _compute_region_membership_per_frame
+primitive); and that with hdbscan_region_split_enabled left at its False
+default, compute_bin_region_labels() is never called during a full
+BSoidEngine.run() (spy-verified, not just "produces the same output").
+
 Never touches real user data or CUBE_logs/ — synthetic fixtures only.
 """
 import importlib.util
@@ -15,6 +24,7 @@ import shutil
 import subprocess
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import cube_core as cc
@@ -259,3 +269,206 @@ class TestLocalReclusterAndAssign:
         joined = " ".join(logged)
         if logged:  # only asserts detail text made it through when a split happened
             assert "(custom detail)" in joined
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Phase 2 — compute_bin_region_labels() + region_per_bin plumbing
+# ──────────────────────────────────────────────────────────────────────────
+
+def _square(x0, y0, size):
+    return [(x0, y0), (x0 + size, y0), (x0 + size, y0 + size), (x0, y0 + size)]
+
+
+class TestComputeBinRegionLabels:
+    FPS = 30.0
+    BODYPARTS = ["nose", "tailbase"]
+
+    def _cfg(self):
+        return {
+            "schema_version": 3, "paradigm": "open_field", "reference_stem": "s1",
+            "coord_space": "post_crop",
+            "reference_shapes": {
+                "boundary": None,
+                "regions": [{"name": "R1", "kind": "region",
+                             "vertices": _square(0, 0, 20), "role": None}],
+                "objects": []},
+            "per_video": {}}
+
+    def test_none_env_cfg_returns_none(self):
+        xs = np.full((30, 2), 5.0)
+        ys = np.full((30, 2), 5.0)
+        assert cc.compute_bin_region_labels(None, "s1", xs, ys, self.BODYPARTS, self.FPS) is None
+
+    def test_no_traced_shapes_returns_none(self):
+        cfg = {"schema_version": 3, "paradigm": "custom", "reference_stem": "s1",
+               "coord_space": "post_crop",
+               "reference_shapes": {"boundary": None, "regions": [], "objects": []},
+               "per_video": {}}
+        xs = np.full((30, 2), 5.0)
+        ys = np.full((30, 2), 5.0)
+        assert cc.compute_bin_region_labels(cfg, "s1", xs, ys, self.BODYPARTS, self.FPS) is None
+
+    def test_matches_compute_session_env_context_current_region(self):
+        """The whole point of sharing _compute_region_membership_per_frame:
+        compute_bin_region_labels()'s output must be IDENTICAL to
+        compute_session_env_context()'s own current_region per-bin series,
+        for the same inputs, on both a stationary-inside-region case and a
+        moving-between-regions-and-outside case."""
+        cfg = self._cfg()
+        rng = np.random.default_rng(0)
+        n = 90
+        # animal wanders between inside R1 (0,0)-(20,20) and well outside it.
+        cx = np.where(np.arange(n) % 30 < 15, 5.0, 50.0) + rng.normal(0, 0.01, n)
+        cy = np.where(np.arange(n) % 30 < 15, 5.0, 50.0) + rng.normal(0, 0.01, n)
+        xs = np.column_stack([cx, cx])
+        ys = np.column_stack([cy, cy])
+
+        via_env_ctx = cc.compute_session_env_context(
+            cfg, "s1", xs, ys, self.BODYPARTS, self.FPS)["per_bin"]["current_region"]
+        via_bin_labels = cc.compute_bin_region_labels(
+            cfg, "s1", xs, ys, self.BODYPARTS, self.FPS)
+
+        assert len(via_env_ctx) == len(via_bin_labels)
+        assert list(via_env_ctx) == list(via_bin_labels)
+
+    def test_leftover_region_fill_matches_too(self):
+        """Same equivalence check but exercising the paradigm-leftover-zone
+        fill path (open_field's implied 'Periphery')."""
+        cfg = {
+            "schema_version": 3, "paradigm": "open_field", "reference_stem": "s1",
+            "coord_space": "post_crop",
+            "reference_shapes": {
+                "boundary": {"name": "Arena", "kind": "boundary",
+                             "vertices": _square(0, 0, 100), "role": None},
+                "regions": [{"name": "Center", "kind": "region",
+                             "vertices": _square(30, 30, 40), "role": "center"}],
+                "objects": []},
+            "per_video": {}}
+        n = 60
+        cx = np.where(np.arange(n) < 30, 50.0, 5.0)  # half in Center, half in periphery
+        cy = np.full(n, 50.0)
+        xs = np.column_stack([cx, cx])
+        ys = np.column_stack([cy, cy])
+
+        via_env_ctx = cc.compute_session_env_context(
+            cfg, "s1", xs, ys, self.BODYPARTS, self.FPS)["per_bin"]["current_region"]
+        via_bin_labels = cc.compute_bin_region_labels(
+            cfg, "s1", xs, ys, self.BODYPARTS, self.FPS)
+        assert list(via_env_ctx) == list(via_bin_labels)
+        assert "Periphery" in set(via_bin_labels)  # sanity: leftover fill actually fired
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Phase 2 — BSoidEngine.run() gating: flag off => never called
+# ──────────────────────────────────────────────────────────────────────────
+
+_P2_BODYPARTS = ["nose", "neck", "tailbase", "paw1", "paw2"]
+
+
+def _p2_make_session_xy(n_frames, seed):
+    rng = np.random.default_rng(seed)
+    t = np.arange(n_frames)
+    n_pts = len(_P2_BODYPARTS)
+    xy = np.zeros((n_frames, n_pts * 2))
+    for i in range(n_pts):
+        cx, cy = 50.0 * (i + 1), 30.0 * (i + 1)
+        phase = rng.uniform(0, 6.28)
+        xy[:, 2 * i] = cx + 15 * np.sin(t / 25.0 + phase + i) + rng.normal(0, 0.5, n_frames)
+        xy[:, 2 * i + 1] = cy + 10 * np.cos(t / 30.0 + phase + i) + rng.normal(0, 0.5, n_frames)
+    return xy
+
+
+def _p2_write_session_h5(path, n_frames, seed):
+    xy = _p2_make_session_xy(n_frames, seed)
+    cols, data = [], {}
+    for i, bp in enumerate(_P2_BODYPARTS):
+        for coord in ("x", "y", "likelihood"):
+            key = ("DLC_scorer", bp, coord)
+            cols.append(key)
+            if coord == "x":
+                data[key] = xy[:, 2 * i]
+            elif coord == "y":
+                data[key] = xy[:, 2 * i + 1]
+            else:
+                data[key] = np.full(n_frames, 0.95)
+    columns = pd.MultiIndex.from_tuples(cols, names=["scorer", "bodyparts", "coords"])
+    df = pd.DataFrame(data.values(), index=columns).T
+    df.columns = columns
+    df.index = range(n_frames)
+    df.to_hdf(str(path), key="df_with_missing", mode="w", format="fixed")
+
+
+_P2_FAST_RUN_CFG = dict(
+    likelihood_thresh=0.3, max_interp_gap_sec=0.5, boxcar_win_sec=0.07,
+    train_frac=1.0, umap_full_thresh=10_000, umap_n_neighbors=15,
+    umap_n_components=2, umap_min_dist=0.1, umap_random_state=42,
+    umap_n_jobs=1, pca_n_components="off", hdbscan_sweep_n_steps=5,
+    hdbscan_pct_lo=5, hdbscan_pct_hi=25, hdbscan_method="eom",
+    target_n_clusters=0, preferred_clusters_lo=2, preferred_clusters_hi=4,
+    hdbscan_selection_mode="floor_soft_cap", mlp_hidden="8,4",
+    mlp_max_iter=50, cv_folds=2, hmm_n_iter=5, seed_sweep_n=0,
+    consensus_clustering_enabled=False, hdbscan_merge_thresh=0.0,
+    hdbscan_split_silhouette_thresh=None, cluster_hierarchy_enabled=False,
+    auto_bodypart_weighting=False, auto_flag_impure_clusters=False,
+    visibility_features_enabled=False, min_cluster_freq=0.0,
+    auto_resource_management=False, hdbscan_sweep_n_jobs=1,
+    hdbscan_split_n_jobs=1, seed_sweep_n_jobs=1, consensus_n_jobs=1,
+    plot_theme="dark",
+    # hdbscan_region_split_enabled deliberately OMITTED -- must default False.
+)
+
+
+@pytest.mark.slow
+class TestRegionPerBinGatingFullPipeline:
+    def test_region_split_disabled_by_default_never_calls_compute_bin_region_labels(
+            self, tmp_path, monkeypatch):
+        dlc_dir = tmp_path / "dlc"
+        dlc_dir.mkdir()
+        _p2_write_session_h5(dlc_dir / "session1_filtered.h5", n_frames=300, seed=1)
+        out_dir = tmp_path / "out"
+
+        calls = []
+        orig = cc.compute_bin_region_labels
+
+        def spy(*a, **kw):
+            calls.append((a, kw))
+            return orig(*a, **kw)
+
+        monkeypatch.setattr(cc, "compute_bin_region_labels", spy)
+
+        engine = cc.BSoidEngine(dlc_dir, video_folder=None, output_dir=out_dir,
+                                fps=30, logger=lambda m: None, cfg=_P2_FAST_RUN_CFG)
+        engine.run()
+
+        assert calls == [], (
+            "compute_bin_region_labels() was called even though "
+            "hdbscan_region_split_enabled defaults to False -- Phase 2's "
+            "hard-gate (zero cost for opted-out users) is violated")
+
+    def test_region_split_enabled_without_arena_cfg_calls_but_yields_none(
+            self, tmp_path, monkeypatch):
+        """Flag on, but no env_arena_cfg configured: the per-session call
+        happens (flag-gated cost is opt-in, expected once enabled) but each
+        call legitimately returns None (no traced shapes) -- must not crash
+        and must leave region_per_bin as None (handled defensively)."""
+        dlc_dir = tmp_path / "dlc"
+        dlc_dir.mkdir()
+        _p2_write_session_h5(dlc_dir / "session1_filtered.h5", n_frames=300, seed=2)
+        out_dir = tmp_path / "out"
+
+        calls = []
+        orig = cc.compute_bin_region_labels
+
+        def spy(*a, **kw):
+            calls.append((a, kw))
+            return orig(*a, **kw)
+
+        monkeypatch.setattr(cc, "compute_bin_region_labels", spy)
+
+        cfg = dict(_P2_FAST_RUN_CFG)
+        cfg["hdbscan_region_split_enabled"] = True
+        engine = cc.BSoidEngine(dlc_dir, video_folder=None, output_dir=out_dir,
+                                fps=30, logger=lambda m: None, cfg=cfg)
+        engine.run()  # must not raise
+
+        assert len(calls) >= 1

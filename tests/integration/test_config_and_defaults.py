@@ -149,6 +149,53 @@ class TestHdbscanSweepPerfCfgKeys:
         assert expected_keys == set(cc.BSoidEngine._LEGACY_V2_DEFAULTS.keys())
 
 
+class TestRegionAwareRefinementCfgKeys:
+    """Region_Aware_Refinement_Implementation_Plan.md's new cfg keys must
+    default to true no-ops and must NOT collide with _LEGACY_V2_DEFAULTS --
+    this feature changes *how* refinement runs when explicitly opted into,
+    not a pre-2.1 numeric default compat_mode="legacy_v2" needs to revert to.
+    """
+
+    def test_hdbscan_region_split_enabled_default_false_not_in_legacy_defaults(self):
+        assert cc.BSoidEngine.DEFAULTS["hdbscan_region_split_enabled"] is False
+        assert "hdbscan_region_split_enabled" not in cc.BSoidEngine._LEGACY_V2_DEFAULTS
+
+    def test_hdbscan_region_split_signal_default(self):
+        assert cc.BSoidEngine.DEFAULTS["hdbscan_region_split_signal"] == ["current_region"]
+        assert "hdbscan_region_split_signal" not in cc.BSoidEngine._LEGACY_V2_DEFAULTS
+
+    def test_hdbscan_region_split_impurity_thresh_default(self):
+        assert cc.BSoidEngine.DEFAULTS["hdbscan_region_split_impurity_thresh"] == 0.5
+        assert "hdbscan_region_split_impurity_thresh" not in cc.BSoidEngine._LEGACY_V2_DEFAULTS
+
+    def test_hdbscan_region_split_min_minority_frac_default(self):
+        assert cc.BSoidEngine.DEFAULTS["hdbscan_region_split_min_minority_frac"] == 0.15
+        assert "hdbscan_region_split_min_minority_frac" not in cc.BSoidEngine._LEGACY_V2_DEFAULTS
+
+    def test_hdbscan_region_split_max_subclusters_default(self):
+        assert cc.BSoidEngine.DEFAULTS["hdbscan_region_split_max_subclusters"] == 3
+        assert "hdbscan_region_split_max_subclusters" not in cc.BSoidEngine._LEGACY_V2_DEFAULTS
+
+    def test_hdbscan_region_split_max_candidates_default(self):
+        assert cc.BSoidEngine.DEFAULTS["hdbscan_region_split_max_candidates"] == 10
+        assert "hdbscan_region_split_max_candidates" not in cc.BSoidEngine._LEGACY_V2_DEFAULTS
+
+    def test_region_split_pre_reduction_pct_default_off(self):
+        assert cc.BSoidEngine.DEFAULTS["region_split_pre_reduction_pct"] == 0.0
+        assert "region_split_pre_reduction_pct" not in cc.BSoidEngine._LEGACY_V2_DEFAULTS
+
+    def test_pinned_legacy_defaults_set_undisturbed(self):
+        # Re-assert the exact same pinned set as the other two "...five..."-
+        # named tests above (misleadingly named -- 7 keys, not 5 -- but this
+        # plan's own new keys must not have been added to it either way).
+        expected_keys = {
+            "umap_min_dist", "hdbscan_mcs_anchor", "angular_fallback",
+            "hdbscan_merge_thresh", "hdbscan_split_silhouette_thresh",
+            "auto_bodypart_weighting", "turned_away_exclude_from_bad_frac",
+        }
+        assert expected_keys == set(cc.BSoidEngine._LEGACY_V2_DEFAULTS.keys())
+
+
 class TestEngineConstructionSideEffects:
     def test_output_subdirs_created(self, tmp_path):
         eng = make_engine(tmp_path)
