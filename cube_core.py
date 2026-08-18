@@ -2870,7 +2870,8 @@ def _normalized_region_entropy(region_vals: list) -> "tuple[float, dict]":
 def split_region_impure_clusters(feats_sc: np.ndarray, embedding: np.ndarray,
                                   labels: np.ndarray,
                                   region_per_bin: "list | None",
-                                  cfg: dict, log_fn=None) -> np.ndarray:
+                                  cfg: dict, log_fn=None,
+                                  region_split_stats: "dict | None" = None) -> np.ndarray:
     """
     Region-aware sibling of split_impure_clusters() (Region_Aware_
     Refinement_Implementation_Plan.md, v1, opt-in). Locally re-clusters any
@@ -2960,15 +2961,22 @@ def split_region_impure_clusters(feats_sc: np.ndarray, embedding: np.ndarray,
     def _detail_fn(cid):
         return f" (region entropy {entropies[cid]:.3f} >= {impurity_thresh})"
 
-    return _local_recluster_and_assign(
+    _ids_before = set(int(c) for c in set(labels) if c >= 0)
+    result = _local_recluster_and_assign(
         feats_sc, embedding, labels, candidates, _local_cfg_fn, cfg,
         log_fn=log_fn, candidate_detail_fn=_detail_fn)
+    if region_split_stats is not None:
+        _new_ids = set(int(c) for c in set(result) if c >= 0) - _ids_before
+        region_split_stats["clusters_created"] = (
+            region_split_stats.get("clusters_created", 0) + len(_new_ids))
+    return result
 
 
 def refine_clusters_iterative(feats_sc: np.ndarray, embedding: np.ndarray,
                                labels: np.ndarray, clf, cfg: dict,
                                log_fn=None,
-                               region_per_bin: "list | None" = None) -> np.ndarray:
+                               region_per_bin: "list | None" = None,
+                               region_split_stats: "dict | None" = None) -> np.ndarray:
     """
     Iterative split -> merge refinement loop (issue 4, bidirectional):
     split_impure_clusters then merge_similar_clusters, repeated up to
@@ -3018,7 +3026,8 @@ def refine_clusters_iterative(feats_sc: np.ndarray, embedding: np.ndarray,
                                         split_thresh, cfg, log_fn=log_fn)
         if region_split_on:
             labels = split_region_impure_clusters(
-                feats_sc, embedding, labels, region_per_bin, cfg, log_fn=log_fn)
+                feats_sc, embedding, labels, region_per_bin, cfg, log_fn=log_fn,
+                region_split_stats=region_split_stats)
         labels = merge_similar_clusters(clf, labels, embedding,
                                          merge_thresh=merge_thresh, log_fn=log_fn)
         if np.array_equal(before, labels):
@@ -6062,7 +6071,8 @@ def _consensus_one_seed(s: int, feats_sc_T: np.ndarray, cfg: dict, n_samp: int,
 
 def consensus_cluster(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
                        log_fn=None, embedding: "np.ndarray | None" = None,
-                       region_per_bin: "list | None" = None):
+                       region_per_bin: "list | None" = None,
+                       region_split_stats: "dict | None" = None):
     """
     Opt-in alternative to trusting a single seed's HDBSCAN partition: run
     UMAP+HDBSCAN(+refinement) across n_seeds random seeds (same per-seed
@@ -6362,7 +6372,7 @@ def consensus_cluster(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
     if bool(cfg.get("consensus_refine_enabled", False)):
         labels = refine_consensus_clusters(
             feats_sc_T, labels, co_assoc, embedding, cfg, log_fn=log_fn,
-            region_per_bin=region_per_bin)
+            region_per_bin=region_per_bin, region_split_stats=region_split_stats)
 
     # Rare-cluster pruning to -1 (noise), same convention/threshold semantics
     # as the primary path's min_cluster_freq pass further down in run() --
@@ -6439,7 +6449,8 @@ def refine_consensus_clusters(feats_sc_T: np.ndarray, labels: np.ndarray,
                                co_assoc: np.ndarray,
                                embedding: "np.ndarray | None",
                                cfg: dict, log_fn=None,
-                               region_per_bin: "list | None" = None) -> np.ndarray:
+                               region_per_bin: "list | None" = None,
+                               region_split_stats: "dict | None" = None) -> np.ndarray:
     """
     Post-hoc split + merge refinement for consensus_cluster() output
     (Aug 2026, opt-in via consensus_refine_enabled). Split reuses
@@ -6485,7 +6496,8 @@ def refine_consensus_clusters(feats_sc_T: np.ndarray, labels: np.ndarray,
                                             split_thresh, cfg, log_fn=log_fn)
         if region_split_on:
             labels = split_region_impure_clusters(
-                feats_sc, embedding, labels, region_per_bin, cfg, log_fn=log_fn)
+                feats_sc, embedding, labels, region_per_bin, cfg, log_fn=log_fn,
+                region_split_stats=region_split_stats)
         labels = merge_by_coassociation(labels, co_assoc, merge_thresh,
                                          log_fn=log_fn)
         if np.array_equal(before, labels):
@@ -10643,6 +10655,16 @@ class BSoidEngine:
                           f"  {traceback.format_exc()}")
                 region_per_bin = None
 
+        # Audit-trail accumulator (Design decision 5): how many clusters
+        # were CREATED by region-aware splitting specifically, across
+        # however many refinement iterations/passes run (primary and/or
+        # consensus). Threaded into refine_clusters_iterative()/
+        # refine_consensus_clusters() as an out-parameter rather than
+        # changing either function's return type (both already have
+        # existing callers -- seed_sweep_stability(), tests -- that expect
+        # a bare ndarray back). Recorded into validation_report.json below.
+        _region_split_stats: dict = {}
+
         # v6 part 2 (Environmental_Context_v6_Implementation_Plan.md Step 5):
         # session_env_context.json -- NOT written at all when
         # env_features_enabled is False (not even empty), matching the
@@ -10959,7 +10981,8 @@ class BSoidEngine:
             try:
                 _cons = consensus_cluster(feats_sc.T, self._cfg, _cn_seeds,
                                           log_fn=self._log, embedding=embedding,
-                                          region_per_bin=region_per_bin)
+                                          region_per_bin=region_per_bin,
+                                          region_split_stats=_region_split_stats)
             except Exception:
                 _cons = None
                 self._log(f"  [WARN] consensus clustering failed: "
@@ -11044,7 +11067,8 @@ class BSoidEngine:
         else:
             hdb_labels = refine_clusters_iterative(
                 feats_sc, embedding, hdb_labels, hdb_clf, self._cfg,
-                log_fn=self._log, region_per_bin=region_per_bin)
+                log_fn=self._log, region_per_bin=region_per_bin,
+                region_split_stats=_region_split_stats)
         n_cl      = len(set(hdb_labels[hdb_labels >= 0]))
         noise     = (hdb_labels < 0).sum()
         noise_pct = 100 * noise / max(1, len(hdb_labels))
@@ -11100,6 +11124,7 @@ class BSoidEngine:
         # pipeline pretending to guarantee a specific final count. Only
         # logged when region-aware splitting is actually active -- silent
         # otherwise, matching every other opt-in diagnostic in this pipeline.
+        _region_split_clusters_created = int(_region_split_stats.get("clusters_created", 0))
         if _region_split_master:
             _post_refine_n_cl = len(set(_post_refine_labels[_post_refine_labels >= 0]))
             self._log(
@@ -11111,6 +11136,13 @@ class BSoidEngine:
                 + (f", pre-reduced to {round(max(2, _orig_pref_lo * _pre_reduction_pct))}-"
                    f"{round(max(2, _orig_pref_hi * _pre_reduction_pct))} for the primary sweep only]"
                    if _pre_reduction_pct > 0 else "]"))
+            self._log(
+                f"  [region-split] {_region_split_clusters_created} cluster(s) "
+                f"created by region-aware splitting this run"
+                + (f" -- some may have since been merged and/or pruned below "
+                   f"(final count reflects that, but which specific ids were "
+                   f"region-split in origin is not tracked past this point)"
+                   if _region_split_clusters_created > 0 else "."))
 
         # Compose a comprehensive ORIGINAL-hdbscan-id -> final-id remap when
         # split/merge refinement and/or rare-cluster pruning changed anything,
@@ -12432,6 +12464,20 @@ class BSoidEngine:
             stages         = _validation,
             all_warnings   = all_warnings,
         )
+        # Region-aware refinement audit trail (Design decision 5): only
+        # present when hdbscan_region_split_enabled=True -- absent entirely
+        # otherwise, matching the "zero new surface for opted-out users"
+        # contract every other opt-in feature in this pipeline follows.
+        if _region_split_master:
+            val_report["region_split"] = dict(
+                enabled                 = True,
+                clusters_created        = _region_split_clusters_created,
+                raw_primary_sweep_n_cl  = _raw_primary_n_cl,
+                post_refinement_n_cl    = _post_refine_n_cl,
+                final_n_cl              = n_cl,
+                preferred_clusters_range_original = [_orig_pref_lo, _orig_pref_hi],
+                pre_reduction_pct       = _pre_reduction_pct,
+            )
         (self.output_dir / "validation_report.json").write_text(
             json.dumps(val_report, indent=2))
         if self._cfg["save_plots"]:

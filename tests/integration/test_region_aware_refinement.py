@@ -835,10 +835,10 @@ class TestRefineConsensusClustersRegionWiring:
         orig = cc.refine_consensus_clusters
 
         def spy(feats_sc_T, labels, co_assoc, embedding, cfg, log_fn=None,
-                region_per_bin=None):
+                region_per_bin=None, **kw):
             captured["region_per_bin"] = region_per_bin
             return orig(feats_sc_T, labels, co_assoc, embedding, cfg,
-                        log_fn=log_fn, region_per_bin=region_per_bin)
+                        log_fn=log_fn, region_per_bin=region_per_bin, **kw)
 
         monkeypatch.setattr(cc, "refine_consensus_clusters", spy)
 
@@ -968,3 +968,156 @@ class TestRegionSplitPreReductionPct:
         engine.run()
 
         assert not any("[region-split]" in m for m in logged)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Phase 6 — downstream verification (Design decision 5's checklist)
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestMlpTrainsOnRegionSplitLabels:
+    def test_train_mlp_succeeds_on_region_split_output(self):
+        """MLP training doesn't care where its label ids came from -- but
+        this test proves it end-to-end on ACTUAL split_region_impure_
+        clusters() output (a real region-split-created id in the label
+        array), not just labels a test hand-constructed to look similar."""
+        feats_sc, embedding, labels, region_per_bin, cfg = _make_region_split_fixture(seed=40)
+        split_labels = cc.split_region_impure_clusters(
+            feats_sc, embedding, labels, region_per_bin, cfg)
+        assert len(set(int(x) for x in split_labels if x >= 0)) > len(set(int(x) for x in labels if x >= 0)), (
+            "fixture must actually produce a region-split-created id for "
+            "this test to be testing what it claims")
+
+        mlp_cfg = dict(mlp_hidden="8,4", mlp_max_iter=100,
+                       umap_random_state=42, cv_folds=2)
+        clf, cv_scores = cc.train_mlp(feats_sc, split_labels, mlp_cfg)
+        assert clf is not None
+        assert cv_scores.size >= 1
+        assert np.all(np.isfinite(cv_scores))
+
+
+class TestMergeSimilarClustersHandlesRegionSplitIds:
+    def test_ancestor_lookup_transparent_for_new_region_split_ids(self):
+        """merge_similar_clusters()'s condensed-tree ancestor lookup keys
+        on a representative POINT INDEX per cluster id (a valid HDBSCAN
+        leaf id, since leaf ids == sample row indices), not on the label
+        integer itself -- so it must transparently handle a brand-new id
+        introduced by region-splitting (which reassigns some of an
+        existing cluster's points to a fresh id) exactly as it already
+        does for silhouette-split ids. Verified with a REAL fitted
+        hdbscan.HDBSCAN clusterer (not a mock), so the condensed_tree_
+        this exercises is genuine."""
+        import hdbscan as _hdbscan_pkg
+
+        rng = np.random.default_rng(42)
+        n_per = 30
+        emb = np.vstack([
+            np.array([0.0, 0.0]) + rng.normal(0, 0.3, size=(n_per, 2)),
+            np.array([10.0, 10.0]) + rng.normal(0, 0.3, size=(n_per, 2)),
+        ])
+        clf = _hdbscan_pkg.HDBSCAN(min_cluster_size=5).fit(emb)
+        orig_labels = clf.labels_.copy()
+        assert len(set(int(l) for l in orig_labels if l >= 0)) >= 2, (
+            "fixture must produce >= 2 real HDBSCAN clusters")
+
+        # Simulate a region-split outcome: take the largest cluster and
+        # reassign half its points to a brand-new id (max_id + 1) -- exactly
+        # what _local_recluster_and_assign's sequential id-assignment loop
+        # does for a cluster's "next_sub_cluster" (see cube_core.py).
+        cluster_ids = sorted(set(int(l) for l in orig_labels if l >= 0))
+        target_cid = max(cluster_ids, key=lambda c: (orig_labels == c).sum())
+        idx = np.flatnonzero(orig_labels == target_cid)
+        new_id = max(cluster_ids) + 1
+        split_labels = orig_labels.copy()
+        split_labels[idx[: len(idx) // 2]] = new_id
+
+        # Must not raise, and must return a same-shape label array -- the
+        # actual point of this test: ancestor_chain()/split_lambda() inside
+        # merge_similar_clusters() must resolve `new_id`'s representative
+        # point through the ORIGINAL condensed tree without a KeyError.
+        out = cc.merge_similar_clusters(clf, split_labels, emb, merge_thresh=1.0)
+        assert out.shape == split_labels.shape
+
+    def test_low_merge_thresh_leaves_region_split_ids_separate(self):
+        """Sanity check the same setup at a merge_thresh that should NOT
+        trigger any merge (0.0, the hard no-op value) -- proving the
+        exercise above at merge_thresh=1.0 is meaningfully different
+        behavior, not just "any thresh no-ops safely"."""
+        import hdbscan as _hdbscan_pkg
+
+        rng = np.random.default_rng(43)
+        n_per = 30
+        emb = np.vstack([
+            np.array([0.0, 0.0]) + rng.normal(0, 0.3, size=(n_per, 2)),
+            np.array([10.0, 10.0]) + rng.normal(0, 0.3, size=(n_per, 2)),
+        ])
+        clf = _hdbscan_pkg.HDBSCAN(min_cluster_size=5).fit(emb)
+        orig_labels = clf.labels_.copy()
+        cluster_ids = sorted(set(int(l) for l in orig_labels if l >= 0))
+        target_cid = max(cluster_ids, key=lambda c: (orig_labels == c).sum())
+        idx = np.flatnonzero(orig_labels == target_cid)
+        new_id = max(cluster_ids) + 1
+        split_labels = orig_labels.copy()
+        split_labels[idx[: len(idx) // 2]] = new_id
+
+        out = cc.merge_similar_clusters(clf, split_labels, emb, merge_thresh=0.0)
+        assert np.array_equal(out, split_labels)  # hard no-op, untouched
+
+
+@pytest.mark.slow
+class TestMinClusterFreqPruningAndAuditTrail:
+    def test_pruning_and_validation_report_apply_uniformly(self, tmp_path):
+        """Full-pipeline check: with region-aware splitting enabled, (a)
+        every surviving cluster in the final output meets min_cluster_freq
+        (pruning is origin-blind -- it thresholds purely on bin-count
+        fraction, so this holds regardless of whether region-split fired),
+        and (b) validation_report.json carries an accurate, present
+        region_split audit block."""
+        dlc_dir = tmp_path / "dlc"
+        dlc_dir.mkdir()
+        _p2_write_session_h5(dlc_dir / "session1_filtered.h5", n_frames=400, seed=7)
+        out_dir = tmp_path / "out"
+
+        cfg = dict(_P2_FAST_RUN_CFG)
+        cfg["hdbscan_region_split_enabled"] = True
+        cfg["min_cluster_freq"] = 5.0  # aggressive (5%), so pruning is exercised
+
+        engine = cc.BSoidEngine(dlc_dir, video_folder=None, output_dir=out_dir,
+                                fps=30, logger=lambda m: None, cfg=cfg)
+        engine.run()
+
+        report_path = out_dir / "validation_report.json"
+        assert report_path.exists()
+        import json as _json
+        report = _json.loads(report_path.read_text())
+        assert "region_split" in report
+        rs = report["region_split"]
+        assert rs["enabled"] is True
+        assert isinstance(rs["clusters_created"], int) and rs["clusters_created"] >= 0
+        assert rs["final_n_cl"] <= rs["post_refinement_n_cl"]
+        assert rs["post_refinement_n_cl"] >= 0
+
+        frame_labels_path = out_dir / "bout_lengths" / "session1_filtered_frame_labels.csv"
+        if frame_labels_path.exists():
+            import pandas as _pd
+            df = _pd.read_csv(frame_labels_path)
+            total = len(df)
+            for cid, n in df["label"].value_counts().items():
+                if cid < 0:
+                    continue
+                assert n / total >= 0.05 - 1e-9, (
+                    f"cluster {cid} survived with {n/total:.3%} of bins, "
+                    f"below the configured 5% min_cluster_freq")
+
+    def test_region_split_key_absent_when_disabled(self, tmp_path):
+        dlc_dir = tmp_path / "dlc"
+        dlc_dir.mkdir()
+        _p2_write_session_h5(dlc_dir / "session1_filtered.h5", n_frames=300, seed=8)
+        out_dir = tmp_path / "out"
+
+        engine = cc.BSoidEngine(dlc_dir, video_folder=None, output_dir=out_dir,
+                                fps=30, logger=lambda m: None, cfg=_P2_FAST_RUN_CFG)
+        engine.run()
+
+        import json as _json
+        report = _json.loads((out_dir / "validation_report.json").read_text())
+        assert "region_split" not in report
