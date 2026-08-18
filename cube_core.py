@@ -10829,8 +10829,36 @@ class BSoidEngine:
                   "(adaptive sweep, DBCV criterion)...")
         self._stage("5/7 — HDBSCAN clustering",
                     f"sweeping min_cluster_size over {n_samp} bins…")
+        # region_split_pre_reduction_pct (Region_Aware_Refinement_
+        # Implementation_Plan.md Design decision 4): a one-shot, clearly-
+        # logged convenience, NOT a closed-loop cluster-count-targeting
+        # mechanism -- only multiplies preferred_clusters_lo/hi for THIS
+        # primary sweep call, using a temporary cfg copy so self._cfg (and
+        # every other reader of preferred_clusters_lo/hi -- local
+        # re-clustering in split_impure_clusters()/split_region_impure_
+        # clusters(), which already ignore the global range entirely, GUI
+        # labels, etc.) is completely unaffected. 0.0 (default) or
+        # hdbscan_region_split_enabled=False is a true no-op: _sweep_cfg
+        # stays identical to self._cfg (same object, not even a copy).
+        _orig_pref_lo = int(self._cfg.get("preferred_clusters_lo", 12) or 12)
+        _orig_pref_hi = int(self._cfg.get("preferred_clusters_hi", 20) or 20)
+        _pre_reduction_pct = float(self._cfg.get("region_split_pre_reduction_pct", 0.0) or 0.0)
+        _region_split_master = bool(self._cfg.get("hdbscan_region_split_enabled", False))
+        _sweep_cfg = self._cfg
+        if _region_split_master and _pre_reduction_pct > 0:
+            _reduced_lo = max(2, round(_orig_pref_lo * _pre_reduction_pct))
+            _reduced_hi = max(2, round(_orig_pref_hi * _pre_reduction_pct))
+            _sweep_cfg = dict(self._cfg)
+            _sweep_cfg["preferred_clusters_lo"] = _reduced_lo
+            _sweep_cfg["preferred_clusters_hi"] = _reduced_hi
+            self._log(
+                f"  [region-split] pre-reduction: preferred_clusters "
+                f"{_orig_pref_lo}-{_orig_pref_hi} -> {_reduced_lo}-{_reduced_hi} "
+                f"({_pre_reduction_pct:.0%}) for this sweep only -- region-"
+                f"aware splitting is expected to bring the final count back "
+                f"up; see the before/after log line after refinement.")
         hdb_clf, hdb_labels, hdb_score, hdb_score_label = run_hdbscan(
-            embedding, self._cfg, n_total=n_samp, log_fn=self._log)
+            embedding, _sweep_cfg, n_total=n_samp, log_fn=self._log)
         # Original HDBSCAN output labels, kept so approximate_predict's
         # fallback inference path (which re-queries hdb_clf directly and gets
         # back ORIGINAL ids) can still be mapped to the final id space after
@@ -10839,6 +10867,7 @@ class BSoidEngine:
         n_cl      = len(set(hdb_labels[hdb_labels >= 0]))
         noise     = (hdb_labels < 0).sum()
         noise_pct = 100 * noise / max(1, len(hdb_labels))
+        _raw_primary_n_cl = n_cl
         self._log(f"  {n_cl} clusters, {noise} noise points "
                   f"({noise_pct:.1f} %), "
                   f"{hdb_score_label}={hdb_score:.3f}")
@@ -11064,6 +11093,24 @@ class BSoidEngine:
                             f"{n_cl} clusters (after rare-cluster prune) · "
                             f"{noise_pct:.0f}% noise")
                 _hdb_remap = dict(_remap)
+
+        # region_split_pre_reduction_pct audit line (Design decision 4): a
+        # clear before/after report so a user can see how close the organic
+        # split-driven result landed to their real target, without the
+        # pipeline pretending to guarantee a specific final count. Only
+        # logged when region-aware splitting is actually active -- silent
+        # otherwise, matching every other opt-in diagnostic in this pipeline.
+        if _region_split_master:
+            _post_refine_n_cl = len(set(_post_refine_labels[_post_refine_labels >= 0]))
+            self._log(
+                f"  [region-split] cluster-count trace: "
+                f"{_raw_primary_n_cl} raw (primary sweep) -> "
+                f"{_post_refine_n_cl} after split/merge refinement -> "
+                f"{n_cl} final (after rare-cluster prune) "
+                f"[original preferred_clusters range: {_orig_pref_lo}-{_orig_pref_hi}"
+                + (f", pre-reduced to {round(max(2, _orig_pref_lo * _pre_reduction_pct))}-"
+                   f"{round(max(2, _orig_pref_hi * _pre_reduction_pct))} for the primary sweep only]"
+                   if _pre_reduction_pct > 0 else "]"))
 
         # Compose a comprehensive ORIGINAL-hdbscan-id -> final-id remap when
         # split/merge refinement and/or rare-cluster pruning changed anything,

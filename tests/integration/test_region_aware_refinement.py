@@ -861,3 +861,110 @@ class TestRefineConsensusClustersRegionWiring:
         except Exception:
             pass  # only the threading-through matters for this test, not a full consensus fit
         assert captured.get("region_per_bin") == sentinel
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Phase 5 — region_split_pre_reduction_pct + audit logging
+# ──────────────────────────────────────────────────────────────────────────
+
+_P5_FAST_RUN_CFG = dict(_P2_FAST_RUN_CFG)
+_P5_FAST_RUN_CFG.update(
+    hdbscan_region_split_enabled=True,
+    region_split_pre_reduction_pct=0.5,
+    preferred_clusters_lo=10, preferred_clusters_hi=20,
+    hdbscan_split_silhouette_thresh=None,  # isolate: no silhouette-split local recluster calls
+    hdbscan_merge_thresh=0.0,
+    consensus_clustering_enabled=False,
+    seed_sweep_n=0,
+)
+
+
+@pytest.mark.slow
+class TestRegionSplitPreReductionPct:
+    def test_only_primary_sweep_call_gets_reduced_range(self, tmp_path, monkeypatch):
+        """region_split_pre_reduction_pct=0.5 with preferred_clusters_lo/hi
+        10/20 must reduce ONLY the primary sweep's own run_hdbscan() call to
+        5/10 -- no local re-clustering call (which always hardcodes its own
+        small lo=2/hi=max_subclusters range, independent of the global
+        range already) should ever see either the original OR the reduced
+        pair coincidentally standing in for that independent behavior."""
+        dlc_dir = tmp_path / "dlc"
+        dlc_dir.mkdir()
+        _p2_write_session_h5(dlc_dir / "session1_filtered.h5", n_frames=300, seed=3)
+        out_dir = tmp_path / "out"
+
+        calls = []
+        orig = cc.run_hdbscan
+
+        def spy(embedding, cfg, *a, **kw):
+            calls.append((cfg.get("preferred_clusters_lo"), cfg.get("preferred_clusters_hi")))
+            return orig(embedding, cfg, *a, **kw)
+
+        monkeypatch.setattr(cc, "run_hdbscan", spy)
+
+        engine = cc.BSoidEngine(dlc_dir, video_folder=None, output_dir=out_dir,
+                                fps=30, logger=lambda m: None, cfg=_P5_FAST_RUN_CFG)
+        engine.run()
+
+        assert (5, 10) in calls, (
+            f"expected the primary sweep call with the reduced (5, 10) "
+            f"pair somewhere in the recorded run_hdbscan() calls: {calls}")
+        assert (10, 20) not in calls, (
+            "the ORIGINAL, un-reduced (10, 20) pair must never reach "
+            f"run_hdbscan() while pre-reduction is active: {calls}")
+
+    def test_disabled_by_default_leaves_sweep_unreduced(self, tmp_path, monkeypatch):
+        dlc_dir = tmp_path / "dlc"
+        dlc_dir.mkdir()
+        _p2_write_session_h5(dlc_dir / "session1_filtered.h5", n_frames=300, seed=4)
+        out_dir = tmp_path / "out"
+
+        calls = []
+        orig = cc.run_hdbscan
+
+        def spy(embedding, cfg, *a, **kw):
+            calls.append((cfg.get("preferred_clusters_lo"), cfg.get("preferred_clusters_hi")))
+            return orig(embedding, cfg, *a, **kw)
+
+        monkeypatch.setattr(cc, "run_hdbscan", spy)
+
+        cfg = dict(_P2_FAST_RUN_CFG)  # hdbscan_region_split_enabled omitted -> defaults False
+        cfg["preferred_clusters_lo"] = 10
+        cfg["preferred_clusters_hi"] = 20
+        engine = cc.BSoidEngine(dlc_dir, video_folder=None, output_dir=out_dir,
+                                fps=30, logger=lambda m: None, cfg=cfg)
+        engine.run()
+
+        assert (10, 20) in calls
+        assert all(pair != (5, 10) for pair in calls)
+
+    def test_audit_log_line_present_when_region_split_active(self, tmp_path):
+        dlc_dir = tmp_path / "dlc"
+        dlc_dir.mkdir()
+        _p2_write_session_h5(dlc_dir / "session1_filtered.h5", n_frames=300, seed=5)
+        out_dir = tmp_path / "out"
+
+        logged = []
+        engine = cc.BSoidEngine(dlc_dir, video_folder=None, output_dir=out_dir,
+                                fps=30, logger=logged.append, cfg=_P5_FAST_RUN_CFG)
+        engine.run()
+
+        trace_lines = [m for m in logged if "[region-split] cluster-count trace" in m]
+        assert len(trace_lines) == 1
+        assert "raw (primary sweep)" in trace_lines[0]
+        assert "after split/merge refinement" in trace_lines[0]
+        assert "final (after rare-cluster prune)" in trace_lines[0]
+        assert "pre-reduced to 5-10" in trace_lines[0]
+
+    def test_no_audit_log_line_when_region_split_disabled(self, tmp_path):
+        dlc_dir = tmp_path / "dlc"
+        dlc_dir.mkdir()
+        _p2_write_session_h5(dlc_dir / "session1_filtered.h5", n_frames=300, seed=6)
+        out_dir = tmp_path / "out"
+
+        logged = []
+        engine = cc.BSoidEngine(dlc_dir, video_folder=None, output_dir=out_dir,
+                                fps=30, logger=logged.append, cfg=_P2_FAST_RUN_CFG)
+        engine.run()
+
+        assert not any("[region-split]" in m for m in logged)
