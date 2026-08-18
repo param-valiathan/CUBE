@@ -1804,6 +1804,13 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
     if not folders:
         raise ValueError("No video folders selected.")
 
+    n_epochs      = int(settings.get("dlc_epochs", 15))
+    pseudo_thr    = float(settings.get("dlc_pseudo_thr", 0.5))
+    filter_key    = settings.get("dlc_filter", "Sequential  Median  ’ Gaussian")
+    filter_types  = FILTER_OPTIONS.get(filter_key, ["median", "gaussian"])
+    run_prep      = bool(settings.get("dlc_run_prep", True))
+    create_filt_v = bool(settings.get("dlc_filtered_vid", True))
+
     # ── Read advanced DLC parameters ──────────────────────────────────────────
     _adv           = session.get("dlc_advanced_cfg", {})
     _sa_name       = str(_adv.get("dlc_superanimal_name", "superanimal_quadruped"))
@@ -1817,21 +1824,17 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
     _pcutoff       = float(_adv.get("dlc_pcutoff",        0.6))
     _bbox_thr      = float(_adv.get("dlc_bbox_threshold", 0.6))
     _max_ind       = int(_adv.get("dlc_max_individuals",  1))
-    _det_epochs    = int(_adv.get("dlc_det_epochs",       15))
-    _pose_epochs   = int(_adv.get("dlc_pose_epochs",      15))
+    _det_epochs    = int(_adv.get("dlc_det_epochs",       n_epochs))
+    _pose_epochs   = int(_adv.get("dlc_pose_epochs",      n_epochs))
     _transfer      = bool(_adv.get("dlc_transfer",        True))
+    _inf_batch_ov  = int(_adv.get("dlc_inf_batch",        0))
+    _det_batch_ov  = int(_adv.get("dlc_det_batch",        0))
     _crop_enable   = bool(_adv.get("dlc_crop_enable",    False))
     _crop_x        = int(_adv.get("dlc_crop_x",          0))
     _crop_y        = int(_adv.get("dlc_crop_y",          0))
     _crop_w        = int(_adv.get("dlc_crop_w",          0))
     _crop_h        = int(_adv.get("dlc_crop_h",          0))
     _do_crop       = _crop_enable and _crop_w > 0 and _crop_h > 0
-
-    n_epochs      = int(settings.get("dlc_epochs", 15))
-    filter_key    = settings.get("dlc_filter", "Sequential  Median  ’ Gaussian")
-    filter_types  = FILTER_OPTIONS.get(filter_key, ["median", "gaussian"])
-    run_prep      = bool(settings.get("dlc_run_prep", True))
-    create_filt_v = bool(settings.get("dlc_filtered_vid", True))
 
     work_dir   = _resolve_work_dir(session)
     errors_dir = work_dir / "errors"
@@ -1840,16 +1843,23 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
 
     VIDEO_EXTS = {".avi", ".mp4", ".mov", ".mkv", ".wmv"}
 
-    # GPU batch auto-sizing; capped at 85% of free VRAM to avoid OOM crashes
-    inf_batch = 8
-    try:
-        import torch
-        if torch.cuda.is_available():
-            free_gb = torch.cuda.mem_get_info()[0] / 1024**3
-            usable_gb = free_gb * 0.85
-            inf_batch = 32 if usable_gb >= 10 else (16 if usable_gb >= 5 else 8)
-    except Exception:
-        pass
+    # GPU batch auto-sizing; capped at 85% of free VRAM to avoid OOM crashes.
+    # A user-forced dlc_inf_batch override (Advanced DLC settings) takes
+    # precedence over the VRAM-based auto-calc, matching the regular
+    # per-video path's behavior (cube.py _run_dlc_step).
+    if _inf_batch_ov > 0:
+        inf_batch = _inf_batch_ov
+    else:
+        inf_batch = 8
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+                usable_gb = free_gb * 0.85
+                inf_batch = 32 if usable_gb >= 10 else (16 if usable_gb >= 5 else 8)
+        except Exception:
+            pass
+    det_batch = _det_batch_ov if _det_batch_ov > 0 else inf_batch
 
     # =========================================================================
     #  Phase 1 — Discovery, Validation & Representative Selection
@@ -2094,9 +2104,10 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
                 bbox_threshold       = _bbox_thr,
                 max_individuals      = _max_ind,
                 batch_size           = inf_batch,
+                detector_batch_size  = det_batch,
                 create_labeled_video = False,
                 video_adapt          = True,
-                pseudo_threshold     = 0.5,
+                pseudo_threshold     = pseudo_thr,
                 detector_epochs      = _det_epochs,
                 pose_epochs          = _pose_epochs,
                 device               = "auto",
@@ -2322,6 +2333,10 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
                         bbox_threshold                 = _bbox_thr,
                         max_individuals                = _max_ind,
                         batch_size                     = current_batchsize,
+                        # bounded by current_batchsize so a prior OOM-driven
+                        # reduction (see the retry loop below) is respected
+                        # even when dlc_det_batch was set to a larger value
+                        detector_batch_size            = min(det_batch, current_batchsize),
                         create_labeled_video           = create_filt_v,
                         video_adapt                    = False,
                         dest_folder                    = str(dest_folder),
@@ -2329,6 +2344,13 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
                         customized_pose_checkpoint     = adapted_pose_ckpt,
                         customized_detector_checkpoint = adapted_detector_ckpt,
                     )
+                    try:
+                        import inspect as _insp3
+                        _vis_sig3 = _insp3.signature(dlc.video_inference_superanimal).parameters
+                        if "superanimal_transfer_learning" in _vis_sig3:
+                            _sa_inf_kw["superanimal_transfer_learning"] = _transfer
+                    except Exception:
+                        pass
                     dlc.video_inference_superanimal([vpath], **_sa_inf_kw)
                 else:
                     dlc.analyze_videos(
