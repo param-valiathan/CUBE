@@ -6061,7 +6061,8 @@ def _consensus_one_seed(s: int, feats_sc_T: np.ndarray, cfg: dict, n_samp: int,
 
 
 def consensus_cluster(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
-                       log_fn=None, embedding: "np.ndarray | None" = None):
+                       log_fn=None, embedding: "np.ndarray | None" = None,
+                       region_per_bin: "list | None" = None):
     """
     Opt-in alternative to trusting a single seed's HDBSCAN partition: run
     UMAP+HDBSCAN(+refinement) across n_seeds random seeds (same per-seed
@@ -6360,7 +6361,8 @@ def consensus_cluster(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
     # clusters() (condensed-tree based) can't be reused here.
     if bool(cfg.get("consensus_refine_enabled", False)):
         labels = refine_consensus_clusters(
-            feats_sc_T, labels, co_assoc, embedding, cfg, log_fn=log_fn)
+            feats_sc_T, labels, co_assoc, embedding, cfg, log_fn=log_fn,
+            region_per_bin=region_per_bin)
 
     # Rare-cluster pruning to -1 (noise), same convention/threshold semantics
     # as the primary path's min_cluster_freq pass further down in run() --
@@ -6436,7 +6438,8 @@ def merge_by_coassociation(labels: np.ndarray, co_assoc: np.ndarray,
 def refine_consensus_clusters(feats_sc_T: np.ndarray, labels: np.ndarray,
                                co_assoc: np.ndarray,
                                embedding: "np.ndarray | None",
-                               cfg: dict, log_fn=None) -> np.ndarray:
+                               cfg: dict, log_fn=None,
+                               region_per_bin: "list | None" = None) -> np.ndarray:
     """
     Post-hoc split + merge refinement for consensus_cluster() output
     (Aug 2026, opt-in via consensus_refine_enabled). Split reuses
@@ -6452,12 +6455,24 @@ def refine_consensus_clusters(feats_sc_T: np.ndarray, labels: np.ndarray,
     derived from it (same caveat this codebase already documents for
     skipping the silhouette validation gate on consensus mode). None skips
     the split half and runs merge-only.
+
+    region_per_bin (Region_Aware_Refinement_Implementation_Plan.md Phase 4,
+    opt-in via hdbscan_region_split_enabled): consensus-mode analogue of
+    refine_clusters_iterative()'s own region_per_bin parameter --
+    split_region_impure_clusters() runs as an additional split pass, same
+    embedding-as-proxy-space caveat, same gate (hdbscan_region_split_enabled
+    AND region_per_bin is not None AND embedding is not None -- this
+    function is only reached at all when consensus_refine_enabled is also
+    True, via its caller's own gate). None (default) is a true no-op for
+    this pass.
     """
     labels = np.asarray(labels).copy()
     split_thresh = cfg.get("hdbscan_split_silhouette_thresh")
     merge_thresh = float(cfg.get("consensus_merge_coassoc_thresh", 0.0) or 0.0)
     max_iter = int(cfg.get("recluster_max_iterations", 2) or 0)
-    if not ((split_thresh or merge_thresh > 0) and max_iter > 0):
+    region_split_on = (bool(cfg.get("hdbscan_region_split_enabled", False))
+                        and region_per_bin is not None and embedding is not None)
+    if not ((split_thresh or merge_thresh > 0 or region_split_on) and max_iter > 0):
         return labels
     if log_fn:
         log_fn(f"\n[consensus-refine]  split/merge refinement "
@@ -6468,6 +6483,9 @@ def refine_consensus_clusters(feats_sc_T: np.ndarray, labels: np.ndarray,
         if split_thresh and embedding is not None:
             labels = split_impure_clusters(feats_sc, embedding, labels,
                                             split_thresh, cfg, log_fn=log_fn)
+        if region_split_on:
+            labels = split_region_impure_clusters(
+                feats_sc, embedding, labels, region_per_bin, cfg, log_fn=log_fn)
         labels = merge_by_coassociation(labels, co_assoc, merge_thresh,
                                          log_fn=log_fn)
         if np.array_equal(before, labels):
@@ -10911,7 +10929,8 @@ class BSoidEngine:
                         f"{_cn_seeds} seeds — co-association + Ward linkage")
             try:
                 _cons = consensus_cluster(feats_sc.T, self._cfg, _cn_seeds,
-                                          log_fn=self._log, embedding=embedding)
+                                          log_fn=self._log, embedding=embedding,
+                                          region_per_bin=region_per_bin)
             except Exception:
                 _cons = None
                 self._log(f"  [WARN] consensus clustering failed: "

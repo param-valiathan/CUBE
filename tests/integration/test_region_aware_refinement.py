@@ -764,3 +764,100 @@ class TestRefineClustersIterativeRegionWiring:
             feats_sc, embedding, labels, _FakeClf(), cfg,
             region_per_bin=region_per_bin)
         assert order == ["silhouette", "region", "merge"]
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Phase 4 — consensus-mode wiring (refine_consensus_clusters)
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestRefineConsensusClustersRegionWiring:
+    def test_region_per_bin_none_is_equivalent_to_pre_phase4(self, tmp_path):
+        cc_old = _load_pre_refactor_module(tmp_path)
+        feats_sc, embedding, labels, cfg = _make_split_fixture(seed=30)
+        feats_sc_T = feats_sc.T
+        n = labels.shape[0]
+        co_assoc = np.eye(n, dtype=np.float32)  # merge_thresh=0 -> never read for merging
+        cfg = dict(cfg)
+        cfg["recluster_max_iterations"] = 2
+        cfg["hdbscan_split_silhouette_thresh"] = SPLIT_THRESH
+        cfg["consensus_merge_coassoc_thresh"] = 0.0
+
+        old = cc_old.refine_consensus_clusters(
+            feats_sc_T, labels, co_assoc, embedding, cfg)
+        new = cc.refine_consensus_clusters(
+            feats_sc_T, labels, co_assoc, embedding, cfg)  # region_per_bin defaults to None
+        assert np.array_equal(old, new)
+
+    def test_region_split_requires_embedding(self):
+        feats_sc, embedding, labels, region_per_bin, cfg = _make_region_split_fixture(seed=31)
+        feats_sc_T = feats_sc.T
+        n = labels.shape[0]
+        co_assoc = np.eye(n, dtype=np.float32)
+        cfg = dict(cfg)
+        cfg["recluster_max_iterations"] = 1
+        cfg["hdbscan_split_silhouette_thresh"] = None
+        cfg["consensus_merge_coassoc_thresh"] = 0.0
+
+        out = cc.refine_consensus_clusters(
+            feats_sc_T, labels, co_assoc, None, cfg, region_per_bin=region_per_bin)
+        assert np.array_equal(out, labels)  # embedding=None -> region split skipped, true no-op
+
+    def test_region_split_invoked_and_splits_when_wired_in(self, monkeypatch):
+        feats_sc, embedding, labels, region_per_bin, cfg = _make_region_split_fixture(seed=32)
+        feats_sc_T = feats_sc.T
+        n = labels.shape[0]
+        co_assoc = np.eye(n, dtype=np.float32)
+        cfg = dict(cfg)
+        cfg["recluster_max_iterations"] = 1
+        cfg["hdbscan_split_silhouette_thresh"] = None
+        cfg["consensus_merge_coassoc_thresh"] = 0.0
+
+        calls = []
+        orig = cc.split_region_impure_clusters
+
+        def spy(*a, **kw):
+            calls.append(1)
+            return orig(*a, **kw)
+
+        monkeypatch.setattr(cc, "split_region_impure_clusters", spy)
+
+        out = cc.refine_consensus_clusters(
+            feats_sc_T, labels, co_assoc, embedding, cfg, region_per_bin=region_per_bin)
+        assert len(calls) >= 1
+        new_ids_in_c0 = set(int(x) for x in out[labels == 0] if x >= 0)
+        assert len(new_ids_in_c0) >= 2
+
+    def test_consensus_cluster_threads_region_per_bin_through(self, monkeypatch):
+        """consensus_cluster() itself must forward its region_per_bin
+        argument into refine_consensus_clusters() -- spy-verified at that
+        boundary rather than running the full consensus pipeline."""
+        captured = {}
+        orig = cc.refine_consensus_clusters
+
+        def spy(feats_sc_T, labels, co_assoc, embedding, cfg, log_fn=None,
+                region_per_bin=None):
+            captured["region_per_bin"] = region_per_bin
+            return orig(feats_sc_T, labels, co_assoc, embedding, cfg,
+                        log_fn=log_fn, region_per_bin=region_per_bin)
+
+        monkeypatch.setattr(cc, "refine_consensus_clusters", spy)
+
+        feats_sc, embedding, labels, region_per_bin, cfg = _make_region_split_fixture(seed=33)
+        cfg = dict(cfg)
+        cfg["consensus_refine_enabled"] = True
+        cfg["consensus_n_seeds"] = 2
+        cfg["hdbscan_split_silhouette_thresh"] = None
+        cfg["consensus_merge_coassoc_thresh"] = 0.0
+        cfg["recluster_max_iterations"] = 1
+        cfg["umap_n_jobs"] = 1
+        cfg["consensus_n_jobs"] = 1
+        cfg["hdbscan_sweep_n_steps"] = 4
+        cfg["target_n_clusters"] = 0
+
+        sentinel = ["marker"]
+        try:
+            cc.consensus_cluster(feats_sc.T, cfg, 2, embedding=embedding,
+                                 region_per_bin=sentinel)
+        except Exception:
+            pass  # only the threading-through matters for this test, not a full consensus fit
+        assert captured.get("region_per_bin") == sentinel
