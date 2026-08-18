@@ -1283,11 +1283,21 @@ def _validated_dlc_detector_name(detector_name: str, session, logger,
 
 
 def _apply_dlc_monkeypatch(logger):
-    """Dynamically unfreeze BatchNorm statistics in DeepLabCut PyTorch engine during adaptation training."""
+    """Dynamically unfreeze BatchNorm statistics in DeepLabCut PyTorch engine during adaptation training.
+
+    Applied by both the regular per-video "Video adapt" path and Smart
+    Adapt v3, since both drive the same underlying DLC adaptation-training
+    code. Idempotent: safe to call more than once per process (e.g. a
+    regular-path run followed by a Smart Adapt run in the same session) --
+    re-wrapping an already-patched COCOLoader.update_model_cfg is skipped
+    rather than nesting another wrapper layer.
+    """
     try:
         from deeplabcut.pose_estimation_pytorch.modelzoo.train_from_coco import COCOLoader
+        if getattr(COCOLoader.update_model_cfg, "_cube_bn_unfreeze_patch", False):
+            return
         original_update = COCOLoader.update_model_cfg
-        
+
         def custom_update(self, updates):
             if "model.backbone.freeze_bn_stats" in updates:
                 updates["model.backbone.freeze_bn_stats"] = False
@@ -1296,7 +1306,8 @@ def _apply_dlc_monkeypatch(logger):
                 updates["detector.model.freeze_bn_stats"] = False
                 logger.info("  [MONKEYPATCH] Unfreezing detector model backbone BatchNorm stats.")
             original_update(self, updates)
-            
+
+        custom_update._cube_bn_unfreeze_patch = True
         COCOLoader.update_model_cfg = custom_update
         logger.info("  [MONKEYPATCH] Successfully wrapped COCOLoader to unfreeze BatchNorm statistics.")
     except Exception as e:
@@ -1414,6 +1425,12 @@ def _run_dlc_step(session: SessionState, settings: SettingsPanel,
     if _inf_batch_ov > 0:
         inf_batch = _inf_batch_ov
     det_batch = _det_batch_ov if _det_batch_ov > 0 else inf_batch
+
+    # Same BatchNorm-unfreeze patch Smart Adapt applies before its adaptation
+    # training call -- both paths drive the same underlying DLC
+    # video_adapt=True training code, so both should get consistent behavior.
+    if use_adapt and not _use_custom:
+        _apply_dlc_monkeypatch(logger)
 
     pb.step_start("DLC inference", total)
     logger.step(f"DLC: {total} video(s) across {len(folders)} folder(s)")
