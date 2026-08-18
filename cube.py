@@ -4387,7 +4387,7 @@ class EnvParadigmWindow(tk.Toplevel):
         super().__init__(parent)
         self.title("Environments, Objects, Paradigms")
         self.configure(bg=C["bg"])
-        self.geometry("560x420")
+        self.geometry("580x660")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -4433,6 +4433,64 @@ class EnvParadigmWindow(tk.Toplevel):
                       "approach/avoid object-interaction events.",
                  font=("Segoe UI", 7), bg=C["bg"],
                  fg=C["dim"]).pack(anchor="w", padx=10, pady=(0, 4))
+
+        # ── Region-aware cluster refinement ─────────────────────────────────
+        # All keys live here (not AdvancedCUBEWindow) per explicit user
+        # direction -- it's conceptually an environmental-context feature
+        # (reads env_arena_cfg, gated on traced regions existing) even
+        # though it also touches HDBSCAN refinement internals. Independent
+        # of the "Enable environmental context" checkbox above: this reads
+        # env_arena_cfg directly and does not require env_features_enabled.
+        self._region_split_v = tk.BooleanVar(
+            value=bool(cfg.get("hdbscan_region_split_enabled", False)))
+        row = tk.Frame(self, bg=C["bg"])
+        row.pack(fill="x", **pad)
+        tk.Checkbutton(row, text="Enable region-aware cluster splitting (opt-in)",
+                       variable=self._region_split_v, bg=C["bg"], fg=C["green"],
+                       selectcolor=C["card"], activebackground=C["bg"]).pack(side="left")
+        tk.Label(self,
+                 text="  Flags clusters whose bins are spatially impure across traced regions "
+                      "(e.g. 85% Periphery / 15% Center) and locally re-clusters just that "
+                      "cluster on its kinematic features -- region data never enters UMAP/"
+                      "HDBSCAN itself. Requires an arena with traced regions below.",
+                 font=("Segoe UI", 7), bg=C["bg"],
+                 fg=C["dim"], wraplength=520, justify="left").pack(anchor="w", padx=10, pady=(0, 4))
+
+        self._region_split_params_f = tk.Frame(self, bg=C["bg"])
+        self._region_split_params_f.pack(fill="x", padx=10)
+
+        def _rs_spin(row_f, label, key, lo, hi, step, default, fmt="%.2f"):
+            r = tk.Frame(self._region_split_params_f, bg=C["bg"])
+            r.pack(fill="x", pady=1)
+            tk.Label(r, text=label, font=("Segoe UI", 8), bg=C["bg"],
+                     fg=C["subtext"], width=30, anchor="w").pack(side="left")
+            v = tk.DoubleVar(value=float(cfg.get(key, default)))
+            tk.Spinbox(r, from_=lo, to=hi, increment=step, format=fmt,
+                       textvariable=v, width=8, bg=C["card2"], fg=C["text"],
+                       buttonbackground=C["card2"], font=("Segoe UI", 8)).pack(side="left")
+            return v
+
+        self._region_split_impurity_v = _rs_spin(
+            self._region_split_params_f, "Impurity threshold (entropy 0-1):",
+            "hdbscan_region_split_impurity_thresh", 0.0, 1.0, 0.05, 0.5)
+        self._region_split_min_minority_v = _rs_spin(
+            self._region_split_params_f, "Minority region floor (0-1):",
+            "hdbscan_region_split_min_minority_frac", 0.0, 1.0, 0.01, 0.15)
+        self._region_split_max_sub_v = _rs_spin(
+            self._region_split_params_f, "Max sub-clusters per split:",
+            "hdbscan_region_split_max_subclusters", 2, 10, 1, 3, fmt="%.0f")
+        self._region_split_max_cand_v = _rs_spin(
+            self._region_split_params_f, "Max split candidates per pass:",
+            "hdbscan_region_split_max_candidates", 1, 50, 1, 10, fmt="%.0f")
+        self._region_split_pre_reduction_v = _rs_spin(
+            self._region_split_params_f, "Pre-reduction % (0 = off):",
+            "region_split_pre_reduction_pct", 0.0, 1.0, 0.05, 0.0)
+        tk.Label(self._region_split_params_f,
+                 text="    Pre-reduction multiplies the primary sweep's preferred cluster "
+                      "range for that sweep only -- a one-shot convenience, not a guaranteed "
+                      "final count. See the run log's before/after trace line.",
+                 font=("Segoe UI", 7), bg=C["bg"], fg=C["dim"],
+                 wraplength=500, justify="left").pack(anchor="w", pady=(0, 4))
 
         # ── Interaction threshold ───────────────────────────────────────────
         thr_row = tk.Frame(self, bg=C["bg"])
@@ -4567,6 +4625,29 @@ class EnvParadigmWindow(tk.Toplevel):
             cfg["env_arena_cfg"] = self._env_arena_cfg
         else:
             cfg.pop("env_arena_cfg", None)
+
+        if self._region_split_v.get():
+            cfg["hdbscan_region_split_enabled"] = True
+            cfg["hdbscan_region_split_impurity_thresh"] = float(
+                self._region_split_impurity_v.get())
+            cfg["hdbscan_region_split_min_minority_frac"] = float(
+                self._region_split_min_minority_v.get())
+            cfg["hdbscan_region_split_max_subclusters"] = int(
+                self._region_split_max_sub_v.get())
+            cfg["hdbscan_region_split_max_candidates"] = int(
+                self._region_split_max_cand_v.get())
+            _pre_red = float(self._region_split_pre_reduction_v.get())
+            if _pre_red > 0:
+                cfg["region_split_pre_reduction_pct"] = _pre_red
+            else:
+                cfg.pop("region_split_pre_reduction_pct", None)
+        else:
+            cfg.pop("hdbscan_region_split_enabled", None)
+            cfg.pop("hdbscan_region_split_impurity_thresh", None)
+            cfg.pop("hdbscan_region_split_min_minority_frac", None)
+            cfg.pop("hdbscan_region_split_max_subclusters", None)
+            cfg.pop("hdbscan_region_split_max_candidates", None)
+            cfg.pop("region_split_pre_reduction_pct", None)
 
         _thr_raw = self._env_thresh_var.get().strip()
         if _thr_raw:
