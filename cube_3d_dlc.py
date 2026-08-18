@@ -675,7 +675,8 @@ def _infer_camera_videos(dlc, videos: list[Path], cam_label: str,
             if filter_types:
                 try:
                     filter_dlc_h5(final_h5, filter_types, log_fn=logger,
-                                  out_path=clean_filtered, fps=fps)
+                                  out_path=clean_filtered, fps=fps,
+                                  likelihood_thresh=pcutoff)
                 except Exception as fe:
                     logger.warn(f"  filter_dlc_h5 failed: {fe} — copying raw")
                     shutil.copy2(str(final_h5), str(clean_filtered))

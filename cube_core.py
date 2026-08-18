@@ -6973,13 +6973,115 @@ def plot_cv_scores(cv_scores: np.ndarray, out_path: Path):
 #  DLC H5 POST-PROCESSING FILTER
 #
 
+def _good_runs(good: np.ndarray, min_run: int):
+    """
+    Yield (start, stop) index pairs for each maximal run of consecutive
+    True in good whose length is >= min_run.
+
+    A run shorter than min_run isn't yielded at all — an "island" of only a
+    few confident detections sandwiched between two long low-confidence
+    stretches doesn't carry enough surrounding data to anchor a smoothing
+    filter (there's nothing of comparable quality for the filter to pad
+    against at its edges), so those frames are left out of any run and
+    fall back to their untouched raw value, same as any other low-
+    confidence frame.
+    """
+    n = len(good)
+    i = 0
+    while i < n:
+        if good[i]:
+            j = i
+            while j < n and good[j]:
+                j += 1
+            if (j - i) >= min_run:
+                yield i, j
+            i = j
+        else:
+            i += 1
+
+
+def _apply_filter_chain(values: np.ndarray, filter_types: list, fps: float) -> np.ndarray:
+    """
+    Run the configured filter pipeline over one contiguous array of
+    already-confident samples. Every filter's own boundary handling
+    (scipy's edge padding/reflection) is local to this array only — the
+    caller is expected to pass exactly one confident run at a time, never
+    a full raw series with low-confidence/missing frames spliced into it,
+    so a run's filtered output can never be pulled toward a neighbouring
+    run or a gap it has nothing to do with.
+    """
+    series = np.asarray(values, dtype=float)
+    n = len(series)
+    if "median" in filter_types:
+        from scipy.ndimage import median_filter as _mf
+        series = _mf(series, size=min(7, n), mode="reflect")
+    if "gaussian" in filter_types:
+        from scipy.ndimage import gaussian_filter1d
+        series = gaussian_filter1d(series, sigma=3.0)
+    if "butterworth" in filter_types:
+        from scipy.signal import butter, filtfilt
+        cutoff = 5.0   # Hz — matches base script
+        nyq    = max(fps, 1.0) / 2.0
+        b, a   = butter(4, cutoff / nyq, btype="low")
+        padlen = 3 * max(len(a), len(b))
+        if n > padlen:
+            series = filtfilt(b, a, series)
+    if "savgol" in filter_types:
+        from scipy.signal import savgol_filter
+        wl = min(15, n - 1)
+        if wl % 2 == 0:
+            wl -= 1
+        if 3 <= wl < n:
+            series = savgol_filter(series.astype(float), wl, 3)
+    if "kalman" in filter_types:
+        c = series.astype(float)
+        x_k, p_k = c[0], 1.0
+        Q, R = 0.01, 1.0
+        fwd = np.zeros(n); cov_fwd = np.zeros(n)
+        for _i in range(n):
+            p_k += Q
+            K    = p_k / (p_k + R)
+            x_k  = x_k + K * (c[_i] - x_k)
+            p_k *= (1 - K)
+            fwd[_i] = x_k; cov_fwd[_i] = p_k
+        out_arr = fwd.copy()
+        for _i in range(n - 2, -1, -1):
+            G = cov_fwd[_i] / (cov_fwd[_i] + Q)
+            out_arr[_i] = out_arr[_i] + G * (out_arr[_i + 1] - fwd[_i])
+        series = out_arr
+    return np.asarray(series, dtype=float)
+
+
 def filter_dlc_h5(h5_path: Path, filter_types: list, log_fn=print,
                   out_path: "Path | None" = None,
-                  fps: float = 30.0) -> "Path | None":
+                  fps: float = 30.0,
+                  likelihood_thresh: float = 0.6,
+                  min_good_run: int = 7) -> "Path | None":
     """
-    Apply filter pipeline to a DLC H5 pose file; save as <stem>_filtered.h5.
-    Supports: median, gaussian, butterworth, savgol, kalman.
-    Sequential filters are applied in list order.
+    Apply a jitter-removal filter pipeline to a DLC H5 pose file; save as
+    <stem>_filtered.h5. Supports: median, gaussian, butterworth, savgol,
+    kalman. Sequential filters are applied in list order.
+
+    likelihood_thresh gates which frames this filter is allowed to touch.
+    Frames below it — including DLC's "no detection" -1 sentinel — keep
+    their original raw value untouched. Within a bodypart, confident
+    (>= likelihood_thresh) frames are further split into maximal runs, and
+    each filter chain is applied to a single run in isolation (see
+    _apply_filter_chain / _good_runs): a run shorter than min_good_run is
+    skipped entirely and left at its raw values, and even a qualifying
+    run's filtered output only ever depends on that run's own samples, so
+    a low-confidence/missing stretch can never bleed a smoothed value
+    across the gap into a neighbouring run — the exact mechanism that used
+    to drag nearby high-confidence frames off by tens of pixels and, for
+    long occlusions, filter straight through to a location the tracked
+    point never actually visited.
+
+    Gap-filling the untouched low-confidence/missing frames is left
+    entirely to the analysis pipeline's own likelihood-aware, gap-capped
+    interpolation (see load_dlc_file), which still sees the correct,
+    unmodified likelihood for them and fills them from clean neighbours
+    instead of inheriting a value this filter smoothed across a gap.
+
     Pass out_path to override the default output location.
     Returns the filtered path, or None on failure.
     """
@@ -6992,56 +7094,28 @@ def filter_dlc_h5(h5_path: Path, filter_types: list, log_fn=print,
         result = df.copy()
         scorer = df.columns.get_level_values("scorer").unique()[0]
         for bp in df.columns.get_level_values("bodyparts").unique():
+            try:
+                lik_col = (scorer, bp, "likelihood")
+                lik = pd.to_numeric(
+                    result[lik_col] if lik_col in result.columns
+                    else pd.Series(1.0, index=result.index),
+                    errors="coerce").values
+            except Exception:
+                lik = np.ones(len(result))
+            good  = np.nan_to_num(lik, nan=-1.0) >= likelihood_thresh
+            runs  = list(_good_runs(good, min_good_run))
+            if not runs:
+                continue   # not enough confident data anywhere to denoise
             for coord in ("x", "y"):
                 try:
-                    col    = (scorer, bp, coord)
-                    series = result[col].astype(float).copy()
-                    if "median" in filter_types:
-                        from scipy.ndimage import median_filter as _mf
-                        series = pd.Series(
-                            _mf(series.values, size=7, mode="reflect"),
-                            index=series.index)
-                    if "gaussian" in filter_types:
-                        from scipy.ndimage import gaussian_filter1d
-                        series = pd.Series(
-                            gaussian_filter1d(series.values, sigma=3.0),
-                            index=series.index)
-                    if "butterworth" in filter_types:
-                        from scipy.signal import butter, filtfilt
-                        cutoff = 5.0   # Hz — matches base script
-                        nyq    = max(fps, 1.0) / 2.0
-                        b, a   = butter(4, cutoff / nyq, btype="low")
-                        series = pd.Series(
-                            filtfilt(b, a, series.values),
-                            index=series.index)
-                    if "savgol" in filter_types:
-                        from scipy.signal import savgol_filter
-                        wl = min(15, len(series) - 1)
-                        if wl % 2 == 0:
-                            wl -= 1
-                        if wl >= 3:
-                            series = pd.Series(
-                                savgol_filter(series.values.astype(float), wl, 3),
-                                index=series.index)
-                    if "kalman" in filter_types:
-                        import numpy as _np
-                        c = series.values.astype(float)
-                        n = len(c)
-                        x_k, p_k = c[0], 1.0
-                        Q, R = 0.01, 1.0
-                        fwd = _np.zeros(n); cov_fwd = _np.zeros(n)
-                        for _i in range(n):
-                            p_k += Q
-                            K    = p_k / (p_k + R)
-                            x_k  = x_k + K * (c[_i] - x_k)
-                            p_k *= (1 - K)
-                            fwd[_i] = x_k; cov_fwd[_i] = p_k
-                        out_arr = fwd.copy()
-                        for _i in range(n - 2, -1, -1):
-                            G = cov_fwd[_i] / (cov_fwd[_i] + Q)
-                            out_arr[_i] = out_arr[_i] + G * (out_arr[_i + 1] - fwd[_i])
-                        series = pd.Series(out_arr, index=series.index)
-                    result[col] = series.values
+                    col = (scorer, bp, coord)
+                    out = result[col].astype(float).values.copy()
+                    for i, j in runs:
+                        try:
+                            out[i:j] = _apply_filter_chain(out[i:j], filter_types, fps)
+                        except Exception:
+                            pass   # leave this run's raw values untouched
+                    result[col] = out
                 except Exception:
                     pass
         result.to_hdf(str(out_path), key="df_with_missing", mode="w", format="fixed")

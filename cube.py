@@ -1584,7 +1584,8 @@ def _run_dlc_step(session: SessionState, settings: SettingsPanel,
                 if filter_types:
                     filter_dlc_h5(final_h5, filter_types, log_fn=logger,
                                   out_path=clean_filtered,
-                                  fps=float(session.get("fps", 30)))
+                                  fps=float(session.get("fps", 30)),
+                                  likelihood_thresh=_pcutoff)
                 else:
                     shutil.copy2(str(final_h5), str(clean_filtered))
                     logger(f"  Saved H5 → {clean_filtered.name}")
@@ -2385,7 +2386,8 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
             if filter_types:
                 filter_dlc_h5(final_h5, filter_types, log_fn=logger,
                               out_path=clean_filtered,
-                              fps=float(session.get("fps", 30)))
+                              fps=float(session.get("fps", 30)),
+                              likelihood_thresh=_pcutoff)
             else:
                 shutil.copy2(str(final_h5), str(clean_filtered))
             try:
@@ -2555,7 +2557,8 @@ def _run_dlc_zoo_per_video(dlc, cv2, gc, valid_entries, session, settings,
             if filter_types:
                 filter_dlc_h5(final_h5, filter_types, log_fn=logger,
                               out_path=clean_filtered,
-                              fps=float(session.get("fps", 30)))
+                              fps=float(session.get("fps", 30)),
+                              likelihood_thresh=_pcutoff)
             else:
                 shutil.copy2(str(final_h5), str(clean_filtered))
             try:
@@ -3377,8 +3380,13 @@ class AdvancedDLCWindow(tk.Toplevel):
                        buttonbackground=C["card2"],
                        font=("Segoe UI", 9)).pack(side="left")
 
-        _adv_row(sec2, "Pose confidence (pcutoff)",
-                 lambda r: _spin_f(r, "dlc_pcutoff", 0.0, 1.0, 0.05, 0.6))
+        def _pcutoff_row(r):
+            _spin_f(r, "dlc_pcutoff", 0.0, 1.0, 0.05, 0.6)
+            tk.Label(r, text="also gates which frames the jitter filter denoises",
+                     font=("Segoe UI", 7), bg=C["card"], fg=C["dim"]
+                     ).pack(side="left", padx=4)
+
+        _adv_row(sec2, "Pose confidence (pcutoff)", _pcutoff_row)
         _adv_row(sec2, "Bounding-box threshold",
                  lambda r: _spin_f(r, "dlc_bbox_threshold", 0.0, 1.0, 0.05, 0.6))
         _adv_row(sec2, "Max individuals per frame",
