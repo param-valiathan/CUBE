@@ -779,8 +779,8 @@ class SettingsPanel(tk.Frame):
          "Fine-tune per video (better tracking)"),
         ("dlc_smart_adapt",  "Smart Adapt (v3)",    "bool", None, True,
          "Select 1 representative video → adapt once → reuse for all (Scenario A)"),
-        ("dlc_epochs",       "Adapt epochs",        "int",  (4,30,2),  15,
-         "15=recommended  4=fast"),
+        ("dlc_epochs",       "Adapt epochs",        "int",  (4,200,2),  15,
+         "15=recommended  4=fast  (Advanced dialog's Det/Pose epochs share this ceiling)"),
         ("dlc_pseudo_thr",   "Pseudo threshold",    "float",(0.2,0.8,0.05),0.50,
          "Higher = stricter pseudo-labels"),
         ("dlc_filter",       "Post-filter",         "combo",
@@ -793,7 +793,7 @@ class SettingsPanel(tk.Frame):
          "   Irreversible — deletes source video"),
         ("dlc_run_prep",     "Run CUBE prep",       "bool", None, True,
          "Run Step 3 pre-processing inline within DLC (Step 1)"),
-        ("auto_bsoid",       "Auto-run analysis",   "bool", None, True,
+        ("auto_bsoid",       "Auto-run analysis",   "bool", None, False,
          "After DLC: auto-launch Step 3 (pre-processing) then Step 4 (BSoid analysis)"),
         ("dlc_cooldown",     "Cooldown",            "combo",
          list(COOLDOWN_OPTIONS.keys()), "15 s",
@@ -3204,7 +3204,9 @@ class AdvancedDLCWindow(tk.Toplevel):
         "superanimal_quadruped",
         "superanimal_topviewmouse",
     ]
-    ARCHITECTURES = ["hrnet_w32", "resnet_50", "rtmpose_s", "rtmpose_x"]
+    ARCHITECTURES = ["hrnet_w32", "resnet_50", "rtmpose_s", "rtmpose_x", "dlcrnet"]
+    # dlcrnet is DLC's bottom-up TensorFlow-engine architecture (no detector
+    # pairing needed); the other four are PyTorch top-down architectures.
     DETECTORS     = [
         "fasterrcnn_mobilenet_v3_large_fpn",
         "fasterrcnn_resnet50_fpn_v2",
