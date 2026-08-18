@@ -472,3 +472,295 @@ class TestRegionPerBinGatingFullPipeline:
         engine.run()  # must not raise
 
         assert len(calls) >= 1
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Phase 3 — split_region_impure_clusters() + refine_clusters_iterative() wiring
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestNormalizedRegionEntropy:
+    def test_single_category_is_exactly_zero(self):
+        entropy, counts = cc._normalized_region_entropy(["A"] * 10)
+        assert entropy == 0.0
+        assert counts == {"A": 10}
+
+    def test_two_way_even_split_is_near_one(self):
+        entropy, counts = cc._normalized_region_entropy(["A"] * 10 + ["B"] * 10)
+        assert entropy == pytest.approx(1.0)
+        assert counts == {"A": 10, "B": 10}
+
+    def test_three_way_skewed_is_between_zero_and_one(self):
+        entropy, counts = cc._normalized_region_entropy(["A"] * 10 + ["B"] * 9 + ["C"] * 1)
+        assert 0.0 < entropy < 1.0
+        assert counts == {"A": 10, "B": 9, "C": 1}
+
+    def test_empty_list_does_not_raise(self):
+        # k == 0 -> early return, not a 0/0 division.
+        entropy, counts = cc._normalized_region_entropy([])
+        assert entropy == 0.0
+        assert counts == {}
+
+
+def _make_region_split_fixture(seed=0):
+    """
+    Mirrors _make_split_fixture's feature-space structure but adds a
+    parallel region_per_bin array:
+      - cluster 0: real two-blob feature structure (splits cleanly when
+        attempted) AND a 50/50 two-region split (entropy ~1.0, clears both
+        the impurity threshold and the minority floor) -> region-split
+        candidate that should actually split.
+      - cluster 1: single feature blob, single region -> never a candidate
+        (entropy exactly 0).
+      - cluster 2: single feature blob (so even if picked as a candidate it
+        would fail split_impure_clusters' acceptance gate) with a 10/9/1
+        three-region split -> entropy clears hdbscan_region_split_impurity_thresh
+        (default 0.5) but the size-1 minority region (1/20 = 0.05) fails
+        hdbscan_region_split_min_minority_frac (default 0.15) -> must NOT
+        be a candidate at all (gate should reject before ever attempting a
+        local re-cluster).
+    """
+    rng = np.random.default_rng(seed)
+    n_per = 20
+    n_feat = 6
+
+    emb0 = rng.normal(0, 3.0, size=(n_per, 2))
+    emb1 = np.array([30.0, 30.0]) + rng.normal(0, 0.2, size=(n_per, 2))
+    emb2 = rng.normal(0, 3.0, size=(n_per, 2)) + np.array([1.0, -1.0])
+    embedding = np.vstack([emb0, emb1, emb2])
+    labels = np.array([0] * n_per + [1] * n_per + [2] * n_per)
+
+    b0a = np.array([10.0] * n_feat) + rng.normal(0, 0.3, size=(n_per // 2, n_feat))
+    b0b = np.array([-10.0] * n_feat) + rng.normal(0, 0.3, size=(n_per - n_per // 2, n_feat))
+    feat0 = np.vstack([b0a, b0b])
+    feat1 = np.array([0.0] * n_feat) + rng.normal(0, 0.3, size=(n_per, n_feat))
+    feat2 = np.array([50.0] * n_feat) + rng.normal(0, 0.3, size=(n_per, n_feat))
+    feats_sc = np.vstack([feat0, feat1, feat2]).T  # (n_feat, n_bins)
+
+    region0 = ["RegionA"] * 10 + ["RegionB"] * 10
+    region1 = ["RegionA"] * n_per
+    region2 = ["RegionA"] * 10 + ["RegionB"] * 9 + ["RegionC"] * 1
+    region_per_bin = region0 + region1 + region2
+
+    cfg = dict(
+        umap_n_neighbors=10, umap_n_components=2, umap_min_dist=0.1,
+        umap_random_state=42, umap_n_jobs=1, pca_n_components="off",
+        hdbscan_split_min_points=10,
+        hdbscan_region_split_enabled=True,
+        hdbscan_region_split_signal=["current_region"],
+        hdbscan_region_split_impurity_thresh=0.5,
+        hdbscan_region_split_min_minority_frac=0.15,
+        hdbscan_region_split_max_subclusters=3,
+        hdbscan_region_split_max_candidates=10,
+        hdbscan_split_sweep_n_steps=6,
+        hdbscan_split_n_jobs=1,
+        hdbscan_merge_thresh=0.0,
+        hdbscan_pct_lo=5, hdbscan_pct_hi=40,
+        hdbscan_method="eom", target_n_clusters=0,
+        preferred_clusters_lo=2, preferred_clusters_hi=4,
+    )
+    return feats_sc, embedding, labels, region_per_bin, cfg
+
+
+class TestSplitRegionImpureClusters:
+    def test_flag_off_is_hard_noop(self):
+        feats_sc, embedding, labels, region_per_bin, cfg = _make_region_split_fixture(seed=10)
+        cfg = dict(cfg)
+        cfg["hdbscan_region_split_enabled"] = False
+        out = cc.split_region_impure_clusters(
+            feats_sc, embedding, labels, region_per_bin, cfg)
+        assert np.array_equal(out, labels)
+
+    def test_region_per_bin_none_is_hard_noop(self):
+        feats_sc, embedding, labels, _region_per_bin, cfg = _make_region_split_fixture(seed=11)
+        out = cc.split_region_impure_clusters(feats_sc, embedding, labels, None, cfg)
+        assert np.array_equal(out, labels)
+
+    def test_signal_without_current_region_is_hard_noop(self):
+        feats_sc, embedding, labels, region_per_bin, cfg = _make_region_split_fixture(seed=12)
+        cfg = dict(cfg)
+        cfg["hdbscan_region_split_signal"] = ["dist_to_nearest_object_Toy"]
+        out = cc.split_region_impure_clusters(
+            feats_sc, embedding, labels, region_per_bin, cfg)
+        assert np.array_equal(out, labels)
+
+    def test_misaligned_length_is_hard_noop(self):
+        feats_sc, embedding, labels, region_per_bin, cfg = _make_region_split_fixture(seed=13)
+        out = cc.split_region_impure_clusters(
+            feats_sc, embedding, labels, region_per_bin[:-1], cfg)
+        assert np.array_equal(out, labels)
+
+    def test_impure_cluster_with_real_structure_splits_when_enabled(self):
+        feats_sc, embedding, labels, region_per_bin, cfg = _make_region_split_fixture(seed=14)
+        out = cc.split_region_impure_clusters(
+            feats_sc, embedding, labels, region_per_bin, cfg)
+        new_ids_in_c0 = set(int(x) for x in out[labels == 0] if x >= 0)
+        assert len(new_ids_in_c0) >= 2, (
+            "cluster 0 (50/50 two-region impurity, real two-blob feature "
+            "structure) should have split into >= 2 sub-clusters")
+        # cluster 1 (pure, entropy 0) untouched.
+        assert np.array_equal(out[labels == 1], labels[labels == 1])
+
+    def test_minority_floor_rejects_cluster_2_candidacy(self):
+        feats_sc, embedding, labels, region_per_bin, cfg = _make_region_split_fixture(seed=15)
+        out = cc.split_region_impure_clusters(
+            feats_sc, embedding, labels, region_per_bin, cfg)
+        # cluster 2's entropy clears the impurity threshold but its 1/20
+        # minority region fails the 0.15 floor -> must never even be
+        # attempted as a candidate, so its labels are completely untouched.
+        assert np.array_equal(out[labels == 2], labels[labels == 2])
+
+    def test_minority_floor_disabled_widens_candidate_pool(self, monkeypatch):
+        """With the minority floor set to 0 (accept any minority fraction),
+        cluster 2 becomes a CANDIDATE (region entropy still clears the
+        impurity threshold) even though it wasn't one at the default 0.15
+        floor -- verified via the same worst-first candidate list the
+        function builds internally, not by asserting a specific label
+        outcome (real local HDBSCAN behavior on a tiny homogeneous blob is
+        not reliably "no split" at n=20, so asserting on final labels here
+        would be flaky; the candidate-SELECTION gate is what this test is
+        actually about)."""
+        feats_sc, embedding, labels, region_per_bin, cfg = _make_region_split_fixture(seed=16)
+
+        captured = {}
+        orig = cc._local_recluster_and_assign
+
+        def spy(feats_sc, embedding, labels, candidate_ids, *a, **kw):
+            captured["candidate_ids"] = list(candidate_ids)
+            return orig(feats_sc, embedding, labels, candidate_ids, *a, **kw)
+
+        monkeypatch.setattr(cc, "_local_recluster_and_assign", spy)
+
+        cfg_default = dict(cfg)
+        cc.split_region_impure_clusters(feats_sc, embedding, labels, region_per_bin, cfg_default)
+        assert 2 not in captured.get("candidate_ids", [])
+
+        cfg_floor_off = dict(cfg)
+        cfg_floor_off["hdbscan_region_split_min_minority_frac"] = 0.0
+        cc.split_region_impure_clusters(feats_sc, embedding, labels, region_per_bin, cfg_floor_off)
+        assert 2 in captured.get("candidate_ids", [])
+
+    def test_max_candidates_bounds_worst_first(self, monkeypatch):
+        """With the minority floor relaxed, clusters 0 (entropy 1.0) and 2
+        (entropy ~0.78) are both legitimate candidates. max_candidates=1
+        must keep only the higher-entropy one (cluster 0), worst-impurity-
+        first -- verified via the same candidate-list spy as above (not
+        final labels, to avoid coupling this test to local-HDBSCAN
+        randomness on the smaller candidate)."""
+        feats_sc, embedding, labels, region_per_bin, cfg = _make_region_split_fixture(seed=17)
+        cfg = dict(cfg)
+        cfg["hdbscan_region_split_min_minority_frac"] = 0.0  # cluster 2 now eligible too
+        cfg["hdbscan_region_split_max_candidates"] = 1
+
+        captured = {}
+        orig = cc._local_recluster_and_assign
+
+        def spy(feats_sc, embedding, labels, candidate_ids, *a, **kw):
+            captured["candidate_ids"] = list(candidate_ids)
+            return orig(feats_sc, embedding, labels, candidate_ids, *a, **kw)
+
+        monkeypatch.setattr(cc, "_local_recluster_and_assign", spy)
+        cc.split_region_impure_clusters(feats_sc, embedding, labels, region_per_bin, cfg)
+        assert captured.get("candidate_ids") == [0], (
+            "max_candidates=1 with both clusters 0 (entropy 1.0) and 2 "
+            "(entropy ~0.78) eligible must keep only the higher-entropy "
+            "cluster 0, worst-first")
+
+
+class TestRefineClustersIterativeRegionWiring:
+    def test_region_per_bin_none_is_equivalent_to_pre_phase3(self, tmp_path):
+        """With region_per_bin=None (the default), refine_clusters_iterative()
+        must behave exactly as it did before Phase 3 -- verified against the
+        pre-region-aware-refinement snapshot on the silhouette-split fixture
+        from Phase 1."""
+        cc_old = _load_pre_refactor_module(tmp_path)
+        feats_sc, embedding, labels, cfg = _make_split_fixture(seed=20)
+        cfg = dict(cfg)
+        cfg["recluster_max_iterations"] = 2
+        cfg["hdbscan_split_silhouette_thresh"] = SPLIT_THRESH
+
+        class _FakeClf:
+            condensed_tree_ = None
+
+        old = cc_old.refine_clusters_iterative(
+            feats_sc, embedding, labels, _FakeClf(), cfg)
+        new = cc.refine_clusters_iterative(
+            feats_sc, embedding, labels, _FakeClf(), cfg)  # region_per_bin defaults to None
+        assert np.array_equal(old, new)
+
+    def test_region_split_enabled_but_region_per_bin_none_is_still_noop_for_that_pass(self):
+        feats_sc, embedding, labels, region_per_bin, cfg = _make_region_split_fixture(seed=21)
+        cfg = dict(cfg)
+        cfg["recluster_max_iterations"] = 1
+        cfg["hdbscan_split_silhouette_thresh"] = None
+        cfg["hdbscan_merge_thresh"] = 0.0
+        # region_per_bin intentionally NOT passed -> region_split_on is False
+        # even though hdbscan_region_split_enabled=True in cfg.
+        out = cc.refine_clusters_iterative(
+            feats_sc, embedding, labels, None, cfg)
+        assert np.array_equal(out, labels)
+
+    def test_region_split_actually_invoked_when_wired_in(self, monkeypatch):
+        feats_sc, embedding, labels, region_per_bin, cfg = _make_region_split_fixture(seed=22)
+        cfg = dict(cfg)
+        cfg["recluster_max_iterations"] = 1
+        cfg["hdbscan_split_silhouette_thresh"] = None  # isolate the region pass
+        cfg["hdbscan_merge_thresh"] = 0.0
+
+        calls = []
+        orig = cc.split_region_impure_clusters
+
+        def spy(*a, **kw):
+            calls.append(1)
+            return orig(*a, **kw)
+
+        monkeypatch.setattr(cc, "split_region_impure_clusters", spy)
+
+        class _FakeClf:
+            condensed_tree_ = None
+
+        out = cc.refine_clusters_iterative(
+            feats_sc, embedding, labels, _FakeClf(), cfg,
+            region_per_bin=region_per_bin)
+        assert len(calls) >= 1
+        new_ids_in_c0 = set(int(x) for x in out[labels == 0] if x >= 0)
+        assert len(new_ids_in_c0) >= 2
+
+    def test_split_order_is_silhouette_then_region_then_merge(self, monkeypatch):
+        """Order-of-operations check: with BOTH silhouette and region split
+        active, split_impure_clusters must be called before
+        split_region_impure_clusters, which must be called before
+        merge_similar_clusters, each iteration."""
+        feats_sc, embedding, labels, region_per_bin, cfg = _make_region_split_fixture(seed=23)
+        cfg = dict(cfg)
+        cfg["recluster_max_iterations"] = 1
+        cfg["hdbscan_split_silhouette_thresh"] = 0.9  # deliberately permissive -> real candidates
+        cfg["hdbscan_merge_thresh"] = 0.0
+
+        order = []
+        orig_sil = cc.split_impure_clusters
+        orig_reg = cc.split_region_impure_clusters
+        orig_merge = cc.merge_similar_clusters
+
+        def spy_sil(*a, **kw):
+            order.append("silhouette")
+            return orig_sil(*a, **kw)
+
+        def spy_reg(*a, **kw):
+            order.append("region")
+            return orig_reg(*a, **kw)
+
+        def spy_merge(*a, **kw):
+            order.append("merge")
+            return orig_merge(*a, **kw)
+
+        monkeypatch.setattr(cc, "split_impure_clusters", spy_sil)
+        monkeypatch.setattr(cc, "split_region_impure_clusters", spy_reg)
+        monkeypatch.setattr(cc, "merge_similar_clusters", spy_merge)
+
+        class _FakeClf:
+            condensed_tree_ = None
+
+        cc.refine_clusters_iterative(
+            feats_sc, embedding, labels, _FakeClf(), cfg,
+            region_per_bin=region_per_bin)
+        assert order == ["silhouette", "region", "merge"]

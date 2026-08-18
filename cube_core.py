@@ -17,7 +17,7 @@ Handles:
 """
 
 #   stdlib
-import gc, json, os, pickle, re, shutil, time, traceback, warnings
+import gc, json, math, os, pickle, re, shutil, time, traceback, warnings
 from datetime import datetime
 from itertools import combinations
 from pathlib import Path
@@ -2836,19 +2836,163 @@ def split_impure_clusters(feats_sc: np.ndarray, embedding: np.ndarray,
         log_fn=log_fn, candidate_detail_fn=_detail_fn)
 
 
+def _normalized_region_entropy(region_vals: list) -> "tuple[float, dict]":
+    """
+    Normalized Shannon entropy (0 = single region, 1 = maximally mixed
+    across however many DISTINCT regions are present in region_vals) of a
+    cluster's region-label distribution -- Region_Aware_Refinement_
+    Implementation_Plan.md Design decision 2. region_vals is a list of
+    region names for one cluster's bins with a non-None current_region
+    (None-region bins are excluded upstream, before this function sees
+    them -- "no region determined" is not itself an impurity signal).
+
+    Returns (entropy_norm, counts) where counts is {region_name: n_bins},
+    so the caller can also apply the minority-fraction floor without a
+    second pass over region_vals.
+
+    Edge case (single category): normalized entropy is defined as EXACTLY
+    0.0, not computed via a would-be log(1)-denominator division (which is
+    0/0, not merely large) -- handled as an explicit early return, never a
+    NaN silently threshold-compared as False.
+    """
+    counts: dict = {}
+    for v in region_vals:
+        counts[v] = counts.get(v, 0) + 1
+    k = len(counts)
+    if k <= 1:
+        return 0.0, counts
+    n = len(region_vals)
+    probs = [c / n for c in counts.values()]
+    raw = -sum(p * math.log(p) for p in probs if p > 0)
+    return raw / math.log(k), counts
+
+
+def split_region_impure_clusters(feats_sc: np.ndarray, embedding: np.ndarray,
+                                  labels: np.ndarray,
+                                  region_per_bin: "list | None",
+                                  cfg: dict, log_fn=None) -> np.ndarray:
+    """
+    Region-aware sibling of split_impure_clusters() (Region_Aware_
+    Refinement_Implementation_Plan.md, v1, opt-in). Locally re-clusters any
+    cluster whose bins are spatially impure with respect to traced arena
+    regions -- normalized Shannon entropy of the cluster's current_region
+    distribution >= hdbscan_region_split_impurity_thresh (default 0.5) AND
+    every non-dominant region represents >= hdbscan_region_split_min_minority_frac
+    (default 0.15) of the cluster's (region-labelled) bins, so a cluster is
+    never split over noise-level (e.g. 1%) region contamination.
+
+    Region data NEVER enters the UMAP/HDBSCAN feature space itself -- it
+    only selects WHICH clusters attempt a local re-embedding; the shared
+    _local_recluster_and_assign() helper still re-runs run_umap/run_hdbscan
+    purely on feats_sc (kinematic features), exactly as split_impure_clusters()
+    does, and the split is still only accepted when HDBSCAN/DBCV find a
+    real, stable multi-cluster local result.
+
+    Hard no-op (returns `labels` unchanged) when: hdbscan_region_split_enabled
+    is False, region_per_bin is None, "current_region" is not present in
+    hdbscan_region_split_signal (v1 only implements this one signal -- see
+    the plan's Design decision 2 for the documented-but-not-built extension
+    point for continuous signals), or no cluster clears both gates.
+    """
+    labels = np.asarray(labels).copy()
+    if not bool(cfg.get("hdbscan_region_split_enabled", False)):
+        return labels
+    if region_per_bin is None:
+        return labels
+    signal = cfg.get("hdbscan_region_split_signal", ["current_region"]) or []
+    if "current_region" not in signal:
+        return labels
+    if len(region_per_bin) != labels.shape[0]:
+        return labels   # misaligned array -- caller's responsibility; refuse rather than guess
+
+    impurity_thresh   = float(cfg.get("hdbscan_region_split_impurity_thresh", 0.5))
+    min_minority_frac = float(cfg.get("hdbscan_region_split_min_minority_frac", 0.15))
+    region_arr = np.asarray(region_per_bin, dtype=object)
+
+    entropies: dict = {}   # cid -> (entropy_norm, counts)
+    for cid in sorted(int(c) for c in set(labels) if c >= 0):
+        idx = np.flatnonzero(labels == cid)
+        region_vals = [v for v in region_arr[idx] if v is not None]
+        if len(region_vals) < 2:
+            continue   # too few region-labelled bins to judge impurity
+        entropy_norm, counts = _normalized_region_entropy(region_vals)
+        if entropy_norm < impurity_thresh:
+            continue
+        n_labelled = len(region_vals)
+        dominant = max(counts, key=counts.get)
+        minority_ok = all(c / n_labelled >= min_minority_frac
+                           for name, c in counts.items() if name != dominant)
+        if not minority_ok:
+            continue
+        entropies[cid] = entropy_norm
+
+    if not entropies:
+        return labels
+
+    # ── Bound worst-case (most-impure-first) candidate count, mirroring
+    # split_impure_clusters()'s own hdbscan_split_max_candidates pattern. ──
+    _max_candidates = int(cfg.get("hdbscan_region_split_max_candidates", 10) or 10)
+    candidates = sorted(entropies, key=lambda c: entropies[c], reverse=True)
+    if len(candidates) > _max_candidates:
+        candidates = candidates[:_max_candidates]
+
+    _base_nn  = int(cfg.get("umap_n_neighbors", 15) or 15)
+    _max_sub  = int(cfg.get("hdbscan_region_split_max_subclusters", 3))
+    _split_n_steps = int(cfg.get("hdbscan_split_sweep_n_steps", 12) or 12)
+
+    def _local_cfg_fn(cid):
+        idx_size = int(np.count_nonzero(labels == cid))
+        local_cfg = dict(cfg)
+        local_cfg["umap_n_neighbors"] = max(5, min(_base_nn, idx_size // 3))
+        # Same rationale as split_impure_clusters()'s local_cfg_fn: the
+        # whole-session preferred range/fine_bias are wrong for locally
+        # re-clustering one cluster's own points -- cap to a handful of
+        # region-implied sub-behaviours, don't fragment.
+        local_cfg["preferred_clusters_lo"] = 2
+        local_cfg["preferred_clusters_hi"] = _max_sub
+        local_cfg["hdbscan_fine_bias"]     = 0.0
+        local_cfg["hdbscan_leaf_bonus"]    = 0.0
+        local_cfg["hdbscan_method"]        = "eom"
+        local_cfg["hdbscan_sweep_n_steps"] = _split_n_steps
+        local_cfg["hdbscan_sweep_n_jobs"]  = 1
+        return local_cfg
+
+    def _detail_fn(cid):
+        return f" (region entropy {entropies[cid]:.3f} >= {impurity_thresh})"
+
+    return _local_recluster_and_assign(
+        feats_sc, embedding, labels, candidates, _local_cfg_fn, cfg,
+        log_fn=log_fn, candidate_detail_fn=_detail_fn)
+
+
 def refine_clusters_iterative(feats_sc: np.ndarray, embedding: np.ndarray,
                                labels: np.ndarray, clf, cfg: dict,
-                               log_fn=None) -> np.ndarray:
+                               log_fn=None,
+                               region_per_bin: "list | None" = None) -> np.ndarray:
     """
     Iterative split -> merge refinement loop (issue 4, bidirectional):
     split_impure_clusters then merge_similar_clusters, repeated up to
     cfg['recluster_max_iterations'] times, stopping early once an iteration
     makes no changes.
 
+    region_per_bin (Region_Aware_Refinement_Implementation_Plan.md, v1,
+    opt-in via hdbscan_region_split_enabled): optional global per-bin
+    "current_region" array (same length/indexing as feats_sc/embedding/
+    labels, from compute_bin_region_labels() -- see
+    BSoidEngine.run()'s session_bin_ranges.json-building loop). When
+    provided AND hdbscan_region_split_enabled=True, split_region_impure_clusters()
+    runs as an ADDITIONAL split pass each iteration, after the existing
+    silhouette-based split and before merge: split(silhouette) ->
+    split(region) -> merge. None (default) is a true no-op for this pass --
+    byte-identical to pre-region-aware-refinement behavior.
+
     Hard no-op (returns `labels` unchanged, no logging) when
-    hdbscan_split_silhouette_thresh is falsy AND hdbscan_merge_thresh <= 0,
-    or recluster_max_iterations <= 0 -- matches the "off" DEFAULTS exactly,
-    same gate as before this was extracted into a shared helper.
+    hdbscan_split_silhouette_thresh is falsy AND hdbscan_merge_thresh <= 0
+    AND region-split is not active, or recluster_max_iterations <= 0 --
+    matches the "off" DEFAULTS exactly, same gate as before this was
+    extracted into a shared helper (now additionally considers region-split
+    activation so a user who disables the legacy split/merge pair but opts
+    into region-split alone still gets a refinement loop).
 
     Shared by BSoidEngine.run() (the primary partition, normally called with
     log_fn=self._log) and seed_sweep_stability() (per-seed, normally called
@@ -2860,7 +3004,9 @@ def refine_clusters_iterative(feats_sc: np.ndarray, embedding: np.ndarray,
     split_thresh = cfg.get("hdbscan_split_silhouette_thresh")
     merge_thresh = float(cfg.get("hdbscan_merge_thresh", 0.0) or 0.0)
     max_iter     = int(cfg.get("recluster_max_iterations", 2) or 0)
-    if not ((split_thresh or merge_thresh > 0) and max_iter > 0):
+    region_split_on = (bool(cfg.get("hdbscan_region_split_enabled", False))
+                        and region_per_bin is not None)
+    if not ((split_thresh or merge_thresh > 0 or region_split_on) and max_iter > 0):
         return labels
 
     if log_fn:
@@ -2870,6 +3016,9 @@ def refine_clusters_iterative(feats_sc: np.ndarray, embedding: np.ndarray,
         before = labels.copy()
         labels = split_impure_clusters(feats_sc, embedding, labels,
                                         split_thresh, cfg, log_fn=log_fn)
+        if region_split_on:
+            labels = split_region_impure_clusters(
+                feats_sc, embedding, labels, region_per_bin, cfg, log_fn=log_fn)
         labels = merge_similar_clusters(clf, labels, embedding,
                                          merge_thresh=merge_thresh, log_fn=log_fn)
         if np.array_equal(before, labels):
@@ -10847,7 +10996,7 @@ class BSoidEngine:
         else:
             hdb_labels = refine_clusters_iterative(
                 feats_sc, embedding, hdb_labels, hdb_clf, self._cfg,
-                log_fn=self._log)
+                log_fn=self._log, region_per_bin=region_per_bin)
         n_cl      = len(set(hdb_labels[hdb_labels >= 0]))
         noise     = (hdb_labels < 0).sum()
         noise_pct = 100 * noise / max(1, len(hdb_labels))
