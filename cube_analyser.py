@@ -114,6 +114,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.lines as mlines
 import matplotlib.colors as mcolors
 import matplotlib.patheffects as _pe
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -3644,9 +3645,76 @@ def _cluster_identity_color(cid: int) -> str:
     return mcolors.to_hex((r, g, b))
 
 
+def _region_color_map(region_names) -> dict:
+    """region name -> hex color for the dendrogram's region-composition
+    overlay -- same formula (PALETTE[i % len(PALETTE)] over sorted names)
+    as build_region_ethogram_figure()'s default region_color_map, and the
+    same formula cube_core.py's own _region_color_map() uses on an
+    identical PALETTE list, so a region renders in the same color
+    everywhere in the app that displays region membership."""
+    names_sorted = sorted(n for n in set(region_names) if n is not None)
+    return {rn: PALETTE[i % len(PALETTE)] for i, rn in enumerate(names_sorted)}
+
+
+def find_cluster_region_overlay(root: pathlib.Path):
+    """
+    Reads the SAME cluster_feature_centroids.npz find_cluster_centroids()
+    locates, for the optional region-aware-refinement dendrogram overlay
+    (Region_Aware_Refinement_Implementation_Plan.md Phase 7): region_names,
+    region_composition_frac, region_split_marked_ids. All three are absent
+    from any npz produced by a run with hdbscan_region_split_enabled=False
+    (including every run from before this feature existed) -- this then
+    returns (None, None), and callers render the plain dendrogram with no
+    overlay, exactly as they always have (mirrors find_cluster_centroids'
+    own graceful-fallback precedent for missing/old npz files).
+
+    Returns (region_composition: dict[int, dict[str, float]] | None,
+             region_split_marked_ids: set[int] | None).
+    """
+    def _search(directory: pathlib.Path):
+        candidates = sorted(directory.rglob("cluster_feature_centroids.npz"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+        return candidates[0] if candidates else None
+
+    hit = _search(root)
+    if not hit:
+        candidate = root.resolve()
+        for _ in range(4):
+            parent = candidate.parent
+            if parent == candidate:
+                break
+            candidate = parent
+            hit = _search(candidate)
+            if hit:
+                break
+    if not hit:
+        return None, None
+
+    try:
+        data = np.load(hit)
+        if "region_names" not in data or "region_composition_frac" not in data:
+            return None, None
+        region_names = [str(x) for x in data["region_names"]]
+        frac_matrix = data["region_composition_frac"]
+        cluster_ids = [int(c) for c in data["cluster_ids"]]
+        composition = {
+            cid: {rn: float(frac_matrix[i, j]) for j, rn in enumerate(region_names)
+                  if frac_matrix[i, j] > 0}
+            for i, cid in enumerate(cluster_ids)
+        }
+        marked_ids = (set(int(c) for c in data["region_split_marked_ids"])
+                     if "region_split_marked_ids" in data else set())
+        return composition, marked_ids
+    except Exception:
+        return None, None
+
+
 def build_cluster_hierarchy_figure(centroids, cluster_ids, t: dict = None,
                                     linkage_method: str = "ward",
-                                    approximate: bool = False) -> plt.Figure:
+                                    approximate: bool = False,
+                                    region_composition: "dict | None" = None,
+                                    region_split_marked_ids: "set | None" = None
+                                    ) -> plt.Figure:
     """
     On-the-fly re-render of the pose-hierarchy dendrogram from
     model/cluster_feature_centroids.npz (find_cluster_centroids), using this
@@ -3669,6 +3737,14 @@ def build_cluster_hierarchy_figure(centroids, cluster_ids, t: dict = None,
         backfill_cluster_centroids_from_umap (UMAP-embedding-based, not true
         feature space) — a caveat is shown in the title so it's never
         mistaken for a real Step 3-produced hierarchy.
+    region_composition, region_split_marked_ids : from
+        find_cluster_region_overlay() -- same optional dendrogram overlay
+        cube_core.plot_cluster_hierarchy() renders in the pipeline-exported
+        PNG (Region_Aware_Refinement_Implementation_Plan.md Phase 7). Both
+        None (the default, and the only possibility for any npz produced
+        before this feature existed or by a run with
+        hdbscan_region_split_enabled=False) renders the plain dendrogram
+        exactly as before this parameter existed.
     """
     if t is None:
         t = T()
@@ -3696,6 +3772,12 @@ def build_cluster_hierarchy_figure(centroids, cluster_ids, t: dict = None,
     Z = linkage(centroids, method=linkage_method)
     leaf_labels = [f"C{c}" for c in uniq]
 
+    _has_region_overlay = bool(region_composition)
+    _region_names_all = (sorted({rn for comp in region_composition.values() for rn in comp})
+                         if _has_region_overlay else [])
+    _region_cmap = _region_color_map(_region_names_all) if _has_region_overlay else {}
+    _text_y_frac = 0.20 if _has_region_overlay else 0.09
+
     with plt.style.context(t["mpl_style"]):
         fig_w = max(8.0, 0.55 * len(uniq) + 2.0)
         fig, ax = plt.subplots(figsize=(fig_w, 6.5), facecolor=t["fig_bg"])
@@ -3716,10 +3798,39 @@ def build_cluster_hierarchy_figure(centroids, cluster_ids, t: dict = None,
             col = _cluster_identity_color(c)
             ax.scatter([x], [y0 - 0.045 * yr], s=100, color=col,
                        edgecolor=t["fig_bg"], linewidth=1.0, zorder=6, clip_on=False)
-            ax.text(x, y0 - 0.09 * yr, f"C{c}", color=col,
+            if region_split_marked_ids and c in region_split_marked_ids:
+                ax.scatter([x], [y0 + 0.02 * yr], s=140, marker="*",
+                           color=col, edgecolor=t["tick"], linewidth=0.6,
+                           zorder=7, clip_on=False)
+            if _has_region_overlay:
+                comp = region_composition.get(c) or {}
+                _bar_w, _bar_h = 8.0, 0.05 * yr
+                _bar_y = y0 - 0.11 * yr
+                left, cursor = x - _bar_w / 2, 0.0
+                for rn in _region_names_all:
+                    frac = comp.get(rn, 0.0)
+                    if frac <= 0:
+                        continue
+                    ax.add_patch(mpatches.Rectangle(
+                        (left + cursor * _bar_w, _bar_y), frac * _bar_w, _bar_h,
+                        facecolor=_region_cmap[rn], edgecolor=t["fig_bg"], linewidth=0.3,
+                        zorder=6, clip_on=False))
+                    cursor += frac
+            ax.text(x, y0 - _text_y_frac * yr, f"C{c}", color=col,
                     fontsize=8, fontweight="bold", ha="center", va="top",
                     linespacing=1.3, clip_on=False)
-        ax.set_ylim(y0 - 0.24 * yr, y1)
+        ax.set_ylim(y0 - (0.36 if _has_region_overlay else 0.24) * yr, y1)
+
+        if _has_region_overlay:
+            _legend_handles = [mpatches.Patch(color=_region_cmap[rn], label=rn)
+                               for rn in _region_names_all]
+            if region_split_marked_ids:
+                _legend_handles.append(mlines.Line2D(
+                    [], [], marker="*", linestyle="none", color=t["tick"],
+                    markersize=9, label="created by region-aware split"))
+            ax.legend(handles=_legend_handles, loc="upper right", fontsize=7,
+                      facecolor=t["card"], edgecolor="none", labelcolor=t["tick"],
+                      title="Region composition", title_fontsize=7)
 
         ax.set_ylabel(f"{linkage_method.title()} linkage distance (feature space)",
                       color=t["tick"])
@@ -8618,8 +8729,11 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                     _root = self._get_root_dir()
                     _centroids, _hier_cids, _approx, _link_m = (find_cluster_centroids(_root)
                                                        if _root is not None else (None, None, False, "ward"))
+                    _region_comp, _region_marked = (find_cluster_region_overlay(_root)
+                                                    if _root is not None else (None, None))
                     figs_to_save = [build_cluster_hierarchy_figure(
-                        _centroids, _hier_cids, linkage_method=_link_m, approximate=_approx)]
+                        _centroids, _hier_cids, linkage_method=_link_m, approximate=_approx,
+                        region_composition=_region_comp, region_split_marked_ids=_region_marked)]
                 elif mode == "Elbow/Silhouette":
                     figs_to_save = [build_reclustering_figure(self._recluster)]
                 elif mode == "Guided Merge":
@@ -9158,8 +9272,11 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                 root = self._get_root_dir()
                 centroids, hier_cids, hier_approx, hier_link_m = (find_cluster_centroids(root)
                                                      if root is not None else (None, None, False, "ward"))
+                region_comp, region_marked = (find_cluster_region_overlay(root)
+                                              if root is not None else (None, None))
                 self._show_figure(build_cluster_hierarchy_figure(
-                    centroids, hier_cids, linkage_method=hier_link_m, approximate=hier_approx))
+                    centroids, hier_cids, linkage_method=hier_link_m, approximate=hier_approx,
+                    region_composition=region_comp, region_split_marked_ids=region_marked))
             elif mode == "Elbow/Silhouette":
                 self._save_source_var.set("Manual (k-sweep)")
                 self._show_figure(build_reclustering_figure(self._recluster))

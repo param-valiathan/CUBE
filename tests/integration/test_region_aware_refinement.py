@@ -29,6 +29,19 @@ import pytest
 
 import cube_core as cc
 
+# cube_analyser.py sets matplotlib.use("TkAgg") at import time (needed for
+# its live tkinter GUI embedding); cube_core.py sets "Agg". Importing
+# cube_analyser here, once, then forcing Agg back immediately keeps every
+# figure-drawing call in this test module (both cube_core's and
+# cube_analyser's) on the headless-safe backend regardless of import order
+# elsewhere in the pytest session -- this environment's Tcl/Tk install is
+# broken (missing init.tcl), so any real TkAgg figure creation intermittently
+# raises TclError. Not a cube_analyser bug -- just not testable under TkAgg
+# here.
+import cube_analyser as _ca_backend_fix  # noqa: F401
+import matplotlib as _mpl_backend_fix
+_mpl_backend_fix.use("Agg", force=True)
+
 REPO_ROOT = cc.__file__.rsplit("cube_core.py", 1)[0]
 PRE_REFACTOR_TAG = "pre-region-aware-refinement"
 
@@ -1121,3 +1134,173 @@ class TestMinClusterFreqPruningAndAuditTrail:
         import json as _json
         report = _json.loads((out_dir / "validation_report.json").read_text())
         assert "region_split" not in report
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Phase 7 — dendrogram region-composition overlay
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestComputeClusterRegionComposition:
+    def test_none_region_per_bin_returns_none(self):
+        labels = np.array([0, 0, 1, 1])
+        assert cc.compute_cluster_region_composition(labels, None) is None
+
+    def test_misaligned_length_returns_none(self):
+        labels = np.array([0, 0, 1, 1])
+        assert cc.compute_cluster_region_composition(labels, ["A", "B"]) is None
+
+    def test_fractions_sum_to_one_per_cluster(self):
+        labels = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+        region_per_bin = ["A", "A", "B", "B", "A", "A", "A", None]
+        comp = cc.compute_cluster_region_composition(labels, region_per_bin)
+        assert comp[0] == {"A": 0.5, "B": 0.5}
+        # cluster 1: 3 labelled bins (1 None excluded) -> all "A" -> {"A": 1.0}
+        assert comp[1] == {"A": 1.0}
+
+    def test_cluster_with_no_labelled_bins_omitted(self):
+        labels = np.array([0, 0, 1, 1])
+        region_per_bin = [None, None, "A", "A"]
+        comp = cc.compute_cluster_region_composition(labels, region_per_bin)
+        assert 0 not in comp
+        assert comp[1] == {"A": 1.0}
+
+    def test_all_none_returns_none(self):
+        labels = np.array([0, 0])
+        assert cc.compute_cluster_region_composition(labels, [None, None]) is None
+
+
+class TestPlotClusterHierarchyRegionOverlay:
+    def _fixture(self, seed=50, n_clusters=4, n_per=15, n_feat=8):
+        rng = np.random.default_rng(seed)
+        centers = rng.uniform(-10, 10, size=(n_clusters, n_feat))
+        parts = [centers[i] + rng.normal(0, 0.5, size=(n_per, n_feat))
+                 for i in range(n_clusters)]
+        feats_sc = np.vstack(parts).T  # (n_feat, n_bins)
+        labels = np.concatenate([[i] * n_per for i in range(n_clusters)])
+        return feats_sc, labels
+
+    def test_region_composition_none_does_not_crash(self, tmp_path):
+        feats_sc, labels = self._fixture()
+        out_path = tmp_path / "hierarchy.png"
+        centroid_path = tmp_path / "centroids.npz"
+        cc.plot_cluster_hierarchy(feats_sc, labels, out_path,
+                                  centroid_out_path=centroid_path)
+        assert out_path.exists()
+        assert centroid_path.exists()
+        data = np.load(centroid_path)
+        assert "region_names" not in data
+        assert "region_composition_frac" not in data
+        assert "region_split_marked_ids" not in data
+
+    def test_region_composition_given_renders_and_persists(self, tmp_path):
+        feats_sc, labels = self._fixture()
+        region_per_bin = (["Center"] * 8 + ["Periphery"] * 7) * 4  # matches n_per=15 per cluster
+        comp = cc.compute_cluster_region_composition(labels, region_per_bin)
+        assert comp is not None
+
+        out_path = tmp_path / "hierarchy.png"
+        centroid_path = tmp_path / "centroids.npz"
+        cc.plot_cluster_hierarchy(feats_sc, labels, out_path,
+                                  centroid_out_path=centroid_path,
+                                  region_composition=comp,
+                                  region_split_marked_ids={0, 2})
+        assert out_path.exists()
+        data = np.load(centroid_path)
+        assert "region_names" in data
+        assert set(str(x) for x in data["region_names"]) == {"Center", "Periphery"}
+        assert data["region_composition_frac"].shape == (4, 2)  # 4 clusters x 2 regions
+        assert set(int(x) for x in data["region_split_marked_ids"]) == {0, 2}
+
+    def test_both_theme_passes_render_with_overlay(self, tmp_path):
+        feats_sc, labels = self._fixture(seed=51)
+        region_per_bin = (["A"] * 8 + ["B"] * 7) * 4
+        comp = cc.compute_cluster_region_composition(labels, region_per_bin)
+        for theme in ("dark", "light"):
+            cc._apply_plot_theme(theme)
+            out_path = tmp_path / f"hierarchy_{theme}.png"
+            cc.plot_cluster_hierarchy(feats_sc, labels, out_path,
+                                      region_composition=comp,
+                                      region_split_marked_ids={1})
+            assert out_path.exists()
+        cc._apply_plot_theme("dark")  # restore default for other tests in this process
+
+
+class TestRegionColorMapConsistency:
+    def test_cube_core_and_cube_analyser_produce_identical_colors(self):
+        import cube_analyser as ca
+        names = ["Zone A", "Zone B", "Zone C"]
+        core_map = cc._region_color_map(names)
+        analyser_map = ca._region_color_map(names)
+        assert core_map == analyser_map
+
+
+class TestFindClusterRegionOverlay:
+    def test_missing_npz_returns_none_none(self, tmp_path, monkeypatch):
+        import pathlib as _pathlib
+        import cube_analyser as ca
+        # find_cluster_region_overlay (mirroring find_cluster_centroids' own
+        # precedent) walks UP to 4 parent directories and rglobs down from
+        # each -- under pytest's shared tmp_path base, that walk can reach
+        # sibling test directories from elsewhere in the SAME session that
+        # legitimately contain a cluster_feature_centroids.npz, producing a
+        # false "found" here. Force the search to see an empty filesystem
+        # instead of relying on tmp_path's real ancestry being npz-free.
+        monkeypatch.setattr(_pathlib.Path, "rglob", lambda self, pattern: iter([]))
+        comp, marked = ca.find_cluster_region_overlay(tmp_path)
+        assert comp is None and marked is None
+
+    def test_npz_without_region_keys_returns_none_none(self, tmp_path):
+        import cube_analyser as ca
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        np.savez(model_dir / "cluster_feature_centroids.npz",
+                 centroids=np.random.rand(3, 4), cluster_ids=np.array([0, 1, 2]),
+                 linkage_method=np.array("ward"))
+        comp, marked = ca.find_cluster_region_overlay(tmp_path)
+        assert comp is None and marked is None
+
+    def test_npz_with_region_keys_round_trips(self, tmp_path):
+        import cube_analyser as ca
+        feats_sc, labels = TestPlotClusterHierarchyRegionOverlay()._fixture(seed=52)
+        region_per_bin = (["A"] * 8 + ["B"] * 7) * 4
+        comp = cc.compute_cluster_region_composition(labels, region_per_bin)
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        cc.plot_cluster_hierarchy(
+            feats_sc, labels, tmp_path / "unused.png",
+            centroid_out_path=model_dir / "cluster_feature_centroids.npz",
+            region_composition=comp, region_split_marked_ids={0})
+
+        loaded_comp, loaded_marked = ca.find_cluster_region_overlay(tmp_path)
+        assert loaded_comp is not None
+        assert loaded_marked == {0}
+        for cid, frac_dict in comp.items():
+            assert loaded_comp[cid] == pytest.approx(frac_dict)
+
+
+class TestBuildClusterHierarchyFigureRegionOverlay:
+    def test_none_overlay_does_not_crash(self):
+        import cube_analyser as ca
+        centroids = np.random.default_rng(0).normal(size=(4, 6))
+        cluster_ids = np.array([0, 1, 2, 3])
+        fig = ca.build_cluster_hierarchy_figure(centroids, cluster_ids)
+        assert fig is not None
+
+    def test_overlay_given_renders_without_crash(self):
+        import cube_analyser as ca
+        centroids = np.random.default_rng(0).normal(size=(4, 6))
+        cluster_ids = np.array([0, 1, 2, 3])
+        comp = {0: {"A": 0.5, "B": 0.5}, 1: {"A": 1.0},
+               2: {"B": 1.0}, 3: {"A": 0.3, "B": 0.7}}
+        fig = ca.build_cluster_hierarchy_figure(
+            centroids, cluster_ids, region_composition=comp,
+            region_split_marked_ids={0, 3})
+        assert fig is not None
+
+    def test_missing_centroids_placeholder_unaffected_by_overlay_params(self):
+        import cube_analyser as ca
+        fig = ca.build_cluster_hierarchy_figure(
+            None, None, region_composition={0: {"A": 1.0}},
+            region_split_marked_ids={0})
+        assert fig is not None  # placeholder path, must not raise

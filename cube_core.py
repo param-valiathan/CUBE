@@ -50,6 +50,7 @@ import matplotlib
 matplotlib.use("Agg")          # never open a display window
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.lines as mlines
 import matplotlib.ticker
 
 warnings.filterwarnings("ignore")
@@ -167,6 +168,55 @@ def _cmap(i: int) -> str:
     _frac = ((i - len(PALETTE)) * 0.61803398875) % 1.0   # golden-ratio spacing
     r, g, b, _a = _extra(_frac)
     return "#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255))
+
+def _region_color_map(region_names) -> dict:
+    """
+    region name -> hex color, for the dendrogram's region-composition
+    overlay (Region_Aware_Refinement_Implementation_Plan.md Phase 7).
+    Deliberately the SAME formula (and the same PALETTE values) as
+    cube_analyser.py's build_region_ethogram_figure() uses for its own
+    default region_color_map (PALETTE[i % len(PALETTE)] over sorted names)
+    -- confirmed byte-identical PALETTE lists in both files -- so a given
+    region renders in the same color here as on the region ethogram plot,
+    without cube_core.py importing cube_analyser.py (this file has no
+    GUI/analyser-module dependencies; see the module docstring).
+    """
+    names_sorted = sorted(n for n in set(region_names) if n is not None)
+    return {rn: PALETTE[i % len(PALETTE)] for i, rn in enumerate(names_sorted)}
+
+
+def compute_cluster_region_composition(labels: np.ndarray,
+                                        region_per_bin: "list | None") -> "dict | None":
+    """
+    Per-cluster region-composition fractions for the dendrogram overlay:
+    {cluster_id: {region_name: frac_of_that_cluster's_region-labelled_bins}}.
+    None-region bins are excluded from each cluster's own denominator
+    (mirrors split_region_impure_clusters()'s treatment of None as "no
+    region determined", not itself a category).
+
+    Returns None when region_per_bin is None, misaligned with labels (same
+    refuse-rather-than-guess convention as split_region_impure_clusters()),
+    or no cluster has any region-labelled bin at all.
+    """
+    if region_per_bin is None:
+        return None
+    labels = np.asarray(labels)
+    if len(region_per_bin) != labels.shape[0]:
+        return None
+    region_arr = np.asarray(region_per_bin, dtype=object)
+    composition: dict = {}
+    for cid in sorted(int(c) for c in set(labels) if c >= 0):
+        idx = np.flatnonzero(labels == cid)
+        region_vals = [v for v in region_arr[idx] if v is not None]
+        if not region_vals:
+            continue
+        n = len(region_vals)
+        counts: dict = {}
+        for v in region_vals:
+            counts[v] = counts.get(v, 0) + 1
+        composition[cid] = {rn: c / n for rn, c in counts.items()}
+    return composition if composition else None
+
 
 def _hex_to_bgr(h: str) -> tuple:
     h = h.lstrip("#")
@@ -2594,7 +2644,8 @@ def _mean_silhouette_per_cluster(X: np.ndarray, labels: np.ndarray,
 def _local_recluster_and_assign(feats_sc: np.ndarray, embedding: np.ndarray,
                                  labels: np.ndarray, candidate_ids: list,
                                  local_cfg_fn, cfg: dict, log_fn=None,
-                                 candidate_detail_fn=None) -> np.ndarray:
+                                 candidate_detail_fn=None,
+                                 touched_bin_idx: "list | None" = None) -> np.ndarray:
     """
     Shared mechanics behind every "locally re-cluster a subset of impure
     clusters and splice the result back into the global labels" pass
@@ -2618,6 +2669,12 @@ def _local_recluster_and_assign(feats_sc: np.ndarray, embedding: np.ndarray,
                            appended to this candidate's log line (e.g. the
                            silhouette-vs-threshold text split_impure_clusters
                            logs). Omit for a plain log line.
+    touched_bin_idx      : optional list, appended in place with the global
+                           bin index of every row belonging to a candidate
+                           whose local split actually SUCCEEDED (used by
+                           split_region_impure_clusters() to mark which
+                           final clusters trace back to a region-aware
+                           split, for the dendrogram overlay's leaf marker).
 
     Returns labels unchanged if candidate_ids is empty.
     """
@@ -2729,6 +2786,9 @@ def _local_recluster_and_assign(feats_sc: np.ndarray, embedding: np.ndarray,
                 next_id += 1
         noise_m = sub_labels < 0                  # local noise stays noise — never forced
         new_labels[idx[noise_m]] = -1
+
+        if touched_bin_idx is not None:
+            touched_bin_idx.extend(int(i) for i in idx)
 
         if log_fn:
             detail = candidate_detail_fn(cid) if candidate_detail_fn else ""
@@ -2962,13 +3022,16 @@ def split_region_impure_clusters(feats_sc: np.ndarray, embedding: np.ndarray,
         return f" (region entropy {entropies[cid]:.3f} >= {impurity_thresh})"
 
     _ids_before = set(int(c) for c in set(labels) if c >= 0)
+    _touched_bin_idx = [] if region_split_stats is not None else None
     result = _local_recluster_and_assign(
         feats_sc, embedding, labels, candidates, _local_cfg_fn, cfg,
-        log_fn=log_fn, candidate_detail_fn=_detail_fn)
+        log_fn=log_fn, candidate_detail_fn=_detail_fn,
+        touched_bin_idx=_touched_bin_idx)
     if region_split_stats is not None:
         _new_ids = set(int(c) for c in set(result) if c >= 0) - _ids_before
         region_split_stats["clusters_created"] = (
             region_split_stats.get("clusters_created", 0) + len(_new_ids))
+        region_split_stats.setdefault("touched_bin_idx", []).extend(_touched_bin_idx)
     return result
 
 
@@ -6676,7 +6739,9 @@ def plot_cluster_volatility(sweep: dict, out_path: Path):
 
 def plot_cluster_hierarchy(feats_sc, labels, out_path,
                             bodypart_names=None, linkage_method="ward",
-                            centroid_out_path=None):
+                            centroid_out_path=None,
+                            region_composition: "dict | None" = None,
+                            region_split_marked_ids: "set | None" = None):
     """
     Dendrogram of the production clustering result's cluster centroids in
     standardized feature space.  Deliberately uses feature-space distance
@@ -6694,6 +6759,23 @@ def plot_cluster_hierarchy(feats_sc, labels, out_path,
     this module uses), so a specific cluster can be spotted here and then
     cross-referenced against an ethogram/UMAP/etc. at a glance -- that is
     the only thing color is meant to encode on this plot.
+
+    region_composition (Region_Aware_Refinement_Implementation_Plan.md
+    Phase 7, Design decision 6): optional {cluster_id: {region_name: frac}}
+    from compute_cluster_region_composition(). When given, each leaf's
+    existing colored identity dot gains a small stacked-bar glyph directly
+    below it, showing that cluster's bin-time split across traced arena
+    regions (region->color via _region_color_map(), same PALETTE/formula
+    cube_analyser.py's region ethogram plot uses). None (default) is a
+    true no-op -- this plot renders exactly as it did before this
+    parameter existed (same leaf spacing, same margins).
+
+    region_split_marked_ids: optional set of cluster ids to mark with a
+    small star above their identity dot -- clusters whose bins trace back
+    to a split that region-aware splitting actually performed this run
+    (as opposed to merely being spatially impure enough to LOOK
+    region-split in the composition glyph above). None (default): no
+    markers, no behavior change.
     """
     if feats_sc is None or labels is None:
         return
@@ -6718,9 +6800,21 @@ def plot_cluster_hierarchy(feats_sc, labels, out_path,
 
     if centroid_out_path is not None:
         try:
-            np.savez(centroid_out_path, centroids=centroids,
-                     cluster_ids=np.array(uniq),
-                     linkage_method=np.array(linkage_method))
+            _npz_kwargs = dict(centroids=centroids,
+                               cluster_ids=np.array(uniq),
+                               linkage_method=np.array(linkage_method))
+            if region_composition:
+                _region_names_all = sorted({rn for comp in region_composition.values()
+                                            for rn in comp})
+                _frac_matrix = np.array(
+                    [[region_composition.get(c, {}).get(rn, 0.0) for rn in _region_names_all]
+                     for c in uniq])
+                _npz_kwargs["region_names"] = np.array(_region_names_all)
+                _npz_kwargs["region_composition_frac"] = _frac_matrix
+            if region_split_marked_ids:
+                _npz_kwargs["region_split_marked_ids"] = np.array(
+                    sorted(int(c) for c in region_split_marked_ids))
+            np.savez(centroid_out_path, **_npz_kwargs)
         except Exception:
             pass
 
@@ -6747,15 +6841,49 @@ def plot_cluster_hierarchy(feats_sc, labels, out_path,
     yr = y1 - y0
     n_leaves = len(dn["leaves"])
     leaf_x = 5.0 + 10.0 * np.arange(n_leaves)
+    _has_region_overlay = bool(region_composition)
+    _region_names_all = (sorted({rn for comp in region_composition.values() for rn in comp})
+                         if _has_region_overlay else [])
+    _region_cmap = _region_color_map(_region_names_all) if _has_region_overlay else {}
+    _text_y_frac = 0.20 if _has_region_overlay else 0.09
     for x, leaf_idx in zip(leaf_x, dn["leaves"]):
         c = uniq[leaf_idx]
         col = _cmap(c)
         ax.scatter([x], [y0 - 0.045 * yr], s=100, color=col,
                    edgecolor=_BG, linewidth=1.0, zorder=6, clip_on=False)
-        ax.text(x, y0 - 0.09 * yr, f"C{c}\n(n={sizes[c]})", color=col,
+        if region_split_marked_ids and c in region_split_marked_ids:
+            ax.scatter([x], [y0 + 0.02 * yr], s=140, marker="*",
+                       color=col, edgecolor=_TEXT_COL, linewidth=0.6,
+                       zorder=7, clip_on=False)
+        if _has_region_overlay:
+            comp = region_composition.get(c) or {}
+            _bar_w, _bar_h = 8.0, 0.05 * yr
+            _bar_y = y0 - 0.11 * yr
+            left, cursor = x - _bar_w / 2, 0.0
+            for rn in _region_names_all:
+                frac = comp.get(rn, 0.0)
+                if frac <= 0:
+                    continue
+                ax.add_patch(mpatches.Rectangle(
+                    (left + cursor * _bar_w, _bar_y), frac * _bar_w, _bar_h,
+                    facecolor=_region_cmap[rn], edgecolor=_BG, linewidth=0.3,
+                    zorder=6, clip_on=False))
+                cursor += frac
+        ax.text(x, y0 - _text_y_frac * yr, f"C{c}\n(n={sizes[c]})", color=col,
                 fontsize=8, fontweight="bold", ha="center", va="top",
                 linespacing=1.3, clip_on=False)
-    ax.set_ylim(y0 - 0.24 * yr, y1)
+    ax.set_ylim(y0 - (0.36 if _has_region_overlay else 0.24) * yr, y1)
+
+    if _has_region_overlay:
+        _legend_handles = [mpatches.Patch(color=_region_cmap[rn], label=rn)
+                           for rn in _region_names_all]
+        if region_split_marked_ids:
+            _legend_handles.append(mlines.Line2D(
+                [], [], marker="*", linestyle="none", color=_TEXT_COL,
+                markersize=9, label="created by region-aware split"))
+        ax.legend(handles=_legend_handles, loc="upper right", fontsize=7,
+                  facecolor=_PANEL, edgecolor="none", labelcolor=_TEXT_COL,
+                  title="Region composition", title_fontsize=7)
 
     ax.set_ylabel(f"{linkage_method.title()} linkage distance (feature space)",
                   color=_TEXT_COL)
@@ -11307,6 +11435,28 @@ class BSoidEngine:
                 # whichever theme fits the destination, so it saves both up
                 # front rather than requiring a full re-run to get the other.
                 _hierarchy_theme_before = str(self._cfg.get("plot_theme", "dark"))
+                # region_composition (Phase 7): None whenever region_per_bin
+                # was never computed (hdbscan_region_split_enabled=False,
+                # the default) -- a true no-op, byte-identical dendrogram to
+                # pre-Phase-7 output in that case.
+                _region_composition = compute_cluster_region_composition(
+                    hdb_labels, region_per_bin)
+                # Which FINAL cluster ids trace back to a successful region-
+                # aware split this run (any of their bins came from a
+                # candidate cluster split() actually accepted) -- computed
+                # at the bin level via region_split_stats["touched_bin_idx"]
+                # (populated inside split_region_impure_clusters(), see its
+                # call to _local_recluster_and_assign) so it stays correct
+                # regardless of subsequent merges/renumbering, which only
+                # ever move bins between id VALUES, never between rows.
+                # None whenever region-aware splitting never ran.
+                _region_split_marked_ids = None
+                if _region_split_stats.get("touched_bin_idx"):
+                    _touched_mask = np.zeros(hdb_labels.shape[0], dtype=bool)
+                    _touched_mask[np.array(_region_split_stats["touched_bin_idx"], dtype=int)] = True
+                    _region_split_marked_ids = set(
+                        int(c) for c in sorted(set(hdb_labels[hdb_labels >= 0]))
+                        if _touched_mask[hdb_labels == c].any())
                 try:
                     for _theme_name in ("dark", "light"):
                         _apply_plot_theme(_theme_name)
@@ -11316,7 +11466,9 @@ class BSoidEngine:
                             linkage_method=str(self._cfg.get("cluster_hierarchy_linkage", "ward")),
                             centroid_out_path=(
                                 self._out_model / "cluster_feature_centroids.npz"
-                                if _theme_name == "dark" else None))
+                                if _theme_name == "dark" else None),
+                            region_composition=_region_composition,
+                            region_split_marked_ids=_region_split_marked_ids)
                     self._log("  [PLOT] cluster_hierarchy_dark.png + "
                               "cluster_hierarchy_light.png saved")
                     self._log("  [PLOT] cluster_feature_centroids.npz saved")
