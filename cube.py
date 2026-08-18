@@ -420,7 +420,7 @@ class SessionState:
         dlc_delete_orig = False,
         dlc_cooldown    = "15 s",
         dlc_run_prep    = True,
-        dlc_smart_adapt = False,
+        dlc_smart_adapt = True,
         # BSOID prep
         bsoid_min_conf  = 0.30,
         bsoid_conf_metric    = "median",
