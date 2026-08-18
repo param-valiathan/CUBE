@@ -10767,9 +10767,7 @@ class BSoidEngine:
                         _labels_k = list(_labels_k)[:_nb_k]
                     _region_chunks.append(_labels_k)
                 _region_per_bin_flat = [v for chunk in _region_chunks for v in chunk]
-                if len(_region_per_bin_flat) == n_bins:
-                    region_per_bin = _region_per_bin_flat
-                else:
+                if len(_region_per_bin_flat) != n_bins:
                     # Defensive: length mismatch against the global feature
                     # matrix -- disable rather than risk misaligned indexing
                     # downstream (mirrors the turned_away_bin_mask re-align
@@ -10778,6 +10776,15 @@ class BSoidEngine:
                     self._log("  [WARN] region_per_bin length mismatch "
                                f"({len(_region_per_bin_flat)} vs {n_bins} bins) "
                                "-- disabling region-aware splitting for this run.")
+                elif any(v is not None for v in _region_per_bin_flat):
+                    region_per_bin = _region_per_bin_flat
+                # else: every bin is None (no arena traced / no session had
+                # traced shapes) -- region_per_bin stays the None SENTINEL,
+                # not a same-length all-None list, so refine_clusters_iterative()'s
+                # "region_per_bin is not None" gate stays a true hard no-op
+                # (matching its documented contract) instead of running a
+                # full, silently-inert split/merge loop with log noise for a
+                # user who enabled the flag but hasn't traced anything yet.
             except Exception:
                 self._log(f"  [WARN] region_per_bin computation failed:\n"
                           f"  {traceback.format_exc()}")
@@ -11106,16 +11113,30 @@ class BSoidEngine:
                       f"consensus partition...")
             self._stage("5/7 — Consensus clustering",
                         f"{_cn_seeds} seeds — co-association + Ward linkage")
+            # Use a SEPARATE stats dict for this attempt, only merged into
+            # the shared _region_split_stats accumulator if consensus
+            # actually succeeds and is kept below. Otherwise a discarded
+            # attempt (exception anywhere in consensus_cluster(), including
+            # AFTER its own internal refine_consensus_clusters() already
+            # mutated stats) would leak touched-bin/cluster-count data from
+            # labels that were never used into the primary path's own
+            # audit trail / dendrogram star markers.
+            _consensus_region_split_stats: dict = {}
             try:
                 _cons = consensus_cluster(feats_sc.T, self._cfg, _cn_seeds,
                                           log_fn=self._log, embedding=embedding,
                                           region_per_bin=region_per_bin,
-                                          region_split_stats=_region_split_stats)
+                                          region_split_stats=_consensus_region_split_stats)
             except Exception:
                 _cons = None
                 self._log(f"  [WARN] consensus clustering failed: "
                           f"{traceback.format_exc()}")
             if _cons is not None:
+                _region_split_stats["clusters_created"] = (
+                    _region_split_stats.get("clusters_created", 0)
+                    + _consensus_region_split_stats.get("clusters_created", 0))
+                _region_split_stats.setdefault("touched_bin_idx", []).extend(
+                    _consensus_region_split_stats.get("touched_bin_idx", []))
                 hdb_labels, _cons_quality = _cons
                 _orig_hdb_labels = hdb_labels.copy()
                 hdb_score = _cons_quality["separation_ratio"]

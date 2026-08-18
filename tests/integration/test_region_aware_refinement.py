@@ -982,6 +982,86 @@ class TestRegionSplitPreReductionPct:
 
         assert not any("[region-split]" in m for m in logged)
 
+    def test_enabled_without_traced_arena_stays_a_true_refinement_noop(self, tmp_path):
+        """Regression test (code-review finding, post-Phase-8 fix):
+        hdbscan_region_split_enabled=True but no env_arena_cfg traced used
+        to leave region_per_bin as a same-length list of Nones (not the
+        None sentinel), which made refine_clusters_iterative()'s
+        region_split_on gate fire even with silhouette-split and merge
+        both off -- producing a spurious "[5b/7] Iterative split/merge
+        refinement" log line and wasted no-op iterations every run for a
+        user who enabled the flag but hasn't traced anything yet. Fixed by
+        only keeping region_per_bin as a real array when it contains at
+        least one non-None value; this locks that fix in."""
+        dlc_dir = tmp_path / "dlc"
+        dlc_dir.mkdir()
+        _p2_write_session_h5(dlc_dir / "session1_filtered.h5", n_frames=300, seed=9)
+        out_dir = tmp_path / "out"
+
+        cfg = dict(_P2_FAST_RUN_CFG)
+        cfg["hdbscan_region_split_enabled"] = True   # no env_arena_cfg set -> nothing traced
+        assert "env_arena_cfg" not in cfg
+
+        logged = []
+        engine = cc.BSoidEngine(dlc_dir, video_folder=None, output_dir=out_dir,
+                                fps=30, logger=logged.append, cfg=cfg)
+        engine.run()
+
+        assert not any("[5b/7]" in m for m in logged), (
+            "refine_clusters_iterative() should have hard-no-op'd (both "
+            "hdbscan_split_silhouette_thresh and hdbscan_merge_thresh are "
+            "off in this cfg) instead of running a refinement loop just "
+            "because hdbscan_region_split_enabled=True with nothing traced")
+
+    def test_discarded_consensus_attempt_does_not_leak_region_split_stats(
+            self, tmp_path, monkeypatch):
+        """Regression test (code-review finding, post-Phase-8 fix): a
+        consensus_cluster() attempt that mutates its region_split_stats
+        out-param and then raises/is discarded used to leave those stats
+        in the SAME dict the primary refinement path reuses, inflating
+        validation_report.json's region_split.clusters_created and
+        star-marking clusters in the dendrogram that were never actually
+        created by region-aware splitting in the delivered result. Fixed
+        by giving each consensus attempt its own stats dict, only merged
+        into the shared accumulator on success."""
+        dlc_dir = tmp_path / "dlc"
+        dlc_dir.mkdir()
+        _p2_write_session_h5(dlc_dir / "session1_filtered.h5", n_frames=300, seed=10)
+        _p2_write_session_h5(dlc_dir / "session2_filtered.h5", n_frames=300, seed=11)
+        out_dir = tmp_path / "out"
+
+        orig_consensus_cluster = cc.consensus_cluster
+
+        def fake_consensus_cluster(*a, **kw):
+            region_split_stats = kw.get("region_split_stats")
+            if region_split_stats is not None:
+                # Simulate a real split having happened inside the
+                # (about-to-be-discarded) consensus attempt.
+                region_split_stats["clusters_created"] = 99
+                region_split_stats.setdefault("touched_bin_idx", []).extend([0, 1, 2])
+            raise RuntimeError("simulated consensus failure after stats mutation")
+
+        monkeypatch.setattr(cc, "consensus_cluster", fake_consensus_cluster)
+
+        cfg = dict(_P2_FAST_RUN_CFG)
+        cfg["hdbscan_region_split_enabled"] = True
+        cfg["consensus_clustering_enabled"] = True
+        cfg["consensus_n_seeds"] = 2
+
+        logged = []
+        engine = cc.BSoidEngine(dlc_dir, video_folder=None, output_dir=out_dir,
+                                fps=30, logger=logged.append, cfg=cfg)
+        engine.run()  # must not raise -- consensus failure is caught and falls back
+
+        assert any("consensus clustering failed" in m for m in logged)
+
+        import json as _json
+        report = _json.loads((out_dir / "validation_report.json").read_text())
+        assert "region_split" in report
+        assert report["region_split"]["clusters_created"] == 0, (
+            "the discarded consensus attempt's simulated 99-cluster stat "
+            "leaked into the primary path's audit trail")
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Phase 6 — downstream verification (Design decision 5's checklist)

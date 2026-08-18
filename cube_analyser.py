@@ -606,16 +606,51 @@ def find_cluster_confidence(root: pathlib.Path) -> pathlib.Path | None:
     return None
 
 
-def find_cluster_centroids(root: pathlib.Path):
+def _locate_cluster_centroids_npz(root: pathlib.Path) -> "pathlib.Path | None":
+    """
+    Shared path-resolution logic behind find_cluster_centroids() and
+    find_cluster_region_overlay() -- both read the SAME
+    cluster_feature_centroids.npz, so both MUST resolve to the same file
+    within one render (previously each ran its own independent rglob/
+    parent-walk search, which could pick different files if more than one
+    cluster_feature_centroids.npz was reachable under root, e.g. two run
+    folders sharing a parent -- silently mismatching cluster ids between
+    the dendrogram and its region-composition overlay). Callers should
+    resolve this ONCE per render and pass the same path into both
+    functions' `npz_path` parameter.
+
+    Mirrors find_umap_data's search strategy: recurse downward from root,
+    then walk up to 4 parent levels, picking the most-recently-modified
+    match at each level searched.
+    """
+    def _search(directory: pathlib.Path):
+        candidates = sorted(directory.rglob("cluster_feature_centroids.npz"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+        return candidates[0] if candidates else None
+
+    hit = _search(root)
+    if not hit:
+        candidate = root.resolve()
+        for _ in range(4):
+            parent = candidate.parent
+            if parent == candidate:
+                break
+            candidate = parent
+            hit = _search(candidate)
+            if hit:
+                break
+    return hit
+
+
+def find_cluster_centroids(root: pathlib.Path, npz_path: "pathlib.Path | None" = None):
     """
     Search for cluster_feature_centroids.npz saved by cube_core (from
     plot_cluster_hierarchy's centroid computation, or by
-    backfill_cluster_centroids_from_umap for old run folders). Mirrors
-    find_umap_data's search strategy: recurse downward from root, then walk
-    up to 4 parent levels. Returns (centroids, cluster_ids, approximate,
-    linkage_method) as (numpy array, numpy array, bool, str), or
-    (None, None, False, "ward") if absent -- run folders that predate this
-    feature (and haven't been backfilled) simply don't have this file.
+    backfill_cluster_centroids_from_umap for old run folders). Returns
+    (centroids, cluster_ids, approximate, linkage_method) as (numpy array,
+    numpy array, bool, str), or (None, None, False, "ward") if absent --
+    run folders that predate this feature (and haven't been backfilled)
+    simply don't have this file.
 
     `approximate` is True when the npz was produced by the UMAP-embedding
     backfill path rather than a real Step 3 run's true feature-space
@@ -634,24 +669,13 @@ def find_cluster_centroids(root: pathlib.Path):
     cluster_hierarchy_*.png whenever a run used a non-default linkage method.
     Falls back to "ward" (the pipeline's own default) for older npz files
     saved before this field existed.
+
+    npz_path : optional pre-resolved path (from _locate_cluster_centroids_npz)
+        -- pass the SAME resolved path used for find_cluster_region_overlay()
+        so both read the identical file. None (default): resolves its own
+        path, exactly as before this parameter existed.
     """
-    def _search(directory: pathlib.Path):
-        candidates = sorted(directory.rglob("cluster_feature_centroids.npz"),
-                            key=lambda p: p.stat().st_mtime, reverse=True)
-        return candidates[0] if candidates else None
-
-    hit = _search(root)
-    if not hit:
-        candidate = root.resolve()
-        for _ in range(4):
-            parent = candidate.parent
-            if parent == candidate:
-                break
-            candidate = parent
-            hit = _search(candidate)
-            if hit:
-                break
-
+    hit = npz_path if npz_path is not None else _locate_cluster_centroids_npz(root)
     if not hit:
         return None, None, False, "ward"
 
@@ -3656,7 +3680,7 @@ def _region_color_map(region_names) -> dict:
     return {rn: PALETTE[i % len(PALETTE)] for i, rn in enumerate(names_sorted)}
 
 
-def find_cluster_region_overlay(root: pathlib.Path):
+def find_cluster_region_overlay(root: pathlib.Path, npz_path: "pathlib.Path | None" = None):
     """
     Reads the SAME cluster_feature_centroids.npz find_cluster_centroids()
     locates, for the optional region-aware-refinement dendrogram overlay
@@ -3668,25 +3692,19 @@ def find_cluster_region_overlay(root: pathlib.Path):
     overlay, exactly as they always have (mirrors find_cluster_centroids'
     own graceful-fallback precedent for missing/old npz files).
 
+    npz_path : optional pre-resolved path (from _locate_cluster_centroids_npz)
+        -- pass the SAME resolved path used for find_cluster_centroids() so
+        both read the identical file (a call site resolving each
+        independently could pick DIFFERENT files if more than one
+        cluster_feature_centroids.npz is reachable under root, silently
+        mismatching cluster ids between the dendrogram and this overlay).
+        None (default): resolves its own path, exactly as before this
+        parameter existed.
+
     Returns (region_composition: dict[int, dict[str, float]] | None,
              region_split_marked_ids: set[int] | None).
     """
-    def _search(directory: pathlib.Path):
-        candidates = sorted(directory.rglob("cluster_feature_centroids.npz"),
-                            key=lambda p: p.stat().st_mtime, reverse=True)
-        return candidates[0] if candidates else None
-
-    hit = _search(root)
-    if not hit:
-        candidate = root.resolve()
-        for _ in range(4):
-            parent = candidate.parent
-            if parent == candidate:
-                break
-            candidate = parent
-            hit = _search(candidate)
-            if hit:
-                break
+    hit = npz_path if npz_path is not None else _locate_cluster_centroids_npz(root)
     if not hit:
         return None, None
 
@@ -3697,6 +3715,12 @@ def find_cluster_region_overlay(root: pathlib.Path):
         region_names = [str(x) for x in data["region_names"]]
         frac_matrix = data["region_composition_frac"]
         cluster_ids = [int(c) for c in data["cluster_ids"]]
+        if frac_matrix.shape != (len(cluster_ids), len(region_names)):
+            # Shape mismatch -- e.g. a partially-written npz from an
+            # interrupted save, or a future schema change -- distinguish
+            # this from "feature genuinely absent" rather than silently
+            # falling through to the bare except below.
+            return None, None
         composition = {
             cid: {rn: float(frac_matrix[i, j]) for j, rn in enumerate(region_names)
                   if frac_matrix[i, j] > 0}
@@ -8727,10 +8751,13 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                         groups=user_groups or None)]
                 elif mode == "Cluster Hierarchy":
                     _root = self._get_root_dir()
-                    _centroids, _hier_cids, _approx, _link_m = (find_cluster_centroids(_root)
-                                                       if _root is not None else (None, None, False, "ward"))
-                    _region_comp, _region_marked = (find_cluster_region_overlay(_root)
-                                                    if _root is not None else (None, None))
+                    _npz_path = _locate_cluster_centroids_npz(_root) if _root is not None else None
+                    _centroids, _hier_cids, _approx, _link_m = (
+                        find_cluster_centroids(_root, npz_path=_npz_path)
+                        if _root is not None else (None, None, False, "ward"))
+                    _region_comp, _region_marked = (
+                        find_cluster_region_overlay(_root, npz_path=_npz_path)
+                        if _root is not None else (None, None))
                     figs_to_save = [build_cluster_hierarchy_figure(
                         _centroids, _hier_cids, linkage_method=_link_m, approximate=_approx,
                         region_composition=_region_comp, region_split_marked_ids=_region_marked)]
@@ -9270,10 +9297,13 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                 self._show_figure(fig)
             elif mode == "Cluster Hierarchy":
                 root = self._get_root_dir()
-                centroids, hier_cids, hier_approx, hier_link_m = (find_cluster_centroids(root)
-                                                     if root is not None else (None, None, False, "ward"))
-                region_comp, region_marked = (find_cluster_region_overlay(root)
-                                              if root is not None else (None, None))
+                npz_path = _locate_cluster_centroids_npz(root) if root is not None else None
+                centroids, hier_cids, hier_approx, hier_link_m = (
+                    find_cluster_centroids(root, npz_path=npz_path)
+                    if root is not None else (None, None, False, "ward"))
+                region_comp, region_marked = (
+                    find_cluster_region_overlay(root, npz_path=npz_path)
+                    if root is not None else (None, None))
                 self._show_figure(build_cluster_hierarchy_figure(
                     centroids, hier_cids, linkage_method=hier_link_m, approximate=hier_approx,
                     region_composition=region_comp, region_split_marked_ids=region_marked))

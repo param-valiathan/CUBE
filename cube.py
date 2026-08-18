@@ -4459,31 +4459,32 @@ class EnvParadigmWindow(tk.Toplevel):
         self._region_split_params_f = tk.Frame(self, bg=C["bg"])
         self._region_split_params_f.pack(fill="x", padx=10)
 
-        def _rs_spin(row_f, label, key, lo, hi, step, default, fmt="%.2f"):
+        def _rs_spin(label, key, lo, hi, step, default, fmt="%.2f", is_int=False):
             r = tk.Frame(self._region_split_params_f, bg=C["bg"])
             r.pack(fill="x", pady=1)
             tk.Label(r, text=label, font=("Segoe UI", 8), bg=C["bg"],
                      fg=C["subtext"], width=30, anchor="w").pack(side="left")
-            v = tk.DoubleVar(value=float(cfg.get(key, default)))
+            v = (tk.IntVar(value=int(cfg.get(key, default))) if is_int
+                 else tk.DoubleVar(value=float(cfg.get(key, default))))
             tk.Spinbox(r, from_=lo, to=hi, increment=step, format=fmt,
                        textvariable=v, width=8, bg=C["card2"], fg=C["text"],
                        buttonbackground=C["card2"], font=("Segoe UI", 8)).pack(side="left")
             return v
 
         self._region_split_impurity_v = _rs_spin(
-            self._region_split_params_f, "Impurity threshold (entropy 0-1):",
+            "Impurity threshold (entropy 0-1):",
             "hdbscan_region_split_impurity_thresh", 0.0, 1.0, 0.05, 0.5)
         self._region_split_min_minority_v = _rs_spin(
-            self._region_split_params_f, "Minority region floor (0-1):",
+            "Minority region floor (0-1):",
             "hdbscan_region_split_min_minority_frac", 0.0, 1.0, 0.01, 0.15)
         self._region_split_max_sub_v = _rs_spin(
-            self._region_split_params_f, "Max sub-clusters per split:",
-            "hdbscan_region_split_max_subclusters", 2, 10, 1, 3, fmt="%.0f")
+            "Max sub-clusters per split:",
+            "hdbscan_region_split_max_subclusters", 2, 10, 1, 3, fmt="%.0f", is_int=True)
         self._region_split_max_cand_v = _rs_spin(
-            self._region_split_params_f, "Max split candidates per pass:",
-            "hdbscan_region_split_max_candidates", 1, 50, 1, 10, fmt="%.0f")
+            "Max split candidates per pass:",
+            "hdbscan_region_split_max_candidates", 1, 50, 1, 10, fmt="%.0f", is_int=True)
         self._region_split_pre_reduction_v = _rs_spin(
-            self._region_split_params_f, "Pre-reduction % (0 = off):",
+            "Pre-reduction % (0 = off):",
             "region_split_pre_reduction_pct", 0.0, 1.0, 0.05, 0.0)
         tk.Label(self._region_split_params_f,
                  text="    Pre-reduction multiplies the primary sweep's preferred cluster "
