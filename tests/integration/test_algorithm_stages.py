@@ -288,6 +288,21 @@ class TestRunHdbscanTreeReuseEquivalence:
         # The returned score is still the real (bonus-free) relative_validity_.
         assert score == pytest.approx(clf.relative_validity_, abs=1e-9)
 
+    # -- Case 11 (regression, Aug 2026): the sequential sweep branch must
+    # log progress too, not just the parallel branch. hdbscan_sweep_n_jobs
+    # defaults to 1 (sequential), so this is the DEFAULT path on every real
+    # run -- before this fix it produced zero log output for its entire
+    # duration (confirmed live on a real 20-session dataset: 37+ minutes of
+    # total silence in the equivalent consensus/seed-sweep call sites while
+    # the process was still alive and actively computing).
+    def test_case11_sequential_sweep_logs_progress(self):
+        embedding = make_blob_embedding(n_per_blob=60, n_blobs=3, seed=3)
+        logs = []
+        cfg = dict(_wide_bucket_cfg(), hdbscan_sweep_n_jobs=1)
+        cc.run_hdbscan(embedding.copy(), cfg, log_fn=logs.append)
+        assert any("[hdbscan-sweep] sweeping" in l for l in logs), logs
+        assert any("[hdbscan-sweep]" in l and "candidates fit" in l for l in logs), logs
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  seed_sweep_stability -- zero prior coverage (per the perf plan's own
@@ -335,6 +350,38 @@ class TestSeedSweepStabilityFoundational:
         mean_ari = result["mean_ari"]
         if not np.isnan(mean_ari):
             assert -1.0 <= mean_ari <= 1.0
+
+    # Regression (Aug 2026): the sequential dispatch branch (seed_sweep_n_jobs
+    # =1, forced here but also the real fallback under RAM pressure) must log
+    # progress per seed, not just the parallel branch -- before this fix it
+    # was silent for the whole call's duration.
+    def test_sequential_dispatch_logs_progress(self):
+        feats = make_blob_features(n_per_blob=40, n_blobs=3, seed=1)
+        logs = []
+        cfg = dict(SEED_SWEEP_CFG, seed_sweep_n_jobs=1)
+        cc.seed_sweep_stability(feats, cfg, n_seeds=3, log_fn=logs.append)
+        assert any("[seed-sweep] running" in l for l in logs), logs
+        assert any("[seed-sweep]" in l and "done — seed" in l for l in logs), logs
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  consensus_cluster -- sequential-dispatch progress-logging regression.
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestConsensusClusterLogging:
+    # Regression (Aug 2026, found live on a real 20-session dataset: 37+
+    # minutes of total silence with the process still alive and actively
+    # computing). consensus_n_jobs=1 (sequential -- the real fallback under
+    # RAM pressure, or whenever pinned explicitly) must log progress per
+    # seed, not just the parallel branch.
+    def test_sequential_dispatch_logs_progress(self):
+        feats = make_blob_features(n_per_blob=40, n_blobs=3, seed=1)
+        logs = []
+        cfg = dict(SEED_SWEEP_CFG, consensus_n_jobs=1)
+        result = cc.consensus_cluster(feats, cfg, n_seeds=3, log_fn=logs.append)
+        assert result is not None
+        assert any("[consensus] running" in l for l in logs), logs
+        assert any("[consensus]" in l and "done — seed" in l for l in logs), logs
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -1947,67 +1947,86 @@ def run_hdbscan(embedding: np.ndarray, cfg: dict, n_total: int = None,
     _fit_one = _fit_one_new if _tree_reuse else _fit_one_legacy
 
     _tasks = [(method, pct) for method in methods for pct in pcts]
-    if _sweep_n_jobs != 1 and len(_tasks) > 1:
-        try:
-            from joblib import Parallel, delayed
+    # Progress + heartbeat: this sweep can take minutes with no output
+    # otherwise, indistinguishable from a hang. Reported every 10 candidates
+    # (rather than every one, like the seed sweeps) since this sweep is 40+
+    # candidates vs. their handful of seeds, and per-candidate lines would be
+    # log spam. Set up UNCONDITIONALLY (Aug 2026 fix) -- not just inside the
+    # parallel-dispatch branch below -- because hdbscan_sweep_n_jobs
+    # defaults to 1 (sequential, for the documented Windows heap-corruption
+    # crash-safety reason), so the sequential branch is the actual DEFAULT
+    # path for every run, and it used to produce zero progress output for
+    # its entire (often multi-minute) duration, indistinguishable from a
+    # hang. Same fix applied for the same reason to seed_sweep_stability()
+    # and consensus_cluster()'s own sequential fallback branches.
+    _t0 = time.time()
+    _progress_lock = _threading.Lock()
+    _progress_done = [0]
+    def _on_task_done():
+        if not log_fn:
+            return
+        with _progress_lock:
+            _progress_done[0] += 1
+            n_done = _progress_done[0]
+        if n_done % 10 == 0 or n_done == len(_tasks):
+            log_fn(f"  [hdbscan-sweep] {n_done}/{len(_tasks)} candidates "
+                   f"fit  ({time.time() - _t0:.0f}s elapsed)")
+    _hb_stop = _threading.Event()
+    def _heartbeat():
+        while not _hb_stop.wait(30):
+            with _progress_lock:
+                n_done = _progress_done[0]
             if log_fn:
-                log_fn(f"  [hdbscan-sweep] dispatching {len(_tasks)} candidates "
-                       f"({len(methods)} method(s) x {len(pcts)} min_cluster_size "
-                       f"steps) across n_jobs={_sweep_n_jobs} worker threads...")
-            # Progress + heartbeat: same reasoning/pattern as seed_sweep_
-            # stability() and consensus_cluster()'s dispatch -- this sweep can
-            # take minutes with no output otherwise, indistinguishable from a
-            # hang. Reported every 10 candidates (rather than every one, like
-            # the seed sweeps) since this sweep is 40+ candidates vs. their
-            # handful of seeds, and per-candidate lines would be log spam.
-            _t0 = time.time()
-            _progress_lock = _threading.Lock()
-            _progress_done = [0]
-            def _on_task_done():
-                if not log_fn:
-                    return
-                with _progress_lock:
-                    _progress_done[0] += 1
-                    n_done = _progress_done[0]
-                if n_done % 10 == 0 or n_done == len(_tasks):
-                    log_fn(f"  [hdbscan-sweep] {n_done}/{len(_tasks)} candidates "
-                           f"fit  ({time.time() - _t0:.0f}s elapsed)")
-            _hb_stop = _threading.Event()
-            def _heartbeat():
-                while not _hb_stop.wait(30):
-                    with _progress_lock:
-                        n_done = _progress_done[0]
-                    if log_fn:
-                        log_fn(f"  [hdbscan-sweep] still running — "
-                               f"{n_done}/{len(_tasks)} candidates fit, "
-                               f"{time.time() - _t0:.0f}s elapsed...")
-            _threading.Thread(target=_heartbeat, daemon=True).start()
+                log_fn(f"  [hdbscan-sweep] still running — "
+                       f"{n_done}/{len(_tasks)} candidates fit, "
+                       f"{time.time() - _t0:.0f}s elapsed...")
+    _hb_thread = None
+    if log_fn:
+        _hb_thread = _threading.Thread(target=_heartbeat, daemon=True)
+        _hb_thread.start()
 
-            def _fit_one_tracked(method, pct):
-                r = _fit_one(method, pct)
-                _on_task_done()
-                return r
+    def _fit_one_tracked(method, pct):
+        r = _fit_one(method, pct)
+        _on_task_done()
+        return r
 
-            # Oversubscription guard (BLAS half): mirrors split_impure_
-            # clusters()/seed_sweep_stability()/consensus_cluster(), which
-            # all wrap their own Parallel(...) dispatch the same way -- see
-            # _blas_single_thread_for_dispatch()'s docstring for why this has
-            # to wrap the WHOLE dispatch call rather than each worker
-            # individually (threadpoolctl's limiter is process-global, so
-            # per-worker enter/exit would race). Without this, BLAS calls
-            # inside each worker's own numpy/sklearn steps (PCA, distance
-            # computation) would each try to claim all cores on top of the
-            # numba contention _fit_one already guards against above.
+    try:
+        if _sweep_n_jobs != 1 and len(_tasks) > 1:
             try:
+                from joblib import Parallel, delayed
+                if log_fn:
+                    log_fn(f"  [hdbscan-sweep] dispatching {len(_tasks)} candidates "
+                           f"({len(methods)} method(s) x {len(pcts)} min_cluster_size "
+                           f"steps) across n_jobs={_sweep_n_jobs} worker threads...")
+                # Oversubscription guard (BLAS half): mirrors split_impure_
+                # clusters()/seed_sweep_stability()/consensus_cluster(), which
+                # all wrap their own Parallel(...) dispatch the same way -- see
+                # _blas_single_thread_for_dispatch()'s docstring for why this has
+                # to wrap the WHOLE dispatch call rather than each worker
+                # individually (threadpoolctl's limiter is process-global, so
+                # per-worker enter/exit would race). Without this, BLAS calls
+                # inside each worker's own numpy/sklearn steps (PCA, distance
+                # computation) would each try to claim all cores on top of the
+                # numba contention _fit_one already guards against above.
                 with _blas_single_thread_for_dispatch():
                     _raw = Parallel(n_jobs=_sweep_n_jobs, prefer="threads")(
                         delayed(_fit_one_tracked)(method, pct) for method, pct in _tasks)
-            finally:
-                _hb_stop.set()
-        except Exception:
-            _raw = [_fit_one(method, pct) for method, pct in _tasks]
-    else:
-        _raw = [_fit_one(method, pct) for method, pct in _tasks]
+            except Exception:
+                if log_fn:
+                    log_fn(f"  [hdbscan-sweep] parallel dispatch failed; "
+                           f"falling back to sequential ({len(_tasks)} candidates)...")
+                with _progress_lock:
+                    _progress_done[0] = 0   # reset: some tasks may have
+                                             # already counted before the failure
+                _raw = [_fit_one_tracked(method, pct) for method, pct in _tasks]
+        else:
+            if log_fn:
+                log_fn(f"  [hdbscan-sweep] sweeping {len(_tasks)} candidates "
+                       f"({len(methods)} method(s) x {len(pcts)} min_cluster_size "
+                       f"steps) sequentially...")
+            _raw = [_fit_one_tracked(method, pct) for method, pct in _tasks]
+    finally:
+        _hb_stop.set()
     candidates = [r for r in _raw if r is not None]
 
     # ── Fallback: sweep produced nothing with ≥ 2 clusters ────────────────────
@@ -5463,47 +5482,61 @@ def seed_sweep_stability(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
     seeds = [base_seed + i for i in range(int(n_seeds))]
     n_jobs = resolve_n_jobs(cfg, "seed_sweep_n_jobs", log_fn=log_fn)
     all_labels, counts, dbcv_scores = [], [], []
-    if n_jobs == 1:
-        results = [_seed_sweep_one_seed(s, feats_sc_T, cfg, feats_sc_T.shape[0])
-                   for s in seeds]
-    else:
-        try:
-            from joblib import Parallel, delayed
+    # Progress + heartbeat set up UNCONDITIONALLY (Aug 2026 fix) -- not just
+    # inside the parallel-dispatch branch below. seed_sweep_n_jobs resolving
+    # to 1 (sequential -- happens under RAM pressure, or whenever the caller
+    # pins it explicitly) used to leave the sequential branch producing ZERO
+    # progress output for its entire (each seed is a full UMAP+HDBSCAN fit,
+    # so potentially many minutes x n_seeds) duration, indistinguishable from
+    # a hang. Same fix applied for the same reason to run_hdbscan()'s own
+    # sequential sweep branch and consensus_cluster()'s sequential fallback.
+    _t0 = time.time()
+    _progress_lock = _threading.Lock()
+    _progress_done = [0]
+    def _on_seed_done(s, r):
+        if not log_fn:
+            return
+        with _progress_lock:
+            _progress_done[0] += 1
+            n_done = _progress_done[0]
+        status = f"{r['count']} clusters, DBCV={r['dbcv']:.3f}" if r else "failed"
+        log_fn(f"  [seed-sweep] {n_done}/{len(seeds)} done — seed {s}: "
+               f"{status}  ({time.time() - _t0:.0f}s elapsed)")
+    # Heartbeat: in the parallel case all seeds are dispatched at once and do
+    # similar work, so their completions tend to arrive in a burst near the
+    # end rather than spread across the sweep -- _on_seed_done alone can
+    # still leave a long silent stretch early on. In the sequential case
+    # each seed completes one at a time already, but a single seed's own
+    # UMAP+HDBSCAN fit can itself run for minutes with nothing to report in
+    # between. Either way, a periodic "still running" line makes that
+    # stretch distinguishable from a hang.
+    _hb_stop = _threading.Event()
+    def _heartbeat():
+        while not _hb_stop.wait(30):
+            with _progress_lock:
+                n_done = _progress_done[0]
             if log_fn:
-                log_fn(f"  [seed-sweep] dispatching {len(seeds)} seeds across "
-                       f"n_jobs={n_jobs} worker threads...")
-            # Report as each seed's worker thread finishes -- without this the
-            # log goes silent for the sweep's entire wall-clock (each seed can
-            # take minutes), indistinguishable from a hang. PipelineLogger is
-            # lock-protected so calling log_fn from these worker threads is safe.
-            _t0 = time.time()
-            _progress_lock = _threading.Lock()
-            _progress_done = [0]
-            def _on_seed_done(s, r):
-                if not log_fn:
-                    return
-                with _progress_lock:
-                    _progress_done[0] += 1
-                    n_done = _progress_done[0]
-                status = f"{r['count']} clusters, DBCV={r['dbcv']:.3f}" if r else "failed"
-                log_fn(f"  [seed-sweep] {n_done}/{len(seeds)} done — seed {s}: "
-                       f"{status}  ({time.time() - _t0:.0f}s elapsed)")
-            # Heartbeat: all seeds are dispatched at once and do similar work,
-            # so their completions tend to arrive in a burst near the end
-            # rather than spread across the sweep -- _on_seed_done alone can
-            # still leave a long silent stretch early on. A periodic "still
-            # running" line makes that stretch distinguishable from a hang.
-            _hb_stop = _threading.Event()
-            def _heartbeat():
-                while not _hb_stop.wait(30):
-                    with _progress_lock:
-                        n_done = _progress_done[0]
-                    if log_fn:
-                        log_fn(f"  [seed-sweep] still running — "
-                               f"{n_done}/{len(seeds)} seeds done, "
-                               f"{time.time() - _t0:.0f}s elapsed...")
-            _threading.Thread(target=_heartbeat, daemon=True).start()
+                log_fn(f"  [seed-sweep] still running — "
+                       f"{n_done}/{len(seeds)} seeds done, "
+                       f"{time.time() - _t0:.0f}s elapsed...")
+    if log_fn:
+        _threading.Thread(target=_heartbeat, daemon=True).start()
+
+    try:
+        if n_jobs == 1:
+            if log_fn:
+                log_fn(f"  [seed-sweep] running {len(seeds)} seeds sequentially...")
+            results = [_seed_sweep_one_seed(s, feats_sc_T, cfg, feats_sc_T.shape[0],
+                                             progress_cb=_on_seed_done)
+                       for s in seeds]
+        else:
             try:
+                from joblib import Parallel, delayed
+                if log_fn:
+                    log_fn(f"  [seed-sweep] dispatching {len(seeds)} seeds across "
+                           f"n_jobs={n_jobs} worker threads...")
+                # PipelineLogger is lock-protected so calling log_fn from
+                # these worker threads is safe.
                 with _blas_single_thread_for_dispatch():
                     results = Parallel(n_jobs=n_jobs, prefer="threads")(
                         delayed(_seed_sweep_one_seed)(
@@ -5511,11 +5544,18 @@ def seed_sweep_stability(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
                             progress_cb=_on_seed_done)
                         for s in seeds
                     )
-            finally:
-                _hb_stop.set()
-        except Exception:
-            results = [_seed_sweep_one_seed(s, feats_sc_T, cfg, feats_sc_T.shape[0])
-                       for s in seeds]
+            except Exception:
+                if log_fn:
+                    log_fn(f"  [seed-sweep] parallel dispatch failed; "
+                           f"falling back to sequential ({len(seeds)} seeds)...")
+                with _progress_lock:
+                    _progress_done[0] = 0   # reset: some seeds may have
+                                             # already counted before the failure
+                results = [_seed_sweep_one_seed(s, feats_sc_T, cfg, feats_sc_T.shape[0],
+                                                 progress_cb=_on_seed_done)
+                           for s in seeds]
+    finally:
+        _hb_stop.set()
     for s, r in zip(seeds, results):
         if r is None:
             if log_fn:
@@ -5848,55 +5888,78 @@ def consensus_cluster(feats_sc_T: np.ndarray, cfg: dict, n_seeds: int,
     # so the 8-seed (default consensus_n_seeds) co-association pass ran
     # one full UMAP+HDBSCAN fit after another with most cores idle.
     n_jobs = resolve_n_jobs(cfg, "consensus_n_jobs", log_fn=log_fn)
-    if n_jobs == 1:
-        results = [_consensus_one_seed(s, feats_sc_T, cfg, n_samp) for s in seeds]
-    else:
-        try:
-            from joblib import Parallel, delayed
+    # Progress + heartbeat set up UNCONDITIONALLY (Aug 2026 fix) -- not just
+    # inside the parallel-dispatch branch below. consensus_n_jobs resolving
+    # to 1 (sequential -- happens under RAM pressure, or whenever the caller
+    # pins it explicitly) used to leave the sequential branch producing ZERO
+    # progress output for its entire (each seed is a full UMAP+HDBSCAN fit,
+    # so potentially many minutes x n_seeds -- confirmed on a real 20-session
+    # dataset: 37+ minutes of total silence with the process still alive and
+    # actively computing) duration, indistinguishable from a hang. Same fix
+    # applied for the same reason to run_hdbscan()'s own sequential sweep
+    # branch and seed_sweep_stability()'s sequential branch.
+    _t0 = time.time()
+    _progress_lock = _threading.Lock()
+    _progress_done = [0]
+    def _on_seed_done(s, r):
+        if not log_fn:
+            return
+        with _progress_lock:
+            _progress_done[0] += 1
+            n_done = _progress_done[0]
+        status = f"{r['count']} clusters" if r else "failed"
+        log_fn(f"  [consensus] {n_done}/{len(seeds)} done — seed {s}: "
+               f"{status}  ({time.time() - _t0:.0f}s elapsed)")
+    # Heartbeat: in the parallel case all seeds are dispatched at once and do
+    # similar work, so their completions tend to arrive in a burst near the
+    # end rather than spread across the run. In the sequential case each
+    # seed completes one at a time already, but a single seed's own
+    # UMAP+HDBSCAN fit can itself run for minutes with nothing to report in
+    # between. Either way, a periodic "still running" line makes that
+    # stretch distinguishable from a hang.
+    _hb_stop = _threading.Event()
+    def _heartbeat():
+        while not _hb_stop.wait(30):
+            with _progress_lock:
+                n_done = _progress_done[0]
             if log_fn:
-                log_fn(f"  [consensus] dispatching {len(seeds)} seeds across "
-                       f"n_jobs={n_jobs} worker threads...")
-            # Report as each seed's worker thread finishes -- same reasoning
-            # as seed_sweep_stability's dispatch: each seed's UMAP+HDBSCAN fit
-            # can take minutes, and with no output in between a stalled seed
-            # and a busy one look identical from the log.
-            _t0 = time.time()
-            _progress_lock = _threading.Lock()
-            _progress_done = [0]
-            def _on_seed_done(s, r):
-                if not log_fn:
-                    return
-                with _progress_lock:
-                    _progress_done[0] += 1
-                    n_done = _progress_done[0]
-                status = f"{r['count']} clusters" if r else "failed"
-                log_fn(f"  [consensus] {n_done}/{len(seeds)} done — seed {s}: "
-                       f"{status}  ({time.time() - _t0:.0f}s elapsed)")
-            # Heartbeat: all seeds are dispatched at once and do similar work,
-            # so their completions tend to arrive in a burst near the end
-            # rather than spread across the run -- see seed_sweep_stability's
-            # matching heartbeat for the same reasoning.
-            _hb_stop = _threading.Event()
-            def _heartbeat():
-                while not _hb_stop.wait(30):
-                    with _progress_lock:
-                        n_done = _progress_done[0]
-                    if log_fn:
-                        log_fn(f"  [consensus] still running — "
-                               f"{n_done}/{len(seeds)} seeds done, "
-                               f"{time.time() - _t0:.0f}s elapsed...")
-            _threading.Thread(target=_heartbeat, daemon=True).start()
+                log_fn(f"  [consensus] still running — "
+                       f"{n_done}/{len(seeds)} seeds done, "
+                       f"{time.time() - _t0:.0f}s elapsed...")
+    if log_fn:
+        _threading.Thread(target=_heartbeat, daemon=True).start()
+
+    try:
+        if n_jobs == 1:
+            if log_fn:
+                log_fn(f"  [consensus] running {len(seeds)} seeds sequentially...")
+            results = [_consensus_one_seed(s, feats_sc_T, cfg, n_samp,
+                                            progress_cb=_on_seed_done)
+                       for s in seeds]
+        else:
             try:
+                from joblib import Parallel, delayed
+                if log_fn:
+                    log_fn(f"  [consensus] dispatching {len(seeds)} seeds across "
+                           f"n_jobs={n_jobs} worker threads...")
                 with _blas_single_thread_for_dispatch():
                     results = Parallel(n_jobs=n_jobs, prefer="threads")(
                         delayed(_consensus_one_seed)(
                             s, feats_sc_T, cfg, n_samp, progress_cb=_on_seed_done)
                         for s in seeds
                     )
-            finally:
-                _hb_stop.set()
-        except Exception:
-            results = [_consensus_one_seed(s, feats_sc_T, cfg, n_samp) for s in seeds]
+            except Exception:
+                if log_fn:
+                    log_fn(f"  [consensus] parallel dispatch failed; "
+                           f"falling back to sequential ({len(seeds)} seeds)...")
+                with _progress_lock:
+                    _progress_done[0] = 0   # reset: some seeds may have
+                                             # already counted before the failure
+                results = [_consensus_one_seed(s, feats_sc_T, cfg, n_samp,
+                                                progress_cb=_on_seed_done)
+                           for s in seeds]
+    finally:
+        _hb_stop.set()
 
     per_seed_labels, per_seed_counts, _ok_seeds = [], [], []
     for s, r in zip(seeds, results):
