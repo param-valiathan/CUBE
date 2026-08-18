@@ -1827,6 +1827,10 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
     _det_epochs    = int(_adv.get("dlc_det_epochs",       n_epochs))
     _pose_epochs   = int(_adv.get("dlc_pose_epochs",      n_epochs))
     _transfer      = bool(_adv.get("dlc_transfer",        True))
+    _scale_mode    = str(_adv.get("dlc_scale_mode",       "Auto"))
+    _scale_min     = int(_adv.get("dlc_scale_min",        100))
+    _scale_max     = int(_adv.get("dlc_scale_max",        600))
+    _scale_step    = int(_adv.get("dlc_scale_step",       50))
     _inf_batch_ov  = int(_adv.get("dlc_inf_batch",        0))
     _det_batch_ov  = int(_adv.get("dlc_det_batch",        0))
     _crop_enable   = bool(_adv.get("dlc_crop_enable",    False))
@@ -2095,11 +2099,29 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
             if not rep_inf.exists():
                 shutil.copy2(rep_video_path, str(rep_inf))
 
+            # ── Scale list for SuperAnimal detector (mirrors the regular
+            # per-video path's Auto/Manual logic instead of a fixed range) ──
+            if _scale_mode == "Manual":
+                _scale_list = list(range(_scale_min,
+                                         _scale_max + _scale_step,
+                                         _scale_step))
+            else:
+                try:
+                    _cap_sc = cv2.VideoCapture(str(rep_inf))
+                    _short  = min(int(_cap_sc.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                                  int(_cap_sc.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                    _cap_sc.release()
+                except Exception:
+                    _short = 720
+                _centre     = max(150, int(_short * 0.35))
+                _scale_list = list(range(max(100, _centre - 150),
+                                         min(1200, _centre + 200), 50))
+
             sa_kw = dict(
                 superanimal_name     = _sa_name,
                 model_name           = _model_name,
                 detector_name        = _detector_name,
-                scale_list           = list(range(100, 650, 50)),
+                scale_list           = _scale_list,
                 pcutoff              = _pcutoff,
                 bbox_threshold       = _bbox_thr,
                 max_individuals      = _max_ind,
@@ -2318,6 +2340,25 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
         logger.info(f"  [{idx}/{total}]  {vname}")
         h5_before = set(dest_folder.glob("*.h5"))
         _v_t0 = time.time()
+
+        # ── Scale list for SuperAnimal detector (mirrors the regular
+        # per-video path's Auto/Manual logic instead of a fixed range) ──
+        if _scale_mode == "Manual":
+            _scale_list = list(range(_scale_min,
+                                     _scale_max + _scale_step,
+                                     _scale_step))
+        else:
+            try:
+                _cap_sc = cv2.VideoCapture(str(vpath))
+                _short  = min(int(_cap_sc.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                              int(_cap_sc.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                _cap_sc.release()
+            except Exception:
+                _short = 720
+            _centre     = max(150, int(_short * 0.35))
+            _scale_list = list(range(max(100, _centre - 150),
+                                     min(1200, _centre + 200), 50))
+
         succeeded  = False
         while not succeeded:
             try:
@@ -2328,7 +2369,7 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
                         superanimal_name               = _sa_name,
                         model_name                     = _model_name,
                         detector_name                  = _detector_name,
-                        scale_list                     = list(range(100, 650, 50)),
+                        scale_list                     = _scale_list,
                         pcutoff                        = _pcutoff,
                         bbox_threshold                 = _bbox_thr,
                         max_individuals                = _max_ind,
