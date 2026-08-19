@@ -124,6 +124,21 @@ import pandas as pd
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox
 
+
+def _raise_window(win):
+    """Bring a newly created Toplevel/CTkToplevel to the front of the stacking
+    order and give it focus, so it doesn't spawn hidden behind the main window
+    or other already-open windows on Windows.
+    """
+    try:
+        win.lift()
+        win.focus_force()
+        win.attributes("-topmost", True)
+        win.after(150, lambda: win.attributes("-topmost", False))
+    except Exception:
+        pass
+
+
 try:
     from scipy import stats as sp_stats
     SCIPY_OK = True
@@ -7520,6 +7535,7 @@ class GroupEditorWindow(ctk.CTkToplevel):
         self.geometry("1050x680")
         self.minsize(780, 440)
         self.resizable(True, True)
+        self.after(10, lambda w=self: _raise_window(w))
 
         self._group_rows: list = []
         self._all_labels: list = []
@@ -7797,6 +7813,7 @@ class AnimalListPanel(ctk.CTkFrame):
         win.geometry("340x" + str(60 + len(egs) * 52))
         win.resizable(False, False)
         win.grab_set()
+        win.after(10, lambda w=win: _raise_window(w))
         swatches = {}
         for i, eg in enumerate(sorted(egs)):
             cur_color = self._eg_colors.get(eg, PALETTE[i % len(PALETTE)])
@@ -8052,6 +8069,7 @@ class AnimalListPanel(ctk.CTkFrame):
         dlg.title("Fill Selected Animals")
         dlg.resizable(False, False)
         dlg.grab_set()
+        dlg.after(10, lambda w=dlg: _raise_window(w))
 
         v1 = tk.StringVar(master=dlg)
         v2 = tk.StringVar(master=dlg)
@@ -9257,6 +9275,7 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                     _win = tk.Toplevel(self)
                     _win.title("Top-N: User-Defined Behaviour Groups")
                     _win.configure(bg=T()["bg"])
+                    _win.after(10, lambda w=_win: _raise_window(w))
                     _c = FigureCanvasTkAgg(fig_groups, master=_win)
                     _c.draw()
                     _c.get_tk_widget().pack(fill="both", expand=True)
@@ -20702,6 +20721,7 @@ class BSOiDApp(ctk.CTk):
         win.title("UMAP — Before vs. After Recombination")
         win.geometry("1300x620")
         win.resizable(True, True)
+        win.after(10, lambda w=win: _raise_window(w))
         win.columnconfigure(0, weight=1)
         win.rowconfigure(0, weight=1)
         win.rowconfigure(1, weight=0)
@@ -21668,6 +21688,7 @@ class BSOiDApp(ctk.CTk):
 
 def main():
     app = BSOiDApp()
+    app.after(10, lambda w=app: _raise_window(w))
     app.mainloop()
 
 

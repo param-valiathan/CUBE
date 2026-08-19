@@ -106,6 +106,26 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+
+def _raise_window(win):
+    """Bring a newly created Toplevel/CTkToplevel to the front of the stacking
+    order and give it focus.
+
+    Without this, new windows (especially small dialogs like the shape-naming
+    popup in EnvContextWindow) can spawn behind the main window or other
+    already-open windows on Windows, where they're easy to lose track of.
+    A brief topmost flash forces the window forward once without pinning it
+    above everything else for the rest of its lifetime.
+    """
+    try:
+        win.lift()
+        win.focus_force()
+        win.attributes("-topmost", True)
+        win.after(150, lambda: win.attributes("-topmost", False))
+    except Exception:
+        pass
+
+
 # On Windows, an app that hasn't declared itself DPI-aware gets bitmap-scaled
 # by the OS on non-100%-scaled or mixed-DPI multi-monitor setups: Tk renders
 # widgets at one (logical) coordinate space while Windows displays them
@@ -1049,6 +1069,7 @@ def show_help(parent):
     win.configure(bg=C["bg"])
     win.geometry("700x600")
     win.resizable(True, True)
+    win.after(10, lambda w=win: _raise_window(w))
     tk.Label(win, text="CUBE: Comprehensive Unsupervised Behavioral Explorer — User Guide",
              font=("Segoe UI", 13, "bold"),
              bg=C["bg"], fg=C["accent"]).pack(pady=(14, 4))
@@ -3027,8 +3048,18 @@ def _run_engine_step(session: SessionState, settings: SettingsPanel,
     # ── Single combined output directory (timestamped to preserve prior runs) ──
     _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if len(bsoid_roots) == 1:
-        # Single root: keep original behaviour (output inside BSOID_Project_Ready)
-        this_out = Path(bsoid_roots[0]) / f"cube_results_{_ts}"
+        # Single root: save OUTSIDE BSOID_Project_Ready (and outside the video
+        # folder it lives in), one level above the video folder that was
+        # selected as input.  BSOID_Project_Ready is created *inside* that
+        # video folder (see run_bsoid_prep), so nesting cube_results inside it
+        # too means a later re-run pointed at the same video folder can
+        # recursively pick up prior results (labeled videos, example clips,
+        # etc.) as if they were new input data.  Going one level above the
+        # video folder keeps output fully outside anything Step 2/3 scan.
+        _bsoid_root_p = Path(bsoid_roots[0])
+        _video_folder = _bsoid_root_p.parent
+        _dest = _video_folder.parent if _video_folder.parent != _video_folder else _video_folder
+        this_out = _dest / f"cube_results_{_ts}"
     else:
         # Multiple roots: use workspace root so output is separate from any group
         this_out = _resolve_work_dir(session) / f"cube_results_{_ts}"
@@ -3195,6 +3226,7 @@ class DLCPrepSettingsWindow(tk.Toplevel):
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
+        self.after(10, lambda w=self: _raise_window(w))
 
         tk.Label(self, text="  ⚙  DLC & Prep Settings",
                  font=("Segoe UI", 12, "bold"),
@@ -3356,6 +3388,7 @@ class AdvancedDLCWindow(tk.Toplevel):
         self.resizable(True, True)
         self.transient(parent)
         self.grab_set()
+        self.after(10, lambda w=self: _raise_window(w))
         self._session = session
         self._vars: dict = {}
 
@@ -3754,6 +3787,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
         self.resizable(True, True)
         self.transient(parent)
         self.grab_set()
+        self.after(10, lambda w=self: _raise_window(w))
         self._session = session
         self._vars: dict = {}
         self._bodypart_weights: dict = {}
@@ -4391,6 +4425,7 @@ class EnvParadigmWindow(tk.Toplevel):
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
+        self.after(10, lambda w=self: _raise_window(w))
 
         self._session = session
         cfg = session.get("engine_cfg", {}) or {}
@@ -4706,6 +4741,7 @@ class EnvContextWindow(tk.Toplevel):
         self.resizable(True, True)
         self.transient(parent)
         self.grab_set()
+        self.after(10, lambda w=self: _raise_window(w))
         self.result = None
 
         self._session = session
@@ -5129,6 +5165,7 @@ class EnvContextWindow(tk.Toplevel):
         dlg.configure(bg=C["bg"])
         dlg.transient(self)
         dlg.grab_set()
+        dlg.after(10, lambda w=dlg: _raise_window(w))
         result = {"name": None, "role": None}
 
         tk.Label(dlg, text="Name:", bg=C["bg"], fg=C["text"],
@@ -5580,6 +5617,7 @@ class BodyPartWeightWindow(tk.Toplevel):
         self.resizable(True, True)
         self.transient(parent)
         self.grab_set()
+        self.after(10, lambda w=self: _raise_window(w))
         self.result = None
 
         self._session = session
@@ -5766,6 +5804,7 @@ class ThreeDSettingsWindow(tk.Toplevel):
         self.resizable(False, False)
         self.configure(bg=C["bg"])
         self.grab_set()
+        self.after(10, lambda w=self: _raise_window(w))
 
         pad = dict(padx=10, pady=4)
 
@@ -6061,6 +6100,7 @@ class CropPreviewDialog(tk.Toplevel):
         self.resizable(True, True)
         self.transient(parent)
         self.grab_set()
+        self.after(10, lambda w=self: _raise_window(w))
 
         self._session  = session
         self.confirmed = False
@@ -7319,8 +7359,9 @@ class PipelineApp(tk.Tk):
         self._logger.step("Launching Video Explorer ")
 
         # Find example_clips folder.
-        # engine_out_dirs points to BSOID_Project_Ready/cube_results_TIMESTAMP;
-        # bsoid_ready_dirs points to BSOID_Project_Ready itself (Step 2 output).
+        # engine_out_dirs points to cube_results_TIMESTAMP (saved outside
+        # BSOID_Project_Ready -- see _run_engine_step); bsoid_ready_dirs
+        # points to BSOID_Project_Ready itself (Step 2 output).
         clip_folder = None
         for d in self._session.get("engine_out_dirs", []) + \
                  self._session.get("bsoid_ready_dirs", []):
@@ -7383,6 +7424,7 @@ class PipelineApp(tk.Tk):
                 sm.add_command(label="Quit",           command=app._on_close)
                 mb.add_cascade(label="Session", menu=sm)
                 app.configure(menu=mb)
+                app.after(10, lambda w=app: _raise_window(w))
                 app.mainloop()
                 self._running = False
                 self._session.set_status("annotate", "done")
@@ -7619,6 +7661,7 @@ class PipelineApp(tk.Tk):
                         self._logger.warn(
                             f"Auto-load failed: {traceback.format_exc()}")
 
+                app.after(10, lambda w=app: _raise_window(w))
                 app.mainloop()
                 self._running = False
                 if messagebox.askyesno(

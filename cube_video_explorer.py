@@ -41,6 +41,20 @@ from tkinter import filedialog, messagebox, simpledialog
 from pathlib import Path
 from collections import defaultdict, deque
 
+
+def _raise_window(win):
+    """Bring a newly created Toplevel to the front of the stacking order and
+    give it focus, so it doesn't spawn hidden behind the main window or other
+    already-open windows on Windows.
+    """
+    try:
+        win.lift()
+        win.focus_force()
+        win.attributes("-topmost", True)
+        win.after(150, lambda: win.attributes("-topmost", False))
+    except Exception:
+        pass
+
 # See the matching block in cube.py for why this is needed: on Windows,
 # an app that isn't DPI-aware can get its clicks delivered to the wrong
 # widget (visually clicking one radio button invokes a different one) on
@@ -644,6 +658,7 @@ class ColourPickerDialog(tk.Toplevel):
         self.configure(bg=C["bg"])
         self.resizable(False, False)
         self.grab_set()
+        self.after(10, lambda w=self: _raise_window(w))
         self._bg_obj = bg_obj
         self._cb     = callback
         tk.Label(self, text="Select a colour:",
@@ -1735,6 +1750,7 @@ def main():
     menubar.add_cascade(label="Help", menu=hm)
     app.configure(menu=menubar)
 
+    app.after(10, lambda w=app: _raise_window(w))
     app.mainloop()
 
 
@@ -1751,6 +1767,7 @@ def _show_help(parent):
     win.title("Keyboard Shortcuts")
     win.configure(bg=C["bg"])
     win.resizable(False, False)
+    win.after(10, lambda w=win: _raise_window(w))
     rows = [
         ("   /  ->",  "Previous / next cluster"),
         ("Space",     "Reload / replay current cluster"),
