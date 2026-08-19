@@ -122,7 +122,10 @@ target directly rather than through a pipeline rewrite:
   *selects which clusters get a second look*, never enters the UMAP/HDBSCAN feature space itself. To our
   knowledge this makes CUBE the only pipeline in this comparison where an experiment's spatial structure can
   change what gets labelled as a distinct behaviour without position ever substituting for movement as the
-  classification signal.
+  classification signal — and, as of the region-aware merge guard (see "Refinement pathways" below), that
+  guarantee now holds all the way through cluster consolidation, not just at the moment of the split: B-SOiD-
+  and consensus-style merge steps in this and comparable pipelines have no spatial signal to check against at
+  all, so a region-pure split can otherwise be silently re-mixed by the very next merge with nothing to catch it.
 - **Net positioning:** these additions keep CUBE's core B-SOiD architecture (minutes, not hours, per run, no GPU
   training loop) while borrowing the *diagnosis* behind VAME's and keypoint-MoSeq's improvements and applying the
   cheapest available fix inside the existing pipeline for each one, and adding a spatial-awareness capability
@@ -130,6 +133,46 @@ target directly rather than through a pipeline rewrite:
   features (see Advanced Settings below) — a full temporal re-embedding (VAME-style) or generative uncertainty
   model (keypoint-MoSeq-style) would be the next escalation if these mitigations prove insufficient for a given
   dataset, not something attempted here.
+
+---
+
+## Refinement pathways: primary vs. consensus, and how they interact
+
+CUBE runs cluster refinement through exactly **one** of two pathways per run, never both: the **primary path**
+(`refine_clusters_iterative()`), used when consensus clustering is off or its own attempt fails, and the
+**consensus path** (`refine_consensus_clusters()`, called from inside `consensus_cluster()`), used whenever
+`consensus_clustering_enabled` succeeds — this fully replaces the primary path's refinement call, logged as
+`[refine] this pass skipped for consensus labels`.
+
+Both share the exact same split logic — `split_impure_clusters()` (kinematic/silhouette-triggered) and
+`split_region_impure_clusters()` (region-triggered, opt-in) are one code path each, called identically from
+both pathways. They differ only in **merge**, and that difference is structural, not an inconsistency to fix:
+a consensus partition never comes from a single HDBSCAN fit, so it has no condensed tree for
+`merge_similar_clusters()` to read — `merge_by_coassociation()` (co-association-agreement based) is the
+closest available analogue, built from the same seeds-agreeing signal consensus clustering itself uses.
+
+| | Non-region-specific (default, always active) | Region-specific (opt-in, `hdbscan_region_split_enabled`) |
+|---|---|---|
+| Trigger | `hdbscan_split_silhouette_thresh` (default `0.2`) | `hdbscan_region_split_impurity_thresh` (`0.5`) + `min_minority_frac` (`0.15`) |
+| What it measures | Per-bin silhouette in embedding/feature space | Normalized Shannon entropy of traced-arena region distribution |
+| Candidate screening | Mean silhouette below threshold | Entropy ≥ threshold AND every minority region ≥ 15% |
+| What merge originally knew about it | Same signal family as the split criterion — no blind spot, a re-merge is a legitimate second opinion | Was a blind spot: neither merge function had any region signal at all |
+| Fix applied | Not needed — this criterion never had the problem | Region-aware merge guard (refuses a merge that would recreate impurity) + final terminal re-screen (backstop, no merge after) |
+| Behavior when region-splitting is off | Always active by default | Complete no-op — byte-identical to a run without the feature |
+
+**Why the fix needed two parts, not one.** The merge guard prevents the problem during the loop — cheaper, and
+stops wasted local-recluster effort from being thrown away by the very next merge. But it's a pairwise check;
+the terminal re-screen is kept as an independent backstop specifically so the delivered partition is verified
+once more, in full, right before pruning — not relying on the pairwise guard alone to have caught every
+combination across every iteration. Both are opt-in, gated identically behind
+`hdbscan_region_split_enabled=True AND region_per_bin is not None`, and reuse the *same* impurity
+threshold/minority floor — there is no separate "merge guard aggressiveness" or "re-screen sensitivity" knob
+to tune.
+
+**Everything above applies uniformly to both the primary and consensus pathways** — the merge guard is wired
+into both `merge_similar_clusters()` and `merge_by_coassociation()`, and the final re-screen is a single call
+site in `run()` positioned after whichever pathway actually executed, rather than being duplicated (and
+potentially drifting) inside each pathway's own function.
 
 ---
 
@@ -354,6 +397,21 @@ With `auto_bsoid = True`, completing the 3D DLC step automatically triggers Step
   when active; `cluster_hierarchy_*.png` gains an optional per-leaf region-composition bar and a star marker on
   clusters actually created by a region-aware split this run. Off by default — byte-identical output to a run
   without this feature. See `CUBE_ANALYSIS_METHODOLOGY.md` Section 7 for the full design rationale.
+- **Region-aware merge guard + final region-purity re-screen (Aug 2026, part of the same
+  `hdbscan_region_split_enabled` opt-in, no new config surface):** closes a gap the region-aware split above
+  could not see on its own — confirmed on a real run where the region screen found zero impure clusters, yet
+  the *delivered* partition contained a 5265-bin cluster at region entropy 0.687 (threshold 0.5) and an 18.3%
+  minority fraction (floor 0.15), created by a merge step that ran right after the one region screen and had
+  no spatial signal to check against. Fix, in two parts: (1) `merge_similar_clusters()` and
+  `merge_by_coassociation()` now refuse a candidate merge whose combined cluster would itself become a
+  region-split candidate — reusing the same impurity threshold/minority floor, no separate merge-side knob —
+  and thread the same guard into the local self-merge step used immediately after any local split, silhouette-
+  or region-triggered; (2) `BSoidEngine.run()` runs one more region-purity pass after all refinement finishes
+  and before rare-cluster pruning, with deliberately no merge afterward, as a backstop. Every accepted split
+  (both criteria, both pathways) is now logged with parent/child sizes and its eventual final id/size —
+  `model/split_merge_log.json` — so a cluster's split history and whether it survived pruning is auditable
+  after the run, not just inferable from log text. See "Refinement pathways" below for how this applies across
+  the primary and consensus paths, and `CUBE_ANALYSIS_METHODOLOGY.md` Section 7a for the full writeup.
 - **Adaptive parallel HDBSCAN sweep + system resource management (Aug 2026):** the primary `min_cluster_size`
   sweep (up to 40 steps × 2 methods) used to run as a plain sequential loop — most CPU cores sat idle for the
   majority of a run's wall-clock time. It dispatches via the same thread-pool pattern as `hdbscan_split_n_jobs`
@@ -764,7 +822,9 @@ Both Cluster Hierarchy and Guided Merge require `model/cluster_feature_centroids
 **Paradigm Results tab** (v6 part 3 — requires a run with Environmental Context tracing enabled; see "Environmental context & object interaction" below)
 - Surfaces `session_env_context.json`, the kinematics+env enriched bout sidecar, and `approach_events.csv` as seven sub-views: Generic, Y-Maze Alternation, Elevated Plus Maze, Discrimination Index, Sociability/Social Novelty, Place Preference/CPP, Approach/Avoid Events.
 - Auto-selects the sub-view matching the loaded session's traced paradigm; browsing to a mismatched sub-view (or a session with no environmental context data at all) shows a clear message instead of wrong/empty data — the tab itself is always present, its content is what's data-gated.
-- Every sub-view gets a 2D occupancy density heatmap (region/object outlines are an approximation — the convex hull of positions recorded as belonging to that region/object, since the traced shapes' own vertices aren't exported to any output file), a shared arena/region cluster-by-region and group-by-region cross-tab (grouped bar chart of % time each HDBSCAN cluster or experimental group spends in each named region), and every bar chart in the tab overlays each individual animal's own value as an unfilled ring on top of its group's bar.
+- Every sub-view gets a 2D occupancy density heatmap (region/object outlines are an approximation — the convex hull of positions recorded as belonging to that region/object, since the traced shapes' own vertices aren't exported to any output file), a shared arena/region group-by-region and cluster-by-region cross-tab, and every bar chart in the tab overlays each individual animal's own value as an unfilled ring on top of its group's bar. Outline labels are placed with a collision-avoidance pass (`_smart_outline_label_anchors`) so a nested/annular region (e.g. Open Field's Periphery, whose naive polygon centroid lands back at the arena center on top of Center's own label) gets pushed to a point actually inside that region instead of overlapping.
+- **Generic (Open Field) sub-view layout**: (1) a condensed heatmap+trajectory grid, one column per experimental group — pooled occupancy heatmap on top, the group's median-activity animal's raw track underneath, sharing one colorbar — instead of a single heatmap pooling every loaded animal regardless of group; (2) Group-by-region occupancy (the primary between-group comparison) immediately after; (3) a condensed single row of small activity/thigmotaxis-control bar charts (region time, total distance, center-zone entries) that used to each be a full-width figure; (4) center-zone time course and mean-speed distribution; (5) Cluster-by-region occupancy last. "Save Current Data as CSV" exports every underlying table (region cross-tabs, per-metric bar values, the representative-animal-per-group list) alongside "Save Current Graph(s)".
+- The Group-by-region and Cluster-by-region cross-tabs answer different questions and are normalized accordingly: Group-by-region is a per-group weighted-mean % of *that group's own* time spent in each region (does not sum to 100% across groups). Cluster-by-region is normalized so each region's bars sum to 100% *across* clusters — "of all the time animals spent in this region, what fraction went to each cluster" (`aggregate_region_time_share_by_label`), not the group chart's per-cluster question. When the user has merged clusters into named behavior groups via the Group Editor, the cluster-by-region chart reports under those group names/colors instead of raw cluster IDs (falling back to the same app-wide deterministic cluster-id→color mapping used in Unbiased Analytics/Cluster Hierarchy for any cluster left ungrouped).
 - Each paradigm-specific sub-view reports its primary index alongside a **mandatory activity/locomotor control metric** (e.g. total arm entries for Y-Maze/EPM, total exploration time for Discrimination Index, chamber entry frequency for Sociability) so an index difference can't be silently confounded with a general activity difference.
 - New one-sample-vs-reference statistical test (t-test or Wilcoxon signed-rank against a fixed value — chance level for Discrimination Index, zero for CPP's delta score), Benjamini-Hochberg FDR-corrected the same way as every other test in the app, shown with a dagger (†/††/†††) marker distinct from the pink/red star convention used for between-group comparisons.
 - Place Preference/CPP reuses the existing Experimental Design (Independent/Repeated Measures) and Group by controls for its paired pre/post comparison — no separate CPP-specific toggle.
@@ -841,6 +901,12 @@ Both Cluster Hierarchy and Guided Merge require `model/cluster_feature_centroids
                                               carries region_names/region_composition_frac/
                                               region_split_marked_ids when
                                               hdbscan_region_split_enabled=True
+    split_merge_log.json                    ← every accepted split (silhouette- or region-
+                                              triggered, primary or consensus path, including the
+                                              final region-purity re-screen): parent id/size, each
+                                              child's id/size, and the child's eventual FINAL
+                                              id/size after every later merge/split/prune/remap —
+                                              written whenever at least one split occurred this run
   validation_report.json                    ← run summary; gains a region_split block (cluster-
                                               count trace, clusters created) when
                                               hdbscan_region_split_enabled=True

@@ -375,6 +375,10 @@ def _is_hmm_file(p: pathlib.Path) -> bool:
     return "_hmm" in p.stem.lower()
 
 
+def _is_enriched_file(p: pathlib.Path) -> bool:
+    return "enriched" in p.stem.lower()
+
+
 def _prefer_hmm(files: list) -> list:
     """
     Given a mixed list of bout_lengths CSV paths, return HMM-smoothed versions
@@ -384,7 +388,15 @@ def _prefer_hmm(files: list) -> list:
     HMM set (so the analyser uses the temporally-smoothed labels).  If only
     some sessions have HMM files, still return the full HMM set (those sessions
     were processed with HMM; the others weren't).  Never return a mix.
+
+    *_bout_lengths_hmm_enriched.csv sidecars are always excluded here -- they
+    are a companion file for the base *_bout_lengths_hmm.csv (looked up via
+    find_enriched_bout_sidecar()/load_enriched_bout_sidecar()), never a
+    standalone session. Without this exclusion "_hmm" in _is_hmm_file() also
+    matches the enriched filename, so each animal would get loaded twice --
+    once from the plain _hmm.csv and once from the _hmm_enriched.csv.
     """
+    files = [p for p in files if not _is_enriched_file(p)]
     hmm_files = [p for p in files if _is_hmm_file(p)]
     raw_files  = [p for p in files if not _is_hmm_file(p)]
     if hmm_files:
@@ -18068,6 +18080,71 @@ def approximate_region_outline(cx: np.ndarray, cy: np.ndarray,
         return []
 
 
+def _smart_outline_label_anchors(outlines: list) -> dict:
+    """name -> (x, y) label anchor for each outline, pushed off the naive
+    polygon centroid whenever that centroid falls inside another outline's
+    polygon -- e.g. an annular 'Periphery' region's hull-vertex mean lands
+    right back at the arena center, on top of 'Center's own label, because
+    averaging points spread all the way around a ring reproduces the ring's
+    center rather than a point actually inside the ring. Shared by every
+    figure that overlays traced-arena outlines so a Center/Periphery-style
+    pair (or any nested-region pair) never renders with overlapping text."""
+    from matplotlib.path import Path as _MPath
+    polys = []
+    for name, kind, verts in (outlines or []):
+        if len(verts) < 3:
+            continue
+        vxs = [v[0] for v in verts]; vys = [v[1] for v in verts]
+        polys.append((name, verts, float(np.mean(vxs)), float(np.mean(vys))))
+    if not polys:
+        return {}
+    gx = float(np.mean([p[2] for p in polys]))
+    gy = float(np.mean([p[3] for p in polys]))
+    anchors = {}
+    for i, (name, verts, cx, cy) in enumerate(polys):
+        inside_other = False
+        for j, (_name2, verts2, _cx2, _cy2) in enumerate(polys):
+            if i == j:
+                continue
+            try:
+                if _MPath(verts2).contains_point((cx, cy)):
+                    inside_other = True
+                    break
+            except Exception:
+                continue
+        if inside_other:
+            # Push the label out toward this outline's own vertex farthest
+            # from the pooled centroid of every outline -- guaranteed to
+            # sit on/near this region's own ring rather than in the hole.
+            dists = [((vx - gx) ** 2 + (vy - gy) ** 2, vx, vy) for vx, vy in verts]
+            _, fx, fy = max(dists, key=lambda d: d[0])
+            cx = cx + 0.6 * (fx - cx)
+            cy = cy + 0.6 * (fy - cy)
+        anchors[name] = (cx, cy)
+    return anchors
+
+
+def _draw_region_outlines(ax, outlines: list, t: dict):
+    """Draw boundary/region/object outline polygons with non-overlapping
+    labels (see _smart_outline_label_anchors) -- shared by every spatial
+    plot builder that overlays traced-arena outlines."""
+    edge_color = "white" if t.get("mpl_style") == "dark_background" else "black"
+    _STYLE_BY_KIND = {"boundary": ("-", 2.0), "region": ("--", 1.4), "object": (":", 1.8)}
+    anchors = _smart_outline_label_anchors(outlines)
+    for name, kind, verts in (outlines or []):
+        if len(verts) < 3:
+            continue
+        ls, lw = _STYLE_BY_KIND.get(kind, ("-", 1.0))
+        poly = mpatches.Polygon(verts, closed=True, fill=False,
+                                 edgecolor=edge_color, linestyle=ls, linewidth=lw)
+        ax.add_patch(poly)
+        ax_, ay_ = anchors.get(name, (float(np.mean([v[0] for v in verts])),
+                                       float(np.mean([v[1] for v in verts]))))
+        ax.annotate(name, (ax_, ay_), color=t["tick"], fontsize=8, fontweight="bold",
+                    ha="center", va="center",
+                    path_effects=[_pe.withStroke(linewidth=2.4, foreground=t["ax_bg"])])
+
+
 def build_occupancy_heatmap_figure(xy_list: list, outlines: "list | None" = None,
                                     bins: int = 60, t: "dict | None" = None,
                                     title: str = "", smooth_sigma: float = 1.4
@@ -18147,17 +18224,7 @@ def build_occupancy_heatmap_figure(xy_list: list, outlines: "list | None" = None
             cax.axis("off")
             ax.text(0.5, 0.5, "Not enough position data", ha="center", va="center",
                     color=t["muted"], transform=ax.transAxes)
-        for name, kind, verts in (outlines or []):
-            if len(verts) < 3:
-                continue
-            ls, lw = _STYLE_BY_KIND.get(kind, ("-", 1.0))
-            poly = mpatches.Polygon(verts, closed=True, fill=False,
-                                     edgecolor=edge_color, linestyle=ls, linewidth=lw)
-            ax.add_patch(poly)
-            vxs = [v[0] for v in verts]; vys = [v[1] for v in verts]
-            ax.annotate(name, (float(np.mean(vxs)), float(np.mean(vys))),
-                        color=t["tick"], fontsize=8, ha="center", va="center",
-                        path_effects=[_pe.withStroke(linewidth=2, foreground=t["ax_bg"])])
+        _draw_region_outlines(ax, outlines, t)
         ax.set_title(title, color=t["tick"], fontsize=12)
         ax.tick_params(colors=t["tick"])
         for spine in ax.spines.values():
@@ -18167,6 +18234,131 @@ def build_occupancy_heatmap_figure(xy_list: list, outlines: "list | None" = None
         except Exception:
             pass
         fig.tight_layout()
+    return fig
+
+
+def build_group_heatmap_trace_figure(group_xy: dict, group_median: dict,
+                                      outlines: "list | None" = None,
+                                      t: "dict | None" = None,
+                                      group_colors: "dict | None" = None,
+                                      bins: int = 50, smooth_sigma: float = 1.4
+                                      ) -> "plt.Figure":
+    """Condensed occupancy heatmap + representative-trajectory grid, one
+    column per experimental group -- mirrors the reference publication's
+    Track Map / Heat Map figure (row 1 = median-activity animal's raw
+    trajectory, row 2 = pooled occupancy heatmap for that group), instead
+    of a single pooled-cohort heatmap plus a separate untethered trace
+    figure.
+
+    group_xy     : {group_name: [(x_array, y_array), ...]} -- every
+      session's centroid track for that group, pooled for the heatmap.
+    group_median : {group_name: (x_array, y_array, animal_name)} -- the
+      single representative (median-activity) animal's own track for the
+      trace row.
+    """
+    if t is None:
+        t = T()
+    group_colors = group_colors or {}
+    egs = list(group_xy.keys())
+    n = max(len(egs), 1)
+    edge_color = "white" if t.get("mpl_style") == "dark_background" else "black"
+    _STYLE_BY_KIND = {"boundary": ("-", 2.0), "region": ("--", 1.4), "object": (":", 1.8)}
+
+    with plt.style.context(t["mpl_style"]):
+        fig = plt.figure(figsize=(max(3.0 * n, 4.0) + 0.9, 6.6), facecolor=t["fig_bg"])
+        gs = GridSpec(2, n + 1, figure=fig, width_ratios=[6] * n + [0.3],
+                      hspace=0.22, wspace=0.10)
+
+        hists = {}
+        vmax_global = 0.0
+        for eg in egs:
+            pairs = group_xy.get(eg) or []
+            xs_all = [np.asarray(x, dtype=float) for x, _y in pairs]
+            ys_all = [np.asarray(y, dtype=float) for _x, y in pairs]
+            xs = np.concatenate(xs_all) if xs_all else np.array([])
+            ys = np.concatenate(ys_all) if ys_all else np.array([])
+            m = np.isfinite(xs) & np.isfinite(ys)
+            xs, ys = xs[m], ys[m]
+            if len(xs) >= 2:
+                h, xe, ye = np.histogram2d(xs, ys, bins=bins)
+                h = h.T
+                try:
+                    from scipy.ndimage import gaussian_filter as _gfilt
+                    h = _gfilt(h, sigma=smooth_sigma, mode="nearest")
+                except ImportError:
+                    pass
+                tot = h.sum()
+                if tot > 0:
+                    h = h / tot
+                nz = h[h > 0]
+                if nz.size:
+                    vmax_global = max(vmax_global, float(np.percentile(nz, 99)))
+                hists[eg] = (h, xe, ye)
+            else:
+                hists[eg] = (None, None, None)
+
+        im_ref = None
+        for i, eg in enumerate(egs):
+            ax = fig.add_subplot(gs[0, i])
+            ax.set_facecolor(t["ax_bg"])
+            h, xe, ye = hists.get(eg, (None, None, None))
+            if h is not None:
+                im_ref = ax.imshow(h, origin="lower", extent=[xe[0], xe[-1], ye[0], ye[-1]],
+                                    aspect="auto", cmap="viridis", vmin=0,
+                                    vmax=vmax_global or None, interpolation="bilinear")
+            else:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                        color=t["muted"], transform=ax.transAxes)
+            _draw_region_outlines(ax, outlines, t)
+            ax.set_title(str(eg), color=group_colors.get(eg, t["tick"]),
+                         fontsize=11, fontweight="bold")
+            ax.set_xticks([]); ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_color(t["spine"])
+            try:
+                ax.set_aspect("equal", adjustable="box")
+            except Exception:
+                pass
+            if i == 0:
+                ax.set_ylabel("Heat Map", color=t["tick"], fontsize=10)
+
+        if im_ref is not None:
+            cax = fig.add_subplot(gs[0, n])
+            cb = fig.colorbar(im_ref, cax=cax)
+            cb.set_label("Relative occupancy", color=t["tick"], fontsize=8)
+            cb.ax.yaxis.set_tick_params(color=t["tick"], labelsize=7)
+            plt.setp(cb.ax.get_yticklabels(), color=t["tick"])
+
+        for i, eg in enumerate(egs):
+            ax = fig.add_subplot(gs[1, i])
+            ax.set_facecolor(t["ax_bg"])
+            med = group_median.get(eg)
+            if med:
+                x, y, name = med
+                ax.plot(x, y, color=group_colors.get(eg, "#9370DB"), linewidth=0.6, alpha=0.85)
+                ax.set_xlabel(name, color=t["muted"], fontsize=8)
+            else:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center",
+                        color=t["muted"], transform=ax.transAxes)
+            for _name, kind, verts in (outlines or []):
+                if len(verts) < 3:
+                    continue
+                ls, lw = _STYLE_BY_KIND.get(kind, ("-", 1.0))
+                poly = mpatches.Polygon(verts, closed=True, fill=False,
+                                         edgecolor=edge_color, linestyle=ls, linewidth=lw * 0.8)
+                ax.add_patch(poly)
+            ax.set_xticks([]); ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_color(t["spine"])
+            try:
+                ax.set_aspect("equal", adjustable="box")
+            except Exception:
+                pass
+            if i == 0:
+                ax.set_ylabel("Track Map", color=t["tick"], fontsize=10)
+
+        fig.suptitle("Occupancy heatmap and representative trajectory by group",
+                      color=t["tick"], fontsize=13)
     return fig
 
 
@@ -18185,24 +18377,12 @@ def build_approach_avoid_trajectory_figure(events_with_xy: list, outlines: "list
     """
     if t is None:
         t = T()
-    edge_color = "white" if t.get("mpl_style") == "dark_background" else "black"
-    _STYLE_BY_KIND = {"boundary": ("-", 2.0), "region": ("--", 1.4), "object": (":", 1.8)}
     class_colors = {"approach": "#59A14F", "avoid": "#E15759"}
 
     with plt.style.context(t["mpl_style"]):
         fig, ax = plt.subplots(figsize=(7.2, 6.2), facecolor=t["fig_bg"])
         ax.set_facecolor(t["ax_bg"])
-        for name, kind, verts in (outlines or []):
-            if len(verts) < 3:
-                continue
-            ls, lw = _STYLE_BY_KIND.get(kind, ("-", 1.0))
-            poly = mpatches.Polygon(verts, closed=True, fill=False,
-                                     edgecolor=edge_color, linestyle=ls, linewidth=lw)
-            ax.add_patch(poly)
-            vxs = [v[0] for v in verts]; vys = [v[1] for v in verts]
-            ax.annotate(name, (float(np.mean(vxs)), float(np.mean(vys))),
-                        color=t["tick"], fontsize=8, ha="center", va="center",
-                        path_effects=[_pe.withStroke(linewidth=2, foreground=t["ax_bg"])])
+        _draw_region_outlines(ax, outlines, t)
         if events_with_xy:
             for x0, y0, x1, y1, cls, _tgt in events_with_xy:
                 ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
@@ -18308,11 +18488,47 @@ def aggregate_region_time_by_label_and_animal(rows: list, region_names: list) ->
     return out
 
 
+def aggregate_region_time_share_by_label(rows: list, region_names: list) -> dict:
+    """Per-region composition (NOT aggregate_region_time_by_label's
+    per-label weighted mean): of all the time any label's bouts spent in
+    region R, pooled across every label, what percent belongs to each
+    label -- so each region's bars sum to 100% across labels, answering
+    "of the time animals spent in the Center, what fraction was cluster
+    7 doing?" rather than "of cluster 7's own time, what fraction was in
+    the Center?" (a different, non-summing question).
+
+    rows : same shape as aggregate_region_time_by_label's rows.
+    Returns {label: {region_name: pct_of_region_total}}; a region whose
+    pooled total across every label is <= 0 contributes 0.0 for every
+    label at that region, not NaN.
+    """
+    abs_time: dict = {}
+    region_totals = {rn: 0.0 for rn in region_names}
+    for r in rows or []:
+        lbl = r.get("label")
+        w = float(r.get("run_length", 0.0) or 0.0)
+        if w <= 0:
+            continue
+        pct = r.get("pct_time_in_region") or {}
+        acc = abs_time.setdefault(lbl, {rn: 0.0 for rn in region_names})
+        for rn in region_names:
+            share = w * float(pct.get(rn, 0.0) or 0.0)
+            acc[rn] += share
+            region_totals[rn] += share
+    out = {}
+    for lbl, acc in abs_time.items():
+        out[lbl] = {rn: (acc[rn] / region_totals[rn] * 100.0
+                          if region_totals.get(rn, 0.0) > 0 else 0.0)
+                    for rn in region_names}
+    return out
+
+
 def build_region_crosstab_figure(agg: dict, region_names: list,
                                   color_map: "dict | None" = None,
                                   t: "dict | None" = None, title: str = "",
                                   legend_title: str = "Cluster",
-                                  per_animal: "dict | None" = None) -> "plt.Figure":
+                                  per_animal: "dict | None" = None,
+                                  ylabel: str = "% time in region") -> "plt.Figure":
     """Grouped bar chart: x = region, one bar series per label (cluster id
     or exp_group), y = weighted-mean % time in that region. Shared by every
     sub-view per the plan's "Arena/region-based cluster and group analysis"
@@ -18370,7 +18586,7 @@ def build_region_crosstab_figure(agg: dict, region_names: list,
         else:
             ax.text(0.5, 0.5, "No region data", ha="center", va="center",
                     color=t["muted"], transform=ax.transAxes)
-        ax.set_ylabel("% time in region", color=t["tick"])
+        ax.set_ylabel(ylabel, color=t["tick"])
         ax.set_title(title, color=t["tick"], fontsize=12)
         ax.tick_params(colors=t["tick"])
         for side in ("top", "right"):
@@ -18741,13 +18957,29 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         "place_preference": "Place Preference / CPP",
     }
 
-    def __init__(self, parent, get_animals_fn, get_eg_colors_fn=None, **kw):
+    def __init__(self, parent, get_animals_fn, get_eg_colors_fn=None,
+                 get_groups_fn=None, open_color_editor_fn=None, **kw):
         super().__init__(parent, fg_color=T()["panel"], **kw)
         self._get_animals    = get_animals_fn
         self._get_eg_colors  = get_eg_colors_fn or (lambda: {})
+        # Opens the SAME "Experimental Group Colors" dialog AnimalListPanel
+        # exposes elsewhere -- every plot in this panel already reads
+        # colors through get_eg_colors_fn, so editing them here (rather
+        # than sending the user hunting for the control in another tab)
+        # keeps ground rule 6 (one color per group, everywhere) without a
+        # second, independent color-picker implementation.
+        self._open_color_editor = open_color_editor_fn
+        # get_groups_fn: () -> {group_name: {"labels": [cluster_id, ...],
+        # "color": str}} -- the SAME user-defined behavior-group mapping
+        # from the Group Editor that UnbiasedAnalyticsPanel/Behavioral
+        # Explorer expose (get_groups_fn elsewhere in this file), so the
+        # cluster-by-region chart shows merged, named behavior groups when
+        # the user has defined them, not raw HDBSCAN cluster IDs only.
+        self._get_groups     = get_groups_fn or (lambda: {})
         self._current_figs   = []
         self._auto_selected  = False
         self._sessions: list = []   # cached per-session loaded data (see _load_sessions)
+        self._export_tables: list = []   # [(filename_stem, DataFrame), ...] for current view
 
         self.columnconfigure(0, weight=0, minsize=280)
         self.columnconfigure(1, weight=1)
@@ -18811,7 +19043,12 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         ctk.CTkButton(ac, text="Refresh from Loaded Sessions",
                       command=self.refresh).pack(padx=12, pady=(2, 4), fill="x")
         ctk.CTkButton(ac, text="Save Current Graph(s)",
-                      command=self._save_current_graphs).pack(padx=12, pady=(2, 8), fill="x")
+                      command=self._save_current_graphs).pack(padx=12, pady=(2, 4), fill="x")
+        ctk.CTkButton(ac, text="Save Current Data as CSV",
+                      command=self._save_current_data_csv).pack(padx=12, pady=(2, 4), fill="x")
+        if self._open_color_editor is not None:
+            ctk.CTkButton(ac, text="Edit Group Colors...",
+                          command=self._on_edit_colors).pack(padx=12, pady=(2, 8), fill="x")
 
         doc = section("About this metric")
         self._doc_box = ctk.CTkTextbox(doc, height=140, width=250, wrap="word",
@@ -18913,6 +19150,37 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         except Exception as exc:
             messagebox.showerror("Save Error", str(exc))
 
+    def _on_edit_colors(self):
+        # The color-editor dialog is non-modal (a Toplevel with its own
+        # Apply button) -- it returns immediately, before the user has
+        # actually picked/applied anything, so re-rendering right here
+        # would just redraw with the unchanged colors. Re-render on the
+        # next explicit Refresh instead, once Apply has actually run.
+        if self._open_color_editor is not None:
+            self._open_color_editor()
+
+    def _save_current_data_csv(self):
+        """Dump every underlying data table behind the currently-rendered
+        sub-view (populated into self._export_tables by each _render_*
+        method as it builds its figures) to one CSV per table."""
+        if not self._export_tables:
+            messagebox.showwarning("No data", "Generate a sub-view first.")
+            return
+        mode = self._view_var.get().replace("/", "_").replace(" ", "_").lower()
+        d = filedialog.askdirectory(title="Save Current Data To Folder")
+        if not d:
+            return
+        try:
+            n = 0
+            for name, df in self._export_tables:
+                if df is None or df.empty:
+                    continue
+                df.to_csv(str(pathlib.Path(d) / f"paradigm_{mode}_{name}.csv"), index=False)
+                n += 1
+            messagebox.showinfo("Saved", f"{n} CSV file(s) saved to:\n{d}")
+        except Exception as exc:
+            messagebox.showerror("Save Error", str(exc))
+
     # ── Data loading (checkpoint b) ─────────────────────────────────────
 
     def _group_by_key(self) -> str:
@@ -18993,6 +19261,7 @@ class ParadigmResultsPanel(ctk.CTkFrame):
 
     def _render_current_view(self):
         self._refresh_doc_box()
+        self._export_tables = []
         view = self._view_var.get()
         with_env = [s for s in self._sessions if s["env_ctx"]]
         if not with_env:
@@ -19047,6 +19316,51 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                 out.append((np.asarray(cx, dtype=float), np.asarray(cy, dtype=float)))
         return out
 
+    def _group_xy(self, sessions: list) -> dict:
+        """{exp_group: [(x_array, y_array), ...]} -- every session's own
+        centroid track, bucketed by experimental group, for a per-group
+        occupancy heatmap (as many heatmaps as there are groups) instead of
+        one heatmap pooling every loaded animal regardless of group."""
+        out: dict = {}
+        for s in sessions:
+            pb = (s["env_ctx"] or {}).get("per_bin", {})
+            cx, cy = pb.get("centroid_x"), pb.get("centroid_y")
+            if cx and cy:
+                out.setdefault(s["exp_group"], []).append(
+                    (np.asarray(cx, dtype=float), np.asarray(cy, dtype=float)))
+        return out
+
+    def _median_animal_xy(self, sessions: list) -> dict:
+        """{exp_group: (x_array, y_array, animal_name)} for the median-
+        activity animal in each group -- "median" ranked by total distance
+        traveled (path_length_px, when the kinematics sidecar is present)
+        or, failing that, by number of tracked bins -- a representative,
+        typical trajectory per the reference figure's "Representative
+        images ... typical examples of exploratory behavior" convention,
+        not the single most/least active animal."""
+        by_group: dict = {}
+        for s in sessions:
+            by_group.setdefault(s["exp_group"], []).append(s)
+
+        def _activity_metric(s):
+            df = s.get("enriched")
+            if df is not None and not df.empty and "path_length_px" in df.columns:
+                return float(df["path_length_px"].sum())
+            pb = (s["env_ctx"] or {}).get("per_bin", {})
+            cx = pb.get("centroid_x")
+            return float(len(cx)) if cx else 0.0
+
+        out = {}
+        for eg, sess_list in by_group.items():
+            ranked = sorted(sess_list, key=_activity_metric)
+            med = ranked[len(ranked) // 2]
+            pb = (med["env_ctx"] or {}).get("per_bin", {})
+            cx, cy = pb.get("centroid_x"), pb.get("centroid_y")
+            if cx and cy:
+                out[eg] = (np.asarray(cx, dtype=float), np.asarray(cy, dtype=float),
+                           med.get("name") or "")
+        return out
+
     def _region_outlines(self, sessions: list) -> list:
         """Approximate outlines (see build_occupancy_heatmap_figure's module
         note) for every named region across the given sessions, pooled."""
@@ -19070,7 +19384,7 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                     np.asarray(cx_all, dtype=float), np.asarray(cy_all, dtype=float),
                     np.asarray(mask_all, dtype=bool))
                 if verts:
-                    outlines.append((f"{rn} (approx.)", "region", verts))
+                    outlines.append((rn, "region", verts))
         return outlines
 
     def _region_names(self, sessions: list) -> list:
@@ -19080,7 +19394,22 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                          .get("time_in_region_sec", {}).keys())
         return sorted(names)
 
+    def _cid_to_group_map(self) -> dict:
+        """cluster_id -> (group_name, color) from the Group Editor's
+        user-defined behavior groups, when any are currently defined --
+        the same mapping UnbiasedAnalyticsPanel uses (~L2602-2606) so a
+        cluster that has been merged into a named behavior group is
+        reported here under that group's name/color too, rather than as a
+        bare, ungrouped cluster ID that silently ignores the merge."""
+        groups = self._get_groups() or {}
+        out = {}
+        for gname, ginfo in groups.items():
+            for cid in ginfo.get("labels", []):
+                out[cid] = (gname, ginfo.get("color"))
+        return out
+
     def _crosstab_rows_by_cluster(self, sessions: list) -> list:
+        cid_to_group = self._cid_to_group_map()
         rows = []
         for s in sessions:
             df = s["enriched"]
@@ -19089,7 +19418,9 @@ class ParadigmResultsPanel(ctk.CTkFrame):
             region_cols = [c for c in df.columns if c.startswith("pct_time_in_region_")]
             for _, r in df.iterrows():
                 pct = {c[len("pct_time_in_region_"):]: r[c] for c in region_cols}
-                rows.append({"label": int(r.get("B-SOiD labels", -1)),
+                cid = int(r.get("B-SOiD labels", -1))
+                label = cid_to_group[cid][0] if cid in cid_to_group else cid
+                rows.append({"label": label,
                              "animal": s["name"],
                              "run_length": float(r.get("Run lengths", 0.0)),
                              "pct_time_in_region": pct})
@@ -19110,36 +19441,85 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                              "pct_time_in_region": pct})
         return rows
 
-    def _region_crosstab_figs(self, sessions: list, t: dict) -> list:
-        """The shared arena/region cluster-by-region and group-by-region
-        cross-tabs every sub-view gets, per the plan (built once here, not
-        re-implemented per sub-view)."""
+    @staticmethod
+    def _crosstab_to_dataframe(agg: dict, region_names: list) -> pd.DataFrame:
+        rows = [{"label": lbl, **{rn: agg[lbl].get(rn, 0.0) for rn in region_names}}
+                for lbl in agg]
+        return pd.DataFrame(rows)
+
+    def _group_region_crosstab_fig(self, sessions: list, t: dict) -> "plt.Figure | None":
         region_names = self._region_names(sessions)
         if not region_names:
-            return []
-        figs = []
-        cl_rows = self._crosstab_rows_by_cluster(sessions)
-        cl_agg = aggregate_region_time_by_label(cl_rows, region_names)
-        if cl_agg:
-            # _cluster_identity_color: the same deterministic cid -> color
-            # mapping used app-wide (cube_analyser.py ~L3623, mirrors
-            # cube_core.py's _cmap) -- NOT an order-dependent PALETTE index,
-            # so a cluster's color here matches Unbiased Analytics/Cluster
-            # Hierarchy for the same loaded session.
-            cl_color_map = {cid: _cluster_identity_color(cid) for cid in cl_agg}
-            cl_per_animal = aggregate_region_time_by_label_and_animal(cl_rows, region_names)
-            figs.append(build_region_crosstab_figure(
-                cl_agg, region_names, color_map=cl_color_map, t=t,
-                legend_title="Cluster", per_animal=cl_per_animal,
-                title="Cluster-by-region occupancy (% time)"))
+            return None
         grp_rows = self._crosstab_rows_by_group(sessions)
         grp_agg = aggregate_region_time_by_label(grp_rows, region_names)
-        if grp_agg:
-            grp_per_animal = aggregate_region_time_by_label_and_animal(grp_rows, region_names)
-            figs.append(build_region_crosstab_figure(
-                grp_agg, region_names, color_map=self._eg_color_map(sessions),
-                t=t, legend_title="Group", per_animal=grp_per_animal,
-                title="Group-by-region occupancy (% time)"))
+        if not grp_agg:
+            return None
+        grp_per_animal = aggregate_region_time_by_label_and_animal(grp_rows, region_names)
+        fig = build_region_crosstab_figure(
+            grp_agg, region_names, color_map=self._eg_color_map(sessions),
+            t=t, legend_title="Group", per_animal=grp_per_animal,
+            title="Group-by-region occupancy (% time)",
+            ylabel="% of group's own time in region")
+        self._export_tables.append(("group_by_region_occupancy",
+                                     self._crosstab_to_dataframe(grp_agg, region_names)))
+        return fig
+
+    def _cluster_region_crosstab_fig(self, sessions: list, t: dict) -> "plt.Figure | None":
+        """Normalized so each region's bars sum to 100% across clusters/
+        behavior groups -- 'of all the time spent in this region, what
+        fraction went to each cluster' -- NOT the Group-by-region chart's
+        per-label weighted-mean %-of-own-time, which answers a different
+        question and does not sum to anything meaningful across clusters.
+        See aggregate_region_time_share_by_label. Cluster IDs the user has
+        merged into a named behavior group via the Group Editor are
+        reported under that group's name/color (see _cid_to_group_map);
+        clusters left ungrouped fall back to the raw cluster ID and the
+        same app-wide deterministic cid -> color mapping (_cluster_identity_
+        color) used in Unbiased Analytics/Cluster Hierarchy."""
+        region_names = self._region_names(sessions)
+        if not region_names:
+            return None
+        cl_rows = self._crosstab_rows_by_cluster(sessions)
+        cl_share = aggregate_region_time_share_by_label(cl_rows, region_names)
+        if not cl_share:
+            return None
+        cid_to_group = self._cid_to_group_map()
+        group_colors = {}
+        for gname, color in cid_to_group.values():
+            group_colors[gname] = color
+        cl_color_map = {}
+        for lbl in cl_share:
+            if lbl in group_colors:
+                cl_color_map[lbl] = group_colors[lbl]
+            elif isinstance(lbl, int):
+                cl_color_map[lbl] = _cluster_identity_color(lbl)
+            else:
+                cl_color_map[lbl] = PALETTE[hash(str(lbl)) % len(PALETTE)]
+        legend_title = ("Behavior Group" if any(not isinstance(l, int) for l in cl_share)
+                         else "Cluster")
+        fig = build_region_crosstab_figure(
+            cl_share, region_names, color_map=cl_color_map, t=t,
+            legend_title=legend_title,
+            title="Cluster-by-region occupancy (% of region's total time)",
+            ylabel="% of region's total time")
+        self._export_tables.append(("cluster_by_region_occupancy",
+                                     self._crosstab_to_dataframe(cl_share, region_names)))
+        return fig
+
+    def _region_crosstab_figs(self, sessions: list, t: dict) -> list:
+        """The shared arena/region group-by-region and cluster-by-region
+        cross-tabs every sub-view gets, per the plan (built once here, not
+        re-implemented per sub-view). Group-by-region first -- it answers
+        the primary between-group comparison question; cluster-by-region is
+        the finer-grained behavioral breakdown underneath it."""
+        figs = []
+        grp_fig = self._group_region_crosstab_fig(sessions, t)
+        if grp_fig is not None:
+            figs.append(grp_fig)
+        cl_fig = self._cluster_region_crosstab_fig(sessions, t)
+        if cl_fig is not None:
+            figs.append(cl_fig)
         return figs
 
     # ── Data-prep helpers for the new time-course/distribution/paired plots
@@ -19423,14 +19803,18 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                 i += 1
         return color_map
 
-    def _index_bar_fig(self, sessions: list, value_fn, ylabel: str, title: str,
-                        t: dict, one_sample_ref: "float | None" = None,
-                        use_wilcoxon: bool = False) -> "tuple[plt.Figure, dict]":
-        """Generic bar-per-group index chart with between-group significance
-        brackets (draw_sig_brackets, existing visual language) and, when
+    def _draw_index_bar(self, ax, sessions: list, value_fn, ylabel: str, title: str,
+                         t: dict, one_sample_ref: "float | None" = None,
+                         use_wilcoxon: bool = False, fontsize: int = 12,
+                         tick_fontsize: int = 10) -> dict:
+        """Draw one bar-per-group index chart onto an existing axis, with
+        between-group significance brackets (draw_sig_brackets) and, when
         one_sample_ref is given, one-sample-vs-reference dagger markers
-        (draw_one_sample_markers) layered on top -- visually distinct per
-        the plan's verification requirement. Returns (figure, group_values)."""
+        (draw_one_sample_markers) layered on top. Factored out of
+        _index_bar_fig so the same drawing logic can target either its own
+        full-size figure or one narrow subplot in a condensed row (see
+        _condensed_bar_row_fig) -- both need identical bars/points/
+        brackets, just at different sizes. Returns group_values."""
         eg_colors = self._eg_color_map(sessions)
         group_values: dict = {}
         for s in sessions:
@@ -19439,132 +19823,193 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                 continue
             group_values.setdefault(s["exp_group"], []).append(float(val))
         egs = [eg for eg in eg_colors if eg in group_values]
+        ax.set_facecolor(t["ax_bg"])
+        ax.set_axisbelow(True)
+        ax.grid(axis="y", color=t["spine"], alpha=0.35, linewidth=0.7)
+        means = [float(np.mean(group_values[eg])) for eg in egs]
+        sems = [float(np.std(group_values[eg], ddof=1) / max(len(group_values[eg]), 1) ** 0.5)
+                if len(group_values[eg]) > 1 else 0.0 for eg in egs]
+        ax.bar(range(len(egs)), means, yerr=sems,
+               color=[eg_colors[eg] for eg in egs], alpha=0.82, capsize=4,
+               edgecolor=t["ax_bg"], linewidth=0.8,
+               error_kw=dict(ecolor=t["tick"], elinewidth=1.1))
+        # Individual per-animal points as unfilled rings -- same jittered-
+        # overlay convention as Unbiased Analytics' build_top_n_barplot.
+        # Edge uses the theme's tick color rather than the group color: a
+        # same-hue ring on a same-hue bar loses contrast entirely once the
+        # point sits below the bar's own height (found by rendering this
+        # exact case during QA) -- a neutral edge stays visible regardless
+        # of what's underneath it.
+        rng = np.random.default_rng(7)
+        for ei, eg in enumerate(egs):
+            pts = group_values[eg]
+            jit = rng.uniform(-0.12, 0.12, len(pts))
+            ax.scatter(ei + jit, pts, facecolors="none", edgecolors=t["tick"],
+                       s=22, linewidths=0.8, alpha=0.95, zorder=4)
+        ax.set_xticks(range(len(egs)))
+        ax.set_xticklabels(egs, color=t["tick"], rotation=20, ha="right",
+                            fontsize=tick_fontsize)
+        if one_sample_ref is not None:
+            ax.axhline(one_sample_ref, color=t["muted"], linestyle="--", linewidth=1)
+        # Headroom from the ACTUAL data extent (bars+SEM and every
+        # individual point, not just the bars) so the scatter overlay above
+        # never collides with a sig-bracket, one-sample marker, or title.
+        all_pts = [group_values[eg] for eg in egs]
+        data_ceil = max([m + se for m, se in zip(means, sems)]
+                         + [max(pts) for pts in all_pts if pts] + [1e-9])
+        data_floor = min([m - se for m, se in zip(means, sems)]
+                          + [min(pts) for pts in all_pts if pts] + [0.0])
+        span = max(data_ceil - data_floor, 1e-9)
+        bracket_top = data_ceil
+        if len(egs) > 1:
+            bracket_top = draw_sig_brackets(
+                ax, egs, [group_values[eg] for eg in egs],
+                y_start=data_ceil + span * 0.08, y_step=span * 0.12,
+                tick_color=t["tick"])
+        if one_sample_ref is not None:
+            os_df = run_one_sample_statistics(group_values, ref=one_sample_ref,
+                                               use_wilcoxon=use_wilcoxon)
+            draw_one_sample_markers(ax, egs, os_df,
+                                    [m + se + span * 0.03 for m, se in zip(means, sems)])
+        head_top = max(data_ceil + span * 0.35, bracket_top + span * 0.15)
+        ax.set_ylim(bottom=data_floor - span * 0.08, top=head_top)
+        ax.set_ylabel(ylabel, color=t["tick"], fontsize=tick_fontsize)
+        ax.set_title(title, color=t["tick"], fontsize=fontsize)
+        ax.tick_params(colors=t["tick"], labelsize=tick_fontsize)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(t["spine"])
+        return group_values
+
+    def _index_bar_fig(self, sessions: list, value_fn, ylabel: str, title: str,
+                        t: dict, one_sample_ref: "float | None" = None,
+                        use_wilcoxon: bool = False) -> "tuple[plt.Figure, dict]":
+        """Full-size single-metric bar chart -- see _draw_index_bar."""
+        eg_colors = self._eg_color_map(sessions)
+        n_egs = len({s["exp_group"] for s in sessions if s["exp_group"] in eg_colors}) or 1
         with plt.style.context(t["mpl_style"]):
-            fig, ax = plt.subplots(figsize=(max(4.5, len(egs) * 1.3), 4.5),
+            fig, ax = plt.subplots(figsize=(max(4.5, n_egs * 1.3), 4.5),
                                     facecolor=t["fig_bg"])
-            ax.set_facecolor(t["ax_bg"])
-            ax.set_axisbelow(True)
-            ax.grid(axis="y", color=t["spine"], alpha=0.35, linewidth=0.7)
-            means = [float(np.mean(group_values[eg])) for eg in egs]
-            sems = [float(np.std(group_values[eg], ddof=1) / max(len(group_values[eg]), 1) ** 0.5)
-                    if len(group_values[eg]) > 1 else 0.0 for eg in egs]
-            ax.bar(range(len(egs)), means, yerr=sems,
-                   color=[eg_colors[eg] for eg in egs], alpha=0.82, capsize=4,
-                   edgecolor=t["ax_bg"], linewidth=0.8,
-                   error_kw=dict(ecolor=t["tick"], elinewidth=1.1))
-            # Individual per-animal points as unfilled rings -- same
-            # jittered-overlay convention as Unbiased Analytics'
-            # build_top_n_barplot (~cube_analyser.py:3841-3851), retrofitted
-            # here so it applies tab-wide since every single-metric bar
-            # chart in Paradigm Results goes through this one shared
-            # builder. Edge uses the theme's tick color rather than the
-            # group color: a same-hue ring on a same-hue bar loses contrast
-            # entirely once the point sits below the bar's own height
-            # (found by rendering this exact case during QA) -- a neutral
-            # edge stays visible regardless of what's underneath it.
-            rng = np.random.default_rng(7)
-            for ei, eg in enumerate(egs):
-                pts = group_values[eg]
-                jit = rng.uniform(-0.12, 0.12, len(pts))
-                ax.scatter(ei + jit, pts, facecolors="none", edgecolors=t["tick"],
-                           s=22, linewidths=0.8, alpha=0.95, zorder=4)
-            ax.set_xticks(range(len(egs)))
-            ax.set_xticklabels(egs, color=t["tick"], rotation=20, ha="right")
-            if one_sample_ref is not None:
-                ax.axhline(one_sample_ref, color=t["muted"], linestyle="--", linewidth=1)
-            # Headroom from the ACTUAL data extent (bars+SEM and every
-            # individual point, not just the bars) so the new scatter
-            # overlay above never collides with a sig-bracket, one-sample
-            # marker, or the title.
-            all_pts = [group_values[eg] for eg in egs]
-            data_ceil = max([m + se for m, se in zip(means, sems)]
-                             + [max(pts) for pts in all_pts if pts] + [1e-9])
-            data_floor = min([m - se for m, se in zip(means, sems)]
-                              + [min(pts) for pts in all_pts if pts] + [0.0])
-            span = max(data_ceil - data_floor, 1e-9)
-            bracket_top = data_ceil
-            if len(egs) > 1:
-                bracket_top = draw_sig_brackets(
-                    ax, egs, [group_values[eg] for eg in egs],
-                    y_start=data_ceil + span * 0.08, y_step=span * 0.12,
-                    tick_color=t["tick"])
-            if one_sample_ref is not None:
-                os_df = run_one_sample_statistics(group_values, ref=one_sample_ref,
-                                                   use_wilcoxon=use_wilcoxon)
-                draw_one_sample_markers(ax, egs, os_df,
-                                        [m + se + span * 0.03 for m, se in zip(means, sems)])
-            head_top = max(data_ceil + span * 0.35, bracket_top + span * 0.15)
-            ax.set_ylim(bottom=data_floor - span * 0.08, top=head_top)
-            ax.set_ylabel(ylabel, color=t["tick"])
-            ax.set_title(title, color=t["tick"], fontsize=12)
-            ax.tick_params(colors=t["tick"])
-            for side in ("top", "right"):
-                ax.spines[side].set_visible(False)
-            for side in ("left", "bottom"):
-                ax.spines[side].set_color(t["spine"])
+            group_values = self._draw_index_bar(
+                ax, sessions, value_fn, ylabel, title, t,
+                one_sample_ref=one_sample_ref, use_wilcoxon=use_wilcoxon)
             fig.tight_layout()
         return fig, group_values
+
+    def _condensed_bar_row_fig(self, sessions: list, metric_specs: list,
+                                t: dict, suptitle: str = "") -> "plt.Figure":
+        """One row of small, narrow bar-index subplots -- e.g. Center-zone
+        entries / Region time / Total distance, which used to each get a
+        full-width figure of their own. metric_specs is a list of
+        (value_fn, ylabel, title, one_sample_ref) tuples, one per subplot."""
+        n = max(len(metric_specs), 1)
+        with plt.style.context(t["mpl_style"]):
+            fig, axes = plt.subplots(1, n, figsize=(max(2.6 * n, 3.2), 3.4),
+                                      facecolor=t["fig_bg"])
+            if n == 1:
+                axes = [axes]
+            for ax, (value_fn, ylabel, title, one_sample_ref) in zip(axes, metric_specs):
+                self._draw_index_bar(ax, sessions, value_fn, ylabel, title, t,
+                                      one_sample_ref=one_sample_ref,
+                                      fontsize=10, tick_fontsize=8)
+            if suptitle:
+                fig.suptitle(suptitle, color=t["tick"], fontsize=12)
+            fig.tight_layout()
+        return fig
 
     # ── Sub-views ────────────────────────────────────────────────────────
 
     def _render_generic(self, sessions: list):
         t = T()
-        figs = [build_occupancy_heatmap_figure(
-            self._pooled_xy(sessions), outlines=self._region_outlines(sessions),
-            t=t, title="Whole-arena occupancy (all loaded sessions)")]
+        eg_colors = self._eg_color_map(sessions)
         region_names = self._region_names(sessions)
+        outlines = self._region_outlines(sessions)
+
+        # 1) Condensed heatmap + representative-trajectory grid, one column
+        # per group (as many heatmaps as groups, per the reference figure),
+        # instead of a single pooled-cohort heatmap.
+        median_xy = self._median_animal_xy(sessions)
+        figs = [build_group_heatmap_trace_figure(
+            self._group_xy(sessions), median_xy,
+            outlines=outlines, t=t, group_colors=eg_colors)]
+        self._export_tables.append(("median_animal_per_group", pd.DataFrame(
+            [{"exp_group": eg, "representative_animal": name}
+             for eg, (_x, _y, name) in median_xy.items()])))
+
+        # 2) Group-by-region occupancy -- the primary between-group
+        # comparison, so it comes right after the spatial overview.
+        grp_fig = self._group_region_crosstab_fig(sessions, t)
+        if grp_fig is not None:
+            figs.append(grp_fig)
+
+        # 3) Condensed row of small activity/thigmotaxis-control bar charts
+        # (used to each be a full-width figure) -- open_field-specific
+        # mandatory controls per the plan's literature-check table.
+        # "Center" has no formal role tag under open_field's
+        # ENV_PARADIGM_ROLE_VOCAB, so this looks for a traced region
+        # literally named containing "center" (case-insensitive) as a
+        # naming-convention heuristic -- skipped gracefully if none traced.
+        metric_specs = []
         if region_names:
             def _time_in_region_total(s):
                 return sum((s["env_ctx"].get("summary", {})
                             .get("time_in_region_sec", {}) or {}).values())
-            fig, _ = self._index_bar_fig(
-                sessions, _time_in_region_total, "Total time in traced regions (s)",
-                "Region time (activity control)", t)
-            figs.append(fig)
-        # open_field-specific mandatory controls (plan's literature-check
-        # table): total distance traveled (from the kinematics enriched
-        # sidecar's path_length_px, summed across bouts) and center-zone
-        # entry frequency -- separate from center-time %, as an
-        # activity/thigmotaxis control. "Center" has no formal role tag
-        # under open_field's ENV_PARADIGM_ROLE_VOCAB (roles are None for
-        # both regions/objects there), so this looks for a traced region
-        # literally named containing "center" (case-insensitive) as a
-        # naming-convention heuristic -- skipped gracefully, not faked, if
-        # no such region was traced.
-        if any((s["env_ctx"].get("paradigm") == "open_field") for s in sessions):
+            metric_specs.append((_time_in_region_total, "Total time (s)",
+                                  "Region time", None))
+        is_open_field = any((s["env_ctx"].get("paradigm") == "open_field")
+                             for s in sessions)
+        if is_open_field:
             def _total_distance(s):
                 df = s["enriched"]
                 if df is None or df.empty or "path_length_px" not in df.columns:
                     return None
                 return float(df["path_length_px"].sum())
             if any(_total_distance(s) is not None for s in sessions):
-                fig, _ = self._index_bar_fig(
-                    sessions, _total_distance, "Total distance traveled (px)",
-                    "Open Field: total distance (activity control)", t)
-                figs.append(fig)
+                metric_specs.append((_total_distance, "Distance (px)",
+                                      "Total distance", None))
             center_names = [rn for rn in region_names if "center" in rn.lower()]
             if center_names:
                 def _center_entries(s):
                     counts = (s["env_ctx"].get("summary", {})
                               .get("region_entries_count", {}) or {})
                     return sum(counts.get(rn, 0) for rn in center_names)
-                fig, _ = self._index_bar_fig(
-                    sessions, _center_entries, "Center-zone entries",
-                    "Open Field: center-zone entry frequency (thigmotaxis control)", t)
-                figs.append(fig)
+                metric_specs.append((_center_entries, "Entries",
+                                      "Center-zone entries", None))
+        if metric_specs:
+            figs.append(self._condensed_bar_row_fig(
+                sessions, metric_specs, t,
+                suptitle="Activity / thigmotaxis controls"))
+            for value_fn, ylabel, title, _ref in metric_specs:
+                rows = []
+                for s in sessions:
+                    val = value_fn(s)
+                    if val is None or (isinstance(val, float) and not np.isfinite(val)):
+                        continue
+                    rows.append({"animal": s["name"], "exp_group": s["exp_group"],
+                                 ylabel: val})
+                self._export_tables.append(
+                    (title.lower().replace(" ", "_").replace("-", "_"), pd.DataFrame(rows)))
+
+        if is_open_field:
+            if region_names and [rn for rn in region_names if "center" in rn.lower()]:
                 center_tc = self._region_timecourse_pct(sessions, name_contains="center")
                 if center_tc:
                     figs.append(build_timecourse_figure(
                         center_tc, "% of trial elapsed", "% time in center",
                         t, "Open Field: center-zone time course (thigmotaxis dynamics)",
-                        color_map=self._eg_color_map(sessions)))
+                        color_map=eg_colors))
             speed_vals = self._mean_speed_values_by_group(sessions)
             if speed_vals:
                 figs.append(build_distribution_figure(
                     speed_vals, "Mean speed (px/s)", t,
                     "Open Field: mean-speed distribution",
-                    color_map=self._eg_color_map(sessions)))
-        figs.extend(self._region_crosstab_figs(sessions, t))
+                    color_map=eg_colors))
+
+        # 4) Cluster-by-region breakdown -- finer-grained, so last.
+        cl_fig = self._cluster_region_crosstab_fig(sessions, t)
+        if cl_fig is not None:
+            figs.append(cl_fig)
         self._show_figures(figs)
 
     def _render_y_maze(self, sessions: list):
@@ -20186,6 +20631,10 @@ class BSOiDApp(ctk.CTk):
             get_eg_colors_fn=lambda: (
                 self._animal_panel.get_eg_colors()
                 if hasattr(self, "_animal_panel") else {}),
+            get_groups_fn=self._get_groups,
+            open_color_editor_fn=lambda: (
+                self._animal_panel._edit_eg_colors()
+                if hasattr(self, "_animal_panel") else None),
         )
         self._paradigm_panel.grid(row=0, column=0, sticky="nsew")
 
