@@ -7567,7 +7567,7 @@ class GroupEditorWindow(ctk.CTkToplevel):
         self._group_rows.clear()
         for gname, ginfo in groups.items():
             self._add_row(name=gname, color=ginfo.get("color"),
-                          selected=ginfo.get("labels", []))
+                          selected=ginfo.get("labels", []), notify=False)
         # Append individual groups for any cluster not covered by the provided groups
         covered = {int(lbl) for ginfo in groups.values() for lbl in ginfo.get("labels", [])}
         for i, lbl in enumerate(sorted(all_labels)):
@@ -7576,13 +7576,20 @@ class GroupEditorWindow(ctk.CTkToplevel):
                     name=f"Cluster {lbl}",
                     color=PALETTE[(len(groups) + i) % len(PALETTE)],
                     selected=[int(lbl)],
+                    notify=False,
                 )
+        # One preview/canvas rebuild for the whole batch instead of one per row --
+        # with many clusters (e.g. 20+), rebuilding the matplotlib/Tk canvas once
+        # per _add_row() call in a tight synchronous loop was fast enough to crash
+        # the TkAgg backend with a native access violation on Windows.
+        self._on_change()
 
     def merge_groups_from_dict(self, groups: dict):
         """Append new groups without removing existing ones."""
         for gname, ginfo in groups.items():
             self._add_row(name=gname, color=ginfo.get("color"),
-                          selected=ginfo.get("labels", []))
+                          selected=ginfo.get("labels", []), notify=False)
+        self._on_change()
 
     def get_groups(self) -> dict:
         out  = {}
@@ -7617,7 +7624,7 @@ class GroupEditorWindow(ctk.CTkToplevel):
 
     #   internals  
 
-    def _add_row(self, name=None, color=None, selected=None):
+    def _add_row(self, name=None, color=None, selected=None, notify=True):
         idx   = len(self._group_rows)
         color = color or PALETTE[idx % len(PALETTE)]
         name  = name  or f"Group {idx + 1}"
@@ -7637,7 +7644,8 @@ class GroupEditorWindow(ctk.CTkToplevel):
         )
         row.grid(row=idx, column=0, sticky="ew", padx=4, pady=3)
         self._group_rows.append(row)
-        self._on_change()
+        if notify:
+            self._on_change()
 
     def _delete_row(self, row: GroupRow):
         row.destroy()
