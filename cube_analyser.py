@@ -18145,98 +18145,6 @@ def _draw_region_outlines(ax, outlines: list, t: dict):
                     path_effects=[_pe.withStroke(linewidth=2.4, foreground=t["ax_bg"])])
 
 
-def build_occupancy_heatmap_figure(xy_list: list, outlines: "list | None" = None,
-                                    bins: int = 60, t: "dict | None" = None,
-                                    title: str = "", smooth_sigma: float = 1.4
-                                    ) -> "plt.Figure":
-    """Whole-arena 2D occupancy density heatmap.
-
-    xy_list  : list of (x_array, y_array) pairs, pooled into one 2D
-      histogram (call once per group/phase for a faceted view; pool
-      everything for a whole-cohort view).
-    outlines : optional list of (name, kind, vertex_list) tuples drawn as
-      outline overlays (kind in {"boundary","region","object"} controls
-      line style). See module note above re: approximate outlines.
-    smooth_sigma : Gaussian smoothing bandwidth, in histogram-bin units,
-      applied to the raw 2D histogram before rendering. Raw per-bin counts
-      are blocky/noisy at any bin count fine enough to resolve arena
-      structure; smoothing turns that into the gradual density gradient
-      standard in published occupancy plots, without changing the
-      underlying spatial resolution (bins) itself.
-    """
-    if t is None:
-        t = T()
-    xs_all, ys_all = [], []
-    for x, y in (xy_list or []):
-        x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
-        m = np.isfinite(x) & np.isfinite(y)
-        xs_all.append(x[m]); ys_all.append(y[m])
-    all_x = np.concatenate(xs_all) if xs_all else np.array([])
-    all_y = np.concatenate(ys_all) if ys_all else np.array([])
-
-    edge_color = "white" if t.get("mpl_style") == "dark_background" else "black"
-    _STYLE_BY_KIND = {"boundary": ("-", 2.0), "region": ("--", 1.4), "object": (":", 1.8)}
-
-    with plt.style.context(t["mpl_style"]):
-        fig = plt.figure(figsize=(7.2, 6.2), facecolor=t["fig_bg"])
-        gs = GridSpec(1, 2, figure=fig, width_ratios=[20, 1], wspace=0.06)
-        ax = fig.add_subplot(gs[0, 0])
-        cax = fig.add_subplot(gs[0, 1])
-        ax.set_facecolor(t["ax_bg"])
-        if len(all_x) >= 2 and len(all_y) >= 2:
-            h, xedges, yedges = np.histogram2d(all_x, all_y, bins=bins)
-            h = h.T
-            try:
-                from scipy.ndimage import gaussian_filter as _gfilt
-                h = _gfilt(h, sigma=smooth_sigma, mode="nearest")
-            except ImportError:
-                pass
-            # Express as a probability density (sums to 1) rather than raw
-            # bin counts -- comparable across heatmaps pooling different
-            # numbers of sessions/frames, and a single hot bin no longer
-            # dominates the color scale after smoothing spreads it out.
-            total = h.sum()
-            if total > 0:
-                h = h / total
-            # Clip the color ceiling to a high percentile of the smoothed,
-            # non-zero density rather than its raw max: with Gaussian
-            # smoothing the max is usually one central bin, so scaling to
-            # it compresses the rest of the gradient into a narrow band.
-            nonzero = h[h > 0]
-            vmax = float(np.percentile(nonzero, 99)) if nonzero.size else None
-            im = ax.imshow(h, origin="lower",
-                            extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
-                            aspect="auto", cmap="viridis", vmin=0, vmax=vmax,
-                            interpolation="bilinear")
-            try:
-                levels = np.linspace(0, vmax, 5)[1:] if vmax else None
-                if levels is not None and levels[0] > 0:
-                    ax.contour(h, levels=levels, colors=edge_color, alpha=0.18,
-                               linewidths=0.6,
-                               extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]])
-            except Exception:
-                pass
-            cb = fig.colorbar(im, cax=cax)
-            cb.set_label("Relative occupancy (density)", color=t["tick"])
-            cb.ax.yaxis.set_tick_params(color=t["tick"])
-            plt.setp(cb.ax.get_yticklabels(), color=t["tick"])
-        else:
-            cax.axis("off")
-            ax.text(0.5, 0.5, "Not enough position data", ha="center", va="center",
-                    color=t["muted"], transform=ax.transAxes)
-        _draw_region_outlines(ax, outlines, t)
-        ax.set_title(title, color=t["tick"], fontsize=12)
-        ax.tick_params(colors=t["tick"])
-        for spine in ax.spines.values():
-            spine.set_color(t["spine"])
-        try:
-            ax.set_aspect("equal", adjustable="box")
-        except Exception:
-            pass
-        fig.tight_layout()
-    return fig
-
-
 def build_group_heatmap_trace_figure(group_xy: dict, group_median: dict,
                                       outlines: "list | None" = None,
                                       t: "dict | None" = None,
@@ -18725,7 +18633,15 @@ def build_region_ethogram_figure(rows: list, region_color_map: "dict | None" = N
         ax.set_xlim(0, max(max_t, 1e-9))
         ax.set_ylim(-0.6, n_rows - 0.4)
         ax.set_xlabel("Time (s)", color=t["tick"])
-        handles = [mpatches.Patch(color=region_color_map[rn], label=rn) for rn in all_region_names]
+        # .get(..., t["muted"]) -- not direct indexing -- matches the bar-
+        # drawing fallback above: a caller-supplied region_color_map (e.g.
+        # _region_role_color_map, built from the summary's region_roles key)
+        # can legitimately omit a region actually present in the data (a
+        # region traced but missing a role, or added after region_roles was
+        # last computed), which previously raised KeyError here instead of
+        # falling back to the same muted color already used for its bars.
+        handles = [mpatches.Patch(color=region_color_map.get(rn, t["muted"]), label=rn)
+                   for rn in all_region_names]
         leg = ax.legend(handles=handles, fontsize=8, facecolor=t["card"],
                          edgecolor=t["border"], labelcolor=t["tick"],
                          loc="upper right", framealpha=0.85)
@@ -19362,8 +19278,9 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         return out
 
     def _region_outlines(self, sessions: list) -> list:
-        """Approximate outlines (see build_occupancy_heatmap_figure's module
-        note) for every named region across the given sessions, pooled."""
+        """Approximate outlines -- the convex hull of positions recorded as
+        belonging to each named region -- for every named region across
+        the given sessions, pooled."""
         outlines = []
         region_names = set()
         for s in sessions:
@@ -19455,6 +19372,14 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                              "run_length": float(r.get("Run lengths", 0.0)),
                              "pct_time_in_region": pct})
         return rows
+
+    @staticmethod
+    def _slugify(title: str) -> str:
+        """Filesystem-safe filename stem from a plot title, for
+        _export_tables entries populated by every _draw_index_bar call."""
+        import re as _re
+        slug = _re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+        return slug or "metric"
 
     @staticmethod
     def _crosstab_to_dataframe(agg: dict, region_names: list) -> pd.DataFrame:
@@ -19872,11 +19797,16 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         brackets, just at different sizes. Returns group_values."""
         eg_colors = self._eg_color_map(sessions)
         group_values: dict = {}
+        export_rows = []
         for s in sessions:
             val = value_fn(s)
             if val is None or (isinstance(val, float) and not np.isfinite(val)):
                 continue
             group_values.setdefault(s["exp_group"], []).append(float(val))
+            export_rows.append({"animal": s.get("name"), "exp_group": s["exp_group"],
+                                 ylabel: float(val)})
+        if hasattr(self, "_export_tables"):
+            self._export_tables.append((self._slugify(title), pd.DataFrame(export_rows)))
         egs = [eg for eg in eg_colors if eg in group_values]
         ax.set_facecolor(t["ax_bg"])
         ax.set_axisbelow(True)
@@ -20032,19 +19962,12 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                 metric_specs.append((_center_entries, "Entries",
                                       "Center-zone entries", None))
         if metric_specs:
+            # _condensed_bar_row_fig's underlying _draw_index_bar calls each
+            # auto-populate self._export_tables (see _draw_index_bar), so no
+            # separate export pass is needed here.
             figs.append(self._condensed_bar_row_fig(
                 sessions, metric_specs, t,
                 suptitle="Activity / thigmotaxis controls"))
-            for value_fn, ylabel, title, _ref in metric_specs:
-                rows = []
-                for s in sessions:
-                    val = value_fn(s)
-                    if val is None or (isinstance(val, float) and not np.isfinite(val)):
-                        continue
-                    rows.append({"animal": s["name"], "exp_group": s["exp_group"],
-                                 ylabel: val})
-                self._export_tables.append(
-                    (title.lower().replace(" ", "_").replace("-", "_"), pd.DataFrame(rows)))
 
         if is_open_field:
             if region_names and [rn for rn in region_names if "center" in rn.lower()]:
@@ -20079,9 +20002,10 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                              n_entries=(s["env_ctx"].get("derived", {})
                                         .get("n_arm_entries")))
                        for s in sessions]
-        figs = [build_occupancy_heatmap_figure(
-            self._pooled_xy(sessions), outlines=self._region_outlines(sessions),
-            t=t, title="Per-arm occupancy")]
+        figs = [build_group_heatmap_trace_figure(
+            self._group_xy(sessions), self._median_animal_xy(sessions),
+            outlines=self._region_outlines(sessions), t=t,
+            group_colors=self._eg_color_map(sessions))]
         fig, _ = self._index_bar_fig(alt_sessions, lambda s: s["alt_pct"],
                                      "Spontaneous alternation (%)",
                                      "Y-Maze alternation", t)
@@ -20104,21 +20028,28 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         def _entries_total(s):
             return sum((s["env_ctx"].get("summary", {})
                         .get("region_entries_count", {}) or {}).values())
-        figs = [build_occupancy_heatmap_figure(
-            self._pooled_xy(sessions), outlines=self._region_outlines(sessions),
-            t=t, title="Open- vs. closed-arm occupancy")]
-        for key, label in (("pct_time_open_arms", "% time in open arms"),
-                           ("pct_open_arm_entries", "% entries into open arms"),
-                           ("latency_to_first_open_arm_entry_sec",
-                            "Latency to first open-arm entry (s)")):
-            fig, _ = self._index_bar_fig(
-                sessions, lambda s, k=key: s["env_ctx"].get("derived", {}).get(k),
-                label, f"EPM: {label}", t)
-            figs.append(fig)
+        figs = [build_group_heatmap_trace_figure(
+            self._group_xy(sessions), self._median_animal_xy(sessions),
+            outlines=self._region_outlines(sessions), t=t,
+            group_colors=self._eg_color_map(sessions))]
         fig, _ = self._index_bar_fig(
-            sessions, _entries_total, "Total arm entries",
-            "Arm entries (locomotor control)", t)
+            sessions, lambda s: s["env_ctx"].get("derived", {}).get("pct_time_open_arms"),
+            "% time in open arms", "EPM: % time in open arms", t)
         figs.append(fig)
+        # Locomotor/exploratory controls (secondary to the headline % time
+        # in open arms above) condensed into one narrow row instead of each
+        # getting a full-width figure, same convention as the Generic
+        # (Open Field) sub-view's activity-control row.
+        metric_specs = [
+            (lambda s: s["env_ctx"].get("derived", {}).get("pct_open_arm_entries"),
+             "% entries", "% open-arm entries", None),
+            (lambda s: s["env_ctx"].get("derived", {}).get(
+                "latency_to_first_open_arm_entry_sec"),
+             "Latency (s)", "Latency to open arm", None),
+            (_entries_total, "Entries", "Total arm entries", None),
+        ]
+        figs.append(self._condensed_bar_row_fig(
+            sessions, metric_specs, t, suptitle="EPM: locomotor/exploratory controls"))
         open_arm_tc = self._region_timecourse_pct(sessions, role_filter={"open_arm"})
         if open_arm_tc:
             figs.append(build_timecourse_figure(
@@ -20148,18 +20079,26 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         def _total_explore(s):
             return sum((s["env_ctx"].get("summary", {})
                         .get("total_interaction_time_sec", {}) or {}).values())
-        figs = [build_occupancy_heatmap_figure(
-            self._pooled_xy(sessions), outlines=self._region_outlines(sessions),
-            t=t, title="Investigation density around each object")]
+        figs = [build_group_heatmap_trace_figure(
+            self._group_xy(sessions), self._median_animal_xy(sessions),
+            outlines=self._region_outlines(sessions), t=t,
+            group_colors=self._eg_color_map(sessions))]
         fig, _ = self._index_bar_fig(
             sessions, lambda s: s["env_ctx"].get("derived", {}).get("discrimination_index"),
             "Discrimination index", "Novel Object: discrimination index (0 = chance)",
             t, one_sample_ref=0.0)
         figs.append(fig)
-        fig, _ = self._index_bar_fig(
-            sessions, _total_explore, "Total exploration time, both objects (s)",
-            "Total exploration (validity control)", t)
-        figs.append(fig)
+        # Validity/activity controls condensed into one narrow row instead
+        # of each getting a full-width figure, same convention as the
+        # Generic (Open Field) sub-view's activity-control row.
+        metric_specs = [
+            (_total_explore, "Time (s)", "Total exploration", None),
+            (self._latency_to_first_contact_fn(), "Latency (s)",
+             "Latency to first contact", None),
+        ]
+        figs.append(self._condensed_bar_row_fig(
+            sessions, metric_specs, t,
+            suptitle="Novel Object: validity/activity controls"))
         novel_dist_tc = self._object_distance_timecourse_by_group(
             sessions, object_role_filter={"novel"})
         if novel_dist_tc:
@@ -20173,11 +20112,6 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                 bout_durs, "Bout duration (s)", t,
                 "Novel Object: investigation bout-duration distribution",
                 color_map=self._eg_color_map(sessions)))
-        fig, _ = self._index_bar_fig(
-            sessions, self._latency_to_first_contact_fn(),
-            "Latency to first contact (s)",
-            "Novel Object: latency to first investigation", t)
-        figs.append(fig)
         figs.extend(self._region_crosstab_figs(sessions, t))
         self._show_figures(figs)
 
@@ -20186,19 +20120,26 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         def _entries_total(s):
             return sum((s["env_ctx"].get("summary", {})
                         .get("region_entries_count", {}) or {}).values())
-        figs = [build_occupancy_heatmap_figure(
-            self._pooled_xy(sessions), outlines=self._region_outlines(sessions),
-            t=t, title="Per-chamber occupancy")]
+        figs = [build_group_heatmap_trace_figure(
+            self._group_xy(sessions), self._median_animal_xy(sessions),
+            outlines=self._region_outlines(sessions), t=t,
+            group_colors=self._eg_color_map(sessions))]
         for key, label, ref in (("sociability_index", "Sociability index (Phase 1)", 0.0),
                                 ("social_novelty_index", "Social novelty index (Phase 2)", 0.0)):
             fig, _ = self._index_bar_fig(
                 sessions, lambda s, k=key: s["env_ctx"].get("derived", {}).get(k),
                 label, f"Three-Chamber: {label}", t, one_sample_ref=ref)
             figs.append(fig)
-        fig, _ = self._index_bar_fig(
-            sessions, _entries_total, "Chamber entry frequency",
-            "Chamber entries (activity control)", t)
-        figs.append(fig)
+        # Activity controls condensed into one narrow row instead of each
+        # getting a full-width figure, same convention as the Generic
+        # (Open Field) sub-view's activity-control row.
+        metric_specs = [
+            (_entries_total, "Entries", "Chamber entries", None),
+            (self._latency_to_first_contact_fn(object_role_filter={"stranger"}),
+             "Latency (s)", "Latency to stranger", None),
+        ]
+        figs.append(self._condensed_bar_row_fig(
+            sessions, metric_specs, t, suptitle="Three-Chamber: activity controls"))
         # "Chamber" occupancy time-course isn't available: three_chamber's
         # role vocabulary (stranger/empty/novel_stranger) is on OBJECTS, not
         # regions (ENV_PARADIGM_ROLE_VOCAB["three_chamber"]["regions"] is
@@ -20221,19 +20162,15 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                 bout_durs, "Bout duration (s)", t,
                 "Three-Chamber: investigation bout-duration distribution",
                 color_map=self._eg_color_map(sessions)))
-        fig, _ = self._index_bar_fig(
-            sessions, self._latency_to_first_contact_fn(object_role_filter={"stranger"}),
-            "Latency to first contact with stranger (s)",
-            "Three-Chamber: latency to first stranger investigation", t)
-        figs.append(fig)
         figs.extend(self._region_crosstab_figs(sessions, t))
         self._show_figures(figs)
 
     def _render_cpp(self, sessions: list):
         t = T()
-        figs = [build_occupancy_heatmap_figure(
-            self._pooled_xy(sessions), outlines=self._region_outlines(sessions),
-            t=t, title="Occupancy (all loaded phases pooled)")]
+        figs = [build_group_heatmap_trace_figure(
+            self._group_xy(sessions), self._median_animal_xy(sessions),
+            outlines=self._region_outlines(sessions), t=t,
+            group_colors=self._eg_color_map(sessions))]
         fig, group_values = self._index_bar_fig(
             sessions, lambda s: s["env_ctx"].get("derived", {}).get("preference_index"),
             "Preference index (post − pre, or absolute if no pre-test)",
