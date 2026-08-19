@@ -19409,6 +19409,16 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         return out
 
     def _crosstab_rows_by_cluster(self, sessions: list) -> list:
+        """Bout-level rows for the cluster-by-region charts, labeled by
+        Group Editor behavior group where one is defined. Once ANY behavior
+        group exists, a cluster the user left out of every group is dropped
+        entirely rather than falling back to its raw cluster ID -- leaving
+        a cluster out of every group is the only way the Group Editor lets
+        a user exclude it (there is no separate "hide this raw cluster"
+        control on cluster IDs themselves), so keeping it visible here
+        under its bare ID would silently defeat that. With no groups
+        defined at all, every cluster is shown under its raw ID as before,
+        since there is nothing to have excluded it."""
         cid_to_group = self._cid_to_group_map()
         rows = []
         for s in sessions:
@@ -19419,7 +19429,12 @@ class ParadigmResultsPanel(ctk.CTkFrame):
             for _, r in df.iterrows():
                 pct = {c[len("pct_time_in_region_"):]: r[c] for c in region_cols}
                 cid = int(r.get("B-SOiD labels", -1))
-                label = cid_to_group[cid][0] if cid in cid_to_group else cid
+                if cid_to_group:
+                    if cid not in cid_to_group:
+                        continue
+                    label = cid_to_group[cid][0]
+                else:
+                    label = cid
                 rows.append({"label": label,
                              "animal": s["name"],
                              "run_length": float(r.get("Run lengths", 0.0)),
@@ -19465,18 +19480,36 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                                      self._crosstab_to_dataframe(grp_agg, region_names)))
         return fig
 
+    def _cluster_label_color_map(self, labels) -> "tuple[dict, str]":
+        """Shared color-map + legend-title logic for both cluster-by-region
+        charts: a label merged into a Group Editor behavior group gets that
+        group's name/color (see _cid_to_group_map); a label left as a raw
+        cluster ID gets the same app-wide deterministic cid -> color
+        mapping (_cluster_identity_color) used in Unbiased Analytics/
+        Cluster Hierarchy, so a cluster's color is identical everywhere."""
+        cid_to_group = self._cid_to_group_map()
+        group_colors = {}
+        for gname, color in cid_to_group.values():
+            group_colors[gname] = color
+        color_map = {}
+        for lbl in labels:
+            if lbl in group_colors:
+                color_map[lbl] = group_colors[lbl]
+            elif isinstance(lbl, int):
+                color_map[lbl] = _cluster_identity_color(lbl)
+            else:
+                color_map[lbl] = PALETTE[hash(str(lbl)) % len(PALETTE)]
+        legend_title = ("Behavior Group" if any(not isinstance(l, int) for l in labels)
+                         else "Cluster")
+        return color_map, legend_title
+
     def _cluster_region_crosstab_fig(self, sessions: list, t: dict) -> "plt.Figure | None":
         """Normalized so each region's bars sum to 100% across clusters/
         behavior groups -- 'of all the time spent in this region, what
-        fraction went to each cluster' -- NOT the Group-by-region chart's
+        fraction went to each cluster' -- NOT _cluster_region_own_time_fig's
         per-label weighted-mean %-of-own-time, which answers a different
         question and does not sum to anything meaningful across clusters.
-        See aggregate_region_time_share_by_label. Cluster IDs the user has
-        merged into a named behavior group via the Group Editor are
-        reported under that group's name/color (see _cid_to_group_map);
-        clusters left ungrouped fall back to the raw cluster ID and the
-        same app-wide deterministic cid -> color mapping (_cluster_identity_
-        color) used in Unbiased Analytics/Cluster Hierarchy."""
+        See aggregate_region_time_share_by_label."""
         region_names = self._region_names(sessions)
         if not region_names:
             return None
@@ -19484,35 +19517,54 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         cl_share = aggregate_region_time_share_by_label(cl_rows, region_names)
         if not cl_share:
             return None
-        cid_to_group = self._cid_to_group_map()
-        group_colors = {}
-        for gname, color in cid_to_group.values():
-            group_colors[gname] = color
-        cl_color_map = {}
-        for lbl in cl_share:
-            if lbl in group_colors:
-                cl_color_map[lbl] = group_colors[lbl]
-            elif isinstance(lbl, int):
-                cl_color_map[lbl] = _cluster_identity_color(lbl)
-            else:
-                cl_color_map[lbl] = PALETTE[hash(str(lbl)) % len(PALETTE)]
-        legend_title = ("Behavior Group" if any(not isinstance(l, int) for l in cl_share)
-                         else "Cluster")
+        cl_color_map, legend_title = self._cluster_label_color_map(cl_share)
+        subject = "Behavior-group" if legend_title == "Behavior Group" else "Cluster"
         fig = build_region_crosstab_figure(
             cl_share, region_names, color_map=cl_color_map, t=t,
             legend_title=legend_title,
-            title="Cluster-by-region occupancy (% of region's total time)",
+            title=f"{subject}-by-region occupancy (% of region's total time)",
             ylabel="% of region's total time")
-        self._export_tables.append(("cluster_by_region_occupancy",
+        self._export_tables.append(("cluster_by_region_occupancy_pct_of_region",
                                      self._crosstab_to_dataframe(cl_share, region_names)))
+        return fig
+
+    def _cluster_region_own_time_fig(self, sessions: list, t: dict) -> "plt.Figure | None":
+        """Companion chart to _cluster_region_crosstab_fig: per-cluster
+        weighted mean of that cluster's OWN time spent in each region --
+        'of cluster 7's own time, what fraction was in the Center?' (does
+        NOT sum to 100% across clusters -- each cluster's own bars can sum
+        to less than 100% if it also has bouts outside every traced
+        region). This is the original per-label metric every other
+        crosstab in this tab still uses (aggregate_region_time_by_label);
+        kept alongside the region-normalized share chart above rather than
+        replaced by it, since the two answer different questions."""
+        region_names = self._region_names(sessions)
+        if not region_names:
+            return None
+        cl_rows = self._crosstab_rows_by_cluster(sessions)
+        cl_agg = aggregate_region_time_by_label(cl_rows, region_names)
+        if not cl_agg:
+            return None
+        cl_color_map, legend_title = self._cluster_label_color_map(cl_agg)
+        subject = "Behavior-group" if legend_title == "Behavior Group" else "Cluster"
+        cl_per_animal = aggregate_region_time_by_label_and_animal(cl_rows, region_names)
+        fig = build_region_crosstab_figure(
+            cl_agg, region_names, color_map=cl_color_map, t=t,
+            legend_title=legend_title, per_animal=cl_per_animal,
+            title=f"{subject}-by-region occupancy (% of {subject.lower()}'s own time)",
+            ylabel=f"% of {subject.lower()}'s own time in region")
+        self._export_tables.append(("cluster_by_region_occupancy_pct_of_own_time",
+                                     self._crosstab_to_dataframe(cl_agg, region_names)))
         return fig
 
     def _region_crosstab_figs(self, sessions: list, t: dict) -> list:
         """The shared arena/region group-by-region and cluster-by-region
         cross-tabs every sub-view gets, per the plan (built once here, not
         re-implemented per sub-view). Group-by-region first -- it answers
-        the primary between-group comparison question; cluster-by-region is
-        the finer-grained behavioral breakdown underneath it."""
+        the primary between-group comparison question; the two
+        cluster-by-region charts (region-normalized share, then per-
+        cluster's-own-time) are the finer-grained behavioral breakdown
+        underneath it."""
         figs = []
         grp_fig = self._group_region_crosstab_fig(sessions, t)
         if grp_fig is not None:
@@ -19520,6 +19572,9 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         cl_fig = self._cluster_region_crosstab_fig(sessions, t)
         if cl_fig is not None:
             figs.append(cl_fig)
+        cl_own_fig = self._cluster_region_own_time_fig(sessions, t)
+        if cl_own_fig is not None:
+            figs.append(cl_own_fig)
         return figs
 
     # ── Data-prep helpers for the new time-course/distribution/paired plots
@@ -20006,10 +20061,15 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                     "Open Field: mean-speed distribution",
                     color_map=eg_colors))
 
-        # 4) Cluster-by-region breakdown -- finer-grained, so last.
+        # 4) Cluster-by-region breakdown -- finer-grained, so last: the
+        # region-normalized share chart, then its companion per-cluster
+        # own-time chart (see _cluster_region_own_time_fig).
         cl_fig = self._cluster_region_crosstab_fig(sessions, t)
         if cl_fig is not None:
             figs.append(cl_fig)
+        cl_own_fig = self._cluster_region_own_time_fig(sessions, t)
+        if cl_own_fig is not None:
+            figs.append(cl_own_fig)
         self._show_figures(figs)
 
     def _render_y_maze(self, sessions: list):
