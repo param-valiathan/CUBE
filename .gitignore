@@ -205,3 +205,16 @@ dark logo.png
 CUBE_icon.png
 CUBE.ico
 HMM_Smoothing_Section_Addendum.docx
+
+# Internal planning/strategy docs — never push these (local reference only)
+*_Implementation_Plan.md
+*_Implementation_Prompt.md
+*_Implementation_Report.md
+*_Integration_Plan*.md
+*publication_strategy*.md
+*Publication_Strategy*.md
+*Publication_Pathway*.md
+Automated_Test_Suite_Plan.md
+CUBE Publication Strategy & Reviewer Framework (Final Master).md
+CUBE_Analyser_Paradigm_Reporting_Plan.md
+Kinematic_Transition_Analysis_Plan.md
