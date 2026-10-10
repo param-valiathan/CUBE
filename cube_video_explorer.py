@@ -39,7 +39,7 @@ import os, re, csv, json, time, threading, queue, platform, subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 try:                                    # optional Guided labelling tab (see GUIDED_LABELLING_PLAN.md)
-    from cube_guided_tab import GuidedTab as _GuidedTab
+    from guided.tab import GuidedTab as _GuidedTab
 except Exception:                       # missing module / opencv / PIL: the Cluster annotator still works
     _GuidedTab = None
 from pathlib import Path
@@ -1208,7 +1208,7 @@ class BSoidAnnotator(tk.Tk):
         lay = None
         if self._guided_tab is not None:             # a finished CUBE run also feeds the Guided labelling tab
             try:
-                from cube_guided_session import find_run_layout
+                from guided.session import find_run_layout
                 lay = find_run_layout(path)
                 if lay is not None:
                     self._guided_tab.open_layout(lay)

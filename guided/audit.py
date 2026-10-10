@@ -140,7 +140,7 @@ def complete_video_report(X, y, w, sess_of_bin, complete_sessions, behaviours, m
     Leave-one-video-out among the videos that have labels: the scored video is never in training. This is the
     measurement sparse labels cannot give: how often a behaviour is called where it is NOT. Needs >= 1 complete video
     (>= 2 for the model to have other labelled videos to learn from). Returns {behaviour: {...}} or {} if impossible."""
-    import cube_guided as cg
+    from guided import core as cg
     y = np.asarray(y, dtype=object)
     sess = np.asarray(sess_of_bin, dtype=object)
     out: dict = {}

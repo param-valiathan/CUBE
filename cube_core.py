@@ -47,7 +47,7 @@ import numpy as np
 import pandas as pd
 
 try:                                    # guided-labelling constraints (inert unless a labels file is attached)
-    from cube_guided_constraints import guided_active
+    from guided.constraints import guided_active
 except Exception:                       # module missing -> every guided hook is a no-op
     def guided_active():
         return None
@@ -26215,7 +26215,7 @@ class BSoidEngine:
             return self._run_core()
         finally:
             try:
-                from cube_guided_constraints import clear as _guided_clear
+                from guided.constraints import clear as _guided_clear
                 _guided_clear()
             except Exception:
                 pass
@@ -27169,7 +27169,7 @@ class BSoidEngine:
         self._guided_dyn_pack = None
         try:
             if str(self._cfg.get("guided_labels_path", "") or "").strip():
-                from cube_guided_constraints import load_global_rows as _g_load
+                from guided.constraints import load_global_rows as _g_load
                 _g_ranges, _g_off = {}, 0
                 for _nm_g, _ft_g in zip(all_names, all_feats):
                     _g_ranges[_nm_g] = (_g_off, _g_off + _ft_g.shape[1])
@@ -27179,7 +27179,7 @@ class BSoidEngine:
                 if _g_got is not None:
                     self._guided_preloaded = _g_got
                     try:
-                        from cube_guided_report import snapshot_before as _g_snap
+                        from guided.report import snapshot_before as _g_snap
                         _g_snap(self.output_dir, self._log)
                     except Exception:
                         pass
@@ -27415,7 +27415,7 @@ class BSoidEngine:
             _gp = getattr(self, "_guided_preloaded", None)
             if _gp is not None:
                 try:
-                    from cube_guided_constraints import labelled_good_positions as _g_pos
+                    from guided.constraints import labelled_good_positions as _g_pos
                     _lab_pos = _g_pos(_gp[0], exclude_mask)
                     _n_missing = int(np.setdiff1d(_lab_pos, idx).size)
                     if _n_missing:
@@ -27502,7 +27502,7 @@ class BSoidEngine:
         # (kill switch). A missing / corrupt / inconsistent file logs a WARN and the run stays blind.
         self._guided_ctx = None
         try:
-            from cube_guided_constraints import build_context as _g_build, set_active as _g_set, clear as _g_clear
+            from guided.constraints import build_context as _g_build, set_active as _g_set, clear as _g_clear
             _g_clear()
             _g_ctx = _g_build(
                 self._cfg, {k: (int(v[0]), int(v[1])) for k, v in _sbr.items() if k != "_total_bins"},
@@ -29376,8 +29376,8 @@ class BSoidEngine:
                 and _train_orig_bin_idx is not None):
             try:
                 self._stage("5/7 ? Applying your labels", "reclustering poorly tracked / turned-away bins?")
-                from cube_guided_poor import poor_tracking_mask as _pt_mask, recluster_poor as _pt_recluster
-                from cube_guided_dynamics import win100_for as _w100
+                from guided.poor import poor_tracking_mask as _pt_mask, recluster_poor as _pt_recluster
+                from guided.dynamics import win100_for as _w100
                 _pt_g = _pt_mask(all_ll, [f.shape[1] for f in all_feats], [_w100(f) for f in all_fps_list],
                                  _orig_ta_global, float(self._cfg.get("guided_poor_quantile", 0.2)))
                 hdb_labels, _pt_info = _pt_recluster(
@@ -29397,7 +29397,7 @@ class BSoidEngine:
 
         if _gctx_p is not None and bool(self._cfg.get("guided_labelled_plots_enabled", True)):
             try:
-                from cube_guided_report import behaviour_groups as _bgrp, cluster_names as _cnames
+                from guided.report import behaviour_groups as _bgrp, cluster_names as _cnames
                 _g_groups = _bgrp(_gctx_p, hdb_labels) or None
                 _g_names = _cnames(_g_groups) if _g_groups else None
                 if _g_groups:
@@ -30602,7 +30602,7 @@ class BSoidEngine:
                         and bool(self._cfg.get("guided_dynamics_enabled", True))
                         and _hmm_n_states in (None, int(n_cl))):
                     self._stage("6/7 ? Applying your labels", "HMM transition prior from your labelled bouts?")
-                    from cube_guided_dynamics import engine_prior as _g_prior
+                    from guided.dynamics import engine_prior as _g_prior
                     _g_T, _pack = _g_prior(self._guided_ctx, self._guided_preloaded[1], hdb_labels, int(n_cl),
                                            all_fps_list, bool(_soft_ok or _bin_level_ok), self._cfg)
                     self._guided_dyn_pack = _pack if "dyn" in _pack else None
@@ -31821,7 +31821,7 @@ class BSoidEngine:
                 self._log("  [WARN] guided_constraints_log.json export failed")
         if getattr(self, "_guided_ctx", None) is not None and _g_groups:
             try:
-                from cube_guided_report import write_mapping_tsv as _wm, write_behaviour_groups_json as _wg
+                from guided.report import write_mapping_tsv as _wm, write_behaviour_groups_json as _wg
                 _wm(self.output_dir / "cluster_behaviour_mapping.tsv", hdb_labels, _g_groups)
                 _wg(self.output_dir / "behaviour_groups.json", _g_groups,
                     {"source": "user labels", "labels_path": str(self._cfg.get("guided_labels_path", ""))})
@@ -31834,7 +31834,7 @@ class BSoidEngine:
                 and (all_hmm_display_labels or all_frame_labels)):
             try:
                 self._stage("7/7 ? Guided behaviours", "classifying your behaviours directly from your labels?")
-                import cube_guided_behaviour as _gb
+                import guided.behaviour as _gb
                 _X_all = np.nan_to_num(scaler.transform(np.asarray(feats_cat).T)).astype(np.float32)
                 _rng_g = {k: (int(v[0]), int(v[1])) for k, v in _sbr.items() if k != "_total_bins"}
                 _fps_g = {nm: float(fp_) for nm, fp_ in zip(all_names, all_fps_list)}
@@ -31857,7 +31857,7 @@ class BSoidEngine:
                 self._log(f"  [GUIDED] WARN: guided-behaviour export skipped ({_gb_e})")
         if getattr(self, "_guided_dyn_pack", None) and all_hmm_labels:
             try:
-                from cube_guided_dynamics import engine_audit as _g_audit
+                from guided.dynamics import engine_audit as _g_audit
                 _ranges_g = {k: v for k, v in _sbr.items() if k != "_total_bins"}
                 _rep_g = _g_audit(self._guided_dyn_pack, all_hmm_labels, all_fps_list, all_names, _ranges_g, feats_cat)
                 (self._out_model / "guided_dynamics.json").write_text(json.dumps(_rep_g, indent=2, default=str))

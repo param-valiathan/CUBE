@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import cube_guided as cg
+from guided import core as cg
 
 _VID_EXT = (".mp4", ".avi", ".mov", ".mkv", ".m4v")
 BACKGROUND = "Background"
@@ -475,7 +475,7 @@ class GuidedController:
         done = sorted(set(self.ls.complete_sessions) | set(self.ls.complete_spans))
         if not done:
             return {}
-        import cube_guided_audit as au
+        import guided.audit as au
         y, w = self._bins()
         names = [b for b in self.behaviour_names() if b != cg.BACKGROUND]
         return au.complete_video_report(self.features(), y, w, self.data.sess_of_bin, done, names, min_conf=min_conf)
@@ -866,7 +866,7 @@ class GuidedController:
     def export_behaviours(self, out_dir=None) -> dict:
         """Write the guided behaviours (+ sub-type clusters per behaviour) as an Analyser-ready folder,
         'CUBE 3b - Guided behaviours', next to this run's 'CUBE 3 - Clusters'. Reuses the trained model."""
-        import cube_guided_behaviour as gb
+        import guided.behaviour as gb
         if self._snap is None:
             self.retrain()
         model, proba = self._snap

@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import cube_guided as cg
+from guided import core as cg
 
 OTHER = "Other"
 GUIDED_SOURCE = "guided_behaviour"
@@ -34,7 +34,7 @@ NON_BEHAVIOUR = ("", "Background", "Neither", "__neither__")
 
 def stems_for(bout_dir, keys) -> dict:
     """Session key -> the file stem its CUBE bout/frame CSVs already use (falls back to the key)."""
-    from cube_guided_session import session_stems
+    from guided.session import session_stems
     out = {}
     bd = Path(bout_dir) if bout_dir else None
     for k in keys:
@@ -196,7 +196,7 @@ def build_guided_behaviours(feats, ranges, fps_map, ls, cluster_frame_labels, n_
     if cluster_gate:
         # cluster-evidence gate (cube_guided_gate): the blind CUBE clusters veto a behaviour in clusters whose labels
         # say it is something else; opt-in, inert without labels
-        import cube_guided_gate as _gg
+        import guided.gate as _gg
         y_g, _w_g = cg.labels_to_bins(ls, ranges, fps_map, len(feats))
         y_g = np.array([("" if v == "__neither__" else v) for v in y_g], dtype=object)
         cl_bins = _gg.bins_from_frame_clusters(cluster_frame_labels, ranges, fps_map, len(feats))
@@ -324,7 +324,7 @@ def build_guided_behaviours(feats, ranges, fps_map, ls, cluster_frame_labels, n_
             log(f"[guided] WARNING {b}: {secs[b]['warning']}")
     audit = {}
     try:
-        import cube_guided_audit as _au
+        import guided.audit as _au
         audit = _au.audit_track(beh, ranges, fps_map, ls, present)
         for fl in audit.get("flags", []):
             log(f"[guided] AUDIT {fl}")
@@ -352,7 +352,7 @@ def _cluster_pool_share(ls, ranges, fps_map, cluster_frame_labels, n_bins):
     """% of all bins inside the clusters the labels prove (purity-gated) to be each behaviour: an independent estimate
     of how common the behaviour is, used to flag a classifier that calls it far too often."""
     try:
-        import cube_guided_report as rep
+        import guided.report as rep
         y, _w = cg.labels_to_bins(ls, ranges, fps_map, n_bins)
         truth = np.array([None if v in ("", "__neither__") else str(v) for v in y], dtype=object)
         cb = np.full(n_bins, -1, dtype=int)

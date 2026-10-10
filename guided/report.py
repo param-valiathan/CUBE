@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import cube_guided as cg
+from guided import core as cg
 
 SNAP_DIR = "guided/before_run"
 GUIDED_PLOTS = "guided"
@@ -129,7 +129,7 @@ class RunLabels:
         self.frame_labels: dict = {}
         self.fps: dict = {}
         bout = self.dir / "bout_lengths"
-        from cube_guided_session import session_stems
+        from guided.session import session_stems
         for key in self.ranges:
             for suffix, stem in ((sf, st) for sf in ("_frame_labels_hmm.csv", "_frame_labels.csv")
                                  for st in session_stems(key)):
@@ -161,7 +161,7 @@ class RunLabels:
 
 def pools_by_purity(cluster_per_bin, truth, min_bins=5, min_purity=0.7) -> dict:
     """{behaviour: [cluster ids]} - purity-gated, each cluster used by one behaviour (the repo convention)."""
-    import cube_guided_eval as ge
+    import guided.eval as ge
     keep = np.array([t is not None and str(t) != "" for t in truth])
     if not keep.any():
         return {}
@@ -173,7 +173,7 @@ def pools_by_purity(cluster_per_bin, truth, min_bins=5, min_purity=0.7) -> dict:
 def metric_tables(before_bins, after_bins, truth, min_bins=5, min_purity=0.7):
     """Full per-behaviour Coverage / Leakage / Ratio, before and after, on the LABELLED bins only
     (unlabelled bins have no truth and would count as leakage). Returns (before_df, after_df, merged_df)."""
-    import cube_guided_eval as ge
+    import guided.eval as ge
     t = np.asarray(truth, dtype=object)
     keep = np.array([x is not None and str(x) != "" for x in t])
     tb = ge.behaviour_table(np.asarray(before_bins)[keep], t[keep], min_labeled=min_bins, purity_floor=min_purity)
@@ -422,7 +422,7 @@ def produce_plots(after_dir, labels_path, before_dir=None, out_dir=None, theme="
                                     out / "03_hierarchy", out / "04_tables")
     for d in (d_umap, d_met, d_hier, d_tab):
         d.mkdir(parents=True, exist_ok=True)
-    from cube_guided_session import GuidedData
+    from guided.session import GuidedData
     ls = cg.load_labels(labels_path)
     gd = GuidedData(after_dir / "model", after_dir / "bout_lengths")
     after_bins = RunLabels(after_dir).per_bin(gd.ranges, gd.fps_map)
@@ -469,7 +469,7 @@ def produce_plots(after_dir, labels_path, before_dir=None, out_dir=None, theme="
     merged.to_csv(d_tab / "coverage_leakage_ratio_before_after.csv", index=False)
     tb.to_csv(d_tab / "coverage_leakage_ratio_before.csv", index=False)
     ta.to_csv(d_tab / "coverage_leakage_ratio_after.csv", index=False)
-    import cube_guided_eval as ge
+    import guided.eval as ge
     note = ("In-sample: the labels shown here were also given to CUBE. Treat as a diagnostic of how well the "
             "clusters now match YOUR labels, not as held-out accuracy. Evaluated on labelled bins only.")
     md = [f"# Coverage / Leakage / Ratio - before vs after your labels\n", note + "\n",

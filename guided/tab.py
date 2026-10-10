@@ -19,7 +19,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 import numpy as np
 
-import cube_guided_session as gs
+import guided.session as gs
 from cube_busy_overlay import BusyOverlay
 from cube_label_player import LabelPlayer
 
@@ -1021,7 +1021,7 @@ class GuidedTab(tk.Frame):
         self._busy = True
         self._status("Producing plots ... this takes a minute.")
         self._busy_begin("Producing before / after plots", "Starting ...")
-        import cube_guided_report as rep
+        import guided.report as rep
         run_dir, labels_path = Path(self.run_dir), str(self.ctrl.labels_path)
 
         def work():
@@ -1069,7 +1069,7 @@ class GuidedTab(tk.Frame):
                 self.ctrl.progress = lambda f, t: self._sync_progress(0.5 * f, t)
                 self.ctrl.export_all()
                 self.ctrl.progress = None
-                import cube_guided_report as rep
+                import guided.report as rep
                 rep.produce_plots(Path(self.run_dir), str(self.ctrl.labels_path),
                                   before_dir=self._before_run_dir(ask=False), log=self._log_error,
                                   progress=lambda f, t=None: self._sync_progress(0.5 + 0.5 * f, t))

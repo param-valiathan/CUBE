@@ -290,7 +290,7 @@ def load_global_rows(cfg: dict, session_ranges: dict, fps_map, n_bins: int, log=
         if not os.path.isfile(path):
             log(f"  [GUIDED] labels file not found ({path}) -- running blind.")
             return None
-        import cube_guided as cg
+        from guided import core as cg
         ls = cg.load_labels(path)
         if not ls.labels:
             log("  [GUIDED] labels file has no labels -- running blind.")
