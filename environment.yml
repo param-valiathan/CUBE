@@ -1,0 +1,35 @@
+name: CUBE
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - tk
+  - numpy=2.4.*
+  - pandas=2.3.*
+  - scipy=1.17.*
+  - scikit-learn=1.8.*
+  - hdbscan=0.8.*
+  - matplotlib=3.8.*
+  - networkx
+  - numba
+  - joblib
+  - threadpoolctl
+  - psutil
+  - pytables
+  - h5py
+  - pyyaml
+  - ruamel.yaml
+  - pip:
+      - pillow
+      - opencv-python-headless
+      - imageio-ffmpeg
+      - umap-learn==0.5.12
+      - pynndescent
+      - customtkinter==5.2.2
+      - plotly
+      - hmmlearn==0.3.3
+      - scikit-posthocs
+      - aniposelib==0.8.0
+      - deeplabcut==3.0.0rc14   # installs PyTorch; for a GPU build install torch from pytorch.org first
+      - fast-hdbscan            # optional speed-up

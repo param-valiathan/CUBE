@@ -1,0 +1,11 @@
+# Allowlist: only code, the README and logos are published.
+*
+!.gitignore
+!README.md
+!environment.yml
+!*.py
+!CUBE.ico
+!CUBE_logo.png
+!CUBE_logo dark theme.png
+!charuco_board_v2_print.png
+__pycache__/
