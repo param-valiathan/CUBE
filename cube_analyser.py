@@ -11224,11 +11224,60 @@ def _place_cluster_label(ax, cx, cy, text, color, all_x, all_y, placed,
     return lx, ly
 
 
+def _fast_grid_kde(x, y, w, xi, yi):
+    """Weighted 2D Gaussian KDE evaluated on the (xi, yi) grid.
+
+    Same bandwidth rule as scipy.stats.gaussian_kde (Scott factor
+    neff**(-1/6) times the weighted data covariance) but computed by binning
+    onto the grid and FFT-convolving with the Gaussian kernel — O(grid log
+    grid) instead of O(grid * n_points). Returns shape (len(yi), len(xi)).
+    Raises on a singular covariance so callers can fall back, as with gaussian_kde.
+    """
+    import numpy as np
+    from scipy.signal import fftconvolve
+    x = np.asarray(x, float); y = np.asarray(y, float)
+    w = np.asarray(w, float); w = w / w.sum()
+    neff = 1.0 / np.sum(w ** 2)
+    factor = neff ** (-1.0 / 6.0)
+    mx, my = np.sum(w * x), np.sum(w * y)
+    dx_, dy_ = x - mx, y - my
+    denom = 1.0 - np.sum(w ** 2)
+    cov = np.array([[np.sum(w * dx_ * dx_), np.sum(w * dx_ * dy_)],
+                    [np.sum(w * dx_ * dy_), np.sum(w * dy_ * dy_)]]) / denom
+    kcov = cov * factor ** 2
+    det = np.linalg.det(kcov)
+    if not np.isfinite(det) or det <= 0:
+        raise np.linalg.LinAlgError("singular KDE covariance")
+    kinv = np.linalg.inv(kcov)
+
+    hx = float(xi[1] - xi[0]); hy = float(yi[1] - yi[0])
+    ex = np.concatenate([xi - hx / 2, [xi[-1] + hx / 2]])
+    ey = np.concatenate([yi - hy / 2, [yi[-1] + hy / 2]])
+    H, _, _ = np.histogram2d(x, y, bins=[ex, ey], weights=w)
+    H = H.T  # -> [iy, ix]
+
+    # Wide kernel (8 sd): the energy map's support mask thresholds at a low
+    # density percentile, i.e. far into the tails, so truncating earlier
+    # would change which cells count as "supported".
+    nkx = min(int(np.ceil(8 * np.sqrt(kcov[0, 0]) / hx)), len(xi))
+    nky = min(int(np.ceil(8 * np.sqrt(kcov[1, 1]) / hy)), len(yi))
+    KX, KY = np.meshgrid(np.arange(-nkx, nkx + 1) * hx,
+                         np.arange(-nky, nky + 1) * hy)
+    q = kinv[0, 0] * KX ** 2 + 2 * kinv[0, 1] * KX * KY + kinv[1, 1] * KY ** 2
+    kern = np.exp(-0.5 * q) / (2 * np.pi * np.sqrt(det))
+    return np.maximum(fftconvolve(H, kern, mode="same"), 0.0)
+
+
 def build_energy_landscape_figure(
         animal_data: list, umap_embedding, umap_labels,
-        t: dict = None, groups: dict = None) -> "plt.Figure":
+        t: dict = None, groups: dict = None,
+        z_wall_cutoff: float = 0.5, z_aspect: float = 0.6) -> "plt.Figure":
     """
     Behavioral energy landscape over UMAP space — 3-column layout per group.
+    z_wall_cutoff: 3D surface cells with normalised energy above this (0-1)
+        are not drawn, removing the wall so the basin floor is visible
+        (None = draw everything). The 2D heatmaps are unaffected.
+    z_aspect: z-axis box-aspect; <1 flattens the surface.
       col 0 – UMAP scatter (cluster colours) + translucent energy contour overlay
       col 1 – 2D filled energy heatmap (inferno_r) + top-5 valley labels (★)
       col 2 – clean 3D surface (coolwarm, single viewpoint from above)
@@ -11286,6 +11335,16 @@ def build_energy_landscape_figure(
 
     # Noise exclusion: HDBSCAN labels -1 as noise; skip those points entirely.
     _noise_mask = umap_l < 0
+    # Drop noise points up front: they carry zero weight in the energy KDE but
+    # would otherwise still set the axis extent and the data-support mask. On
+    # noise-heavy embeddings (e.g. Xenium, >50 % noise scattered far from the
+    # clusters) that left huge empty/"high-energy" bands and squashed the real
+    # landscape into a corner of the grid.
+    if _noise_mask.any() and (~_noise_mask).sum() >= 10:
+        umap_x = umap_x[~_noise_mask]
+        umap_y = umap_y[~_noise_mask]
+        umap_l = umap_l[~_noise_mask]
+        _noise_mask = _np.zeros(len(umap_l), dtype=bool)
 
     # cluster-id → group name mapping (from user-defined groups, if any)
     _cid_to_gname: dict = {}
@@ -11330,11 +11389,17 @@ def build_energy_landscape_figure(
 
     # ── Data-support mask (shared across groups) ────────────────────────────
     try:
-        _kde_support    = _gkde(_np.vstack([umap_x, umap_y]))
-        _ZZ_support     = _kde_support(
-            _np.vstack([XX.ravel(), YY.ravel()])).reshape(GRID_N, GRID_N)
-        _support_thresh = _np.percentile(_ZZ_support, 20)
-        _support_mask   = _ZZ_support < _support_thresh   # True = empty space
+        # Rank cells by (Scott-bandwidth) Mahalanobis distance to the nearest
+        # data point — monotone with the KDE's log-density in the tails, where
+        # the 20th-percentile cutoff lives (~1e-196 of peak, beyond what an
+        # FFT convolution can resolve). Mask the farthest 20 % as empty.
+        from scipy.spatial import cKDTree as _KDT
+        _cv = _np.cov(_np.vstack([umap_x, umap_y]))
+        _L = _np.linalg.cholesky(_np.linalg.inv(_cv))
+        _pts_w = _np.column_stack([umap_x, umap_y]) @ _L
+        _grid_w = _np.column_stack([XX.ravel(), YY.ravel()]) @ _L
+        _dist = _KDT(_pts_w).query(_grid_w)[0].reshape(GRID_N, GRID_N)
+        _support_mask = _dist > _np.percentile(_dist, 80)   # True = empty space
     except Exception:
         _support_mask = _np.zeros((GRID_N, GRID_N), dtype=bool)
 
@@ -11359,10 +11424,7 @@ def build_energy_landscape_figure(
 
     # ── Weighted KDE → energy surface (shared by both rows) ────────────────
     try:
-        kde     = _gkde(_np.vstack([umap_x, umap_y]),
-                        weights=weights, bw_method="scott")
-        ZZ_dens = kde(_np.vstack([XX.ravel(), YY.ravel()])
-                      ).reshape(GRID_N, GRID_N)
+        ZZ_dens = _fast_grid_kde(umap_x, umap_y, weights, xi, yi)
     except Exception:
         ZZ_dens = _np.full((GRID_N, GRID_N), 1e-9)
         for cid, p in P_cl.items():
@@ -11381,8 +11443,11 @@ def build_energy_landscape_figure(
     supported  = ~_support_mask
     E_lo       = float(_np.nanmin(ZZ_energy[supported]))
     ZZ_shifted = _np.maximum(ZZ_energy - E_lo, 0.0)
-    E_hi       = float(_np.nanmax(ZZ_shifted[supported]))
-    ZZ_norm    = ZZ_shifted / max(E_hi, 1e-9)
+    # Robust upper bound: -ln(density) diverges in the sparse rim, so scaling
+    # by the max squashed every real feature into the bottom of a "well".
+    # Saturate at the 90th percentile of supported cells instead.
+    E_hi       = float(_np.nanpercentile(ZZ_shifted[supported], 90))
+    ZZ_norm    = _np.clip(ZZ_shifted / max(E_hi, 1e-9), 0.0, 1.0)
     ZZ_norm[_support_mask] = 0.0
 
     # NaN mask for 2D contourf so unsupported cells render as background
@@ -11391,6 +11456,8 @@ def build_energy_landscape_figure(
     # NaN mask for 3D surface so the flat padded skirt is not rendered
     ZZ_surface = ZZ_norm.copy().astype(float)
     ZZ_surface[_support_mask] = _np.nan
+    if z_wall_cutoff is not None:
+        ZZ_surface[ZZ_norm > z_wall_cutoff] = _np.nan
 
     # ── Behavior-group membership + combined occupancy (duration-based) ────
     _gmember: dict = {}
@@ -11416,10 +11483,7 @@ def build_energy_landscape_figure(
         if wsum_g > 0:
             weights_group = weights_group / wsum_g
             try:
-                kde_g     = _gkde(_np.vstack([umap_x, umap_y]),
-                                  weights=weights_group, bw_method="scott")
-                ZZ_dens_g = kde_g(_np.vstack([XX.ravel(), YY.ravel()])
-                                  ).reshape(GRID_N, GRID_N)
+                ZZ_dens_g = _fast_grid_kde(umap_x, umap_y, weights_group, xi, yi)
             except Exception:
                 ZZ_dens_g = _np.full((GRID_N, GRID_N), 1e-9)
                 for _gn, _cids in _gmember.items():
@@ -11437,14 +11501,16 @@ def build_energy_landscape_figure(
 
             E_lo_g       = float(_np.nanmin(ZZ_energy_g[supported]))
             ZZ_shifted_g = _np.maximum(ZZ_energy_g - E_lo_g, 0.0)
-            E_hi_g       = float(_np.nanmax(ZZ_shifted_g[supported]))
-            ZZ_norm_g    = ZZ_shifted_g / max(E_hi_g, 1e-9)
+            E_hi_g       = float(_np.nanpercentile(ZZ_shifted_g[supported], 90))
+            ZZ_norm_g    = _np.clip(ZZ_shifted_g / max(E_hi_g, 1e-9), 0.0, 1.0)
             ZZ_norm_g[_support_mask] = 0.0
 
             ZZ_plot_g = ZZ_norm_g.copy().astype(float)
             ZZ_plot_g[_support_mask] = _np.nan
             ZZ_surface_g = ZZ_norm_g.copy().astype(float)
             ZZ_surface_g[_support_mask] = _np.nan
+            if z_wall_cutoff is not None:
+                ZZ_surface_g[ZZ_norm_g > z_wall_cutoff] = _np.nan
 
     # ── Scatter point order (sort by cluster; noise excluded) ──────────────
     sort_idx = _np.argsort(umap_l)
@@ -11607,7 +11673,16 @@ def build_energy_landscape_figure(
             ax.set_xlim(umap_x.min() - x_rng * 0.02, umap_x.max() + x_rng * 0.02)
             ax.set_ylim(umap_y.min() - y_rng * 0.02, umap_y.max() + y_rng * 0.02)
 
-        ax3d.view_init(elev=38, azim=215)
+        # Steeper elevation when the wall is cut, so the near rim doesn't
+        # hide the basin floor.
+        ax3d.view_init(elev=55 if z_wall_cutoff is not None else 38, azim=215)
+        if z_aspect is not None:
+            try:
+                ax3d.set_box_aspect((1, 1, float(z_aspect)))
+            except Exception:
+                pass
+        if z_wall_cutoff is not None:
+            ax3d.set_zlim(0, float(z_wall_cutoff))
         ax3d.set_xlabel(f"UMAP-{_ax_i + 1}", color=t["tick"], fontsize=10, labelpad=4)
         ax3d.set_ylabel(f"UMAP-{_ax_j + 1}", color=t["tick"], fontsize=10, labelpad=4)
         ax3d.set_zlabel("−ln P",  color=t["tick"], fontsize=10, labelpad=4)
@@ -11668,7 +11743,7 @@ def build_energy_landscape_figure(
         ax3d.patch.set_facecolor(t["ax_bg"])
         ax3d.plot_surface(XX, YY, ZZ_surface, cmap=_ECMAP,
                           alpha=0.92, linewidth=0, antialiased=True,
-                          rstride=1, cstride=1)
+                          rstride=2, cstride=2)
 
         _draw_valley_stars(ax1, ax3d, top_n_cluster, "valleys", ZZ_norm)
         _style_energy_axes(ax0, ax1, ax3d, "All Clusters")
@@ -11753,7 +11828,7 @@ def build_energy_landscape_figure(
             ax3dg.patch.set_facecolor(t["ax_bg"])
             ax3dg.plot_surface(XX, YY, ZZ_surface_g, cmap=_ECMAP,
                                alpha=0.92, linewidth=0, antialiased=True,
-                               rstride=1, cstride=1)
+                               rstride=2, cstride=2)
 
             _draw_valley_stars(ax1g, ax3dg, top_n_group, "groups", ZZ_norm_g)
             _style_energy_axes(ax0g, ax1g, ax3dg, "Behavioral Groups")
