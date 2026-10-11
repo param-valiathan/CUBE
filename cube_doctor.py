@@ -24,7 +24,7 @@ OK, WARN, FAIL, INFO = "ok", "warn", "fail", "info"
 
 REFERENCE_PYTHON = (3, 12)          # major, minor of the reference environment (3.12.13)
 HERE = Path(__file__).resolve().parent
-LOCK_FILE = HERE / "requirements-lock.txt"
+LOCK_FILE = HERE / "env" / "requirements-lock.txt"
 
 INSTALL_HINT = "Double-click install_cube.bat in the CUBE folder to repair the installation."
 

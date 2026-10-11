@@ -13163,7 +13163,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
             from PIL import Image as _PILImage, ImageTk as _ImageTk
             _logo_file = ("CUBE_logo dark theme.png"
                           if _THEME_KEY == "dark" else "CUBE_logo.png")
-            _logo_path = pathlib.Path(__file__).parent / _logo_file
+            _logo_path = pathlib.Path(__file__).parent / "assets" / _logo_file
             if _logo_path.is_file():
                 _raw = _PILImage.open(str(_logo_path))
                 _raw.load()
@@ -23898,7 +23898,7 @@ class BSOiDApp(ctk.CTk):
         self.geometry("1440x880")
         self.minsize(1050, 660)
         self.resizable(True, True)
-        _ico = pathlib.Path(__file__).parent / "CUBE.ico"
+        _ico = pathlib.Path(__file__).parent / "assets" / "CUBE.ico"
         if _ico.is_file():
             try:
                 self.wm_iconbitmap(str(_ico))

@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="CUBE_logo.png" alt="CUBE" width="240">
+<img src="assets/CUBE_logo.png" alt="CUBE" width="240">
 
 # CUBE
 
@@ -56,13 +56,13 @@ Windows 10 or 11. No programming knowledge and no separate Python or Anaconda in
 CUBE is developed and tested with **Python 3.12.13**. From the CUBE folder:
 
 ```bat
-conda env create -f environment.yml
+conda env create -f env/environment.yml
 conda activate CUBE
-python -m pip install --no-deps -r requirements-lock.txt
+python -m pip install --no-deps -r env/requirements-lock.txt
 python cube.py
 ```
 
-`--no-deps` is required: the lock file pins the exact tested set of packages (PyTorch 2.9.1 with CUDA 13, DeepLabCut 3.0.0rc14, Anipose 0.8.0, numpy 2.4 and all dependencies), and DeepLabCut's own metadata asks for `numpy<2`. Without an NVIDIA GPU use `environment-cpu.yml` and `requirements-lock-cpu.txt`. Installer options: `install_cube.bat -Cpu`, `-Gpu`, `-Recreate`.
+`--no-deps` is required: the lock file pins the exact tested set of packages (PyTorch 2.9.1 with CUDA 13, DeepLabCut 3.0.0rc14, Anipose 0.8.0, numpy 2.4 and all dependencies), and DeepLabCut's own metadata asks for `numpy<2`. Without an NVIDIA GPU use `env/environment-cpu.yml` and `env/requirements-lock-cpu.txt`. Installer options: `install_cube.bat -Cpu`, `-Gpu`, `-Recreate`.
 
 </details>
 
@@ -80,7 +80,7 @@ python cube.py
 | `install_cube.bat`, `install_cube.ps1` | One-click installer (Python 3.12 environment plus every package) |
 | `Launch CUBE.bat`, `Launch Analyser.bat`, `Launch Video Explorer.bat` | Double-click launchers that find the environment automatically |
 | `cube_doctor.py` | The system check behind **Help → System check** and `python cube.py --check` |
-| `environment.yml`, `environment-cpu.yml`, `requirements-lock.txt`, `requirements-lock-cpu.txt` | Conda environment (Python 3.12.13) and the exact package versions, GPU and CPU variants |
+| `env/` (`environment.yml`, `environment-cpu.yml`, `requirements-lock.txt`, `requirements-lock-cpu.txt`) | Conda environment (Python 3.12.13) and the exact package versions, GPU and CPU variants |
 
 ## 📚 Credits and citation
 

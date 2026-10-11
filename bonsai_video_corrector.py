@@ -1059,7 +1059,7 @@ def _font(size: int = 10, bold: bool = False) -> ctk.CTkFont:
 
 def _load_logo(dark: bool) -> Optional[ctk.CTkImage]:
     name = "CUBE_logo dark theme.png" if dark else "CUBE_logo.png"
-    p = HERE / name
+    p = HERE / "assets" / name
     if not p.exists():
         return None
     try:
@@ -1085,7 +1085,7 @@ class VideoPrep(ctk.CTk):
         self.title("CUBE: Step 0 — Video Prep")
         self.geometry("1200x880")
         self.minsize(920, 680)
-        ico = HERE / "CUBE.ico"
+        ico = HERE / "assets" / "CUBE.ico"
         if ico.exists():
             try:
                 self.iconbitmap(str(ico))
@@ -1748,7 +1748,7 @@ class VideoPrep(ctk.CTk):
         win.geometry("820x660")
         win.minsize(640, 480)
         win.bind("<Escape>", lambda _: win.destroy())
-        ico = HERE / "CUBE.ico"
+        ico = HERE / "assets" / "CUBE.ico"
         if ico.exists():
             try:
                 win.after(150, lambda: win.iconbitmap(str(ico)))

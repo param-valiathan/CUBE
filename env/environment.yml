@@ -1,13 +1,13 @@
 # CUBE conda environment (GPU build). Easiest route: double-click install_cube.bat, which does both steps below.
 #
 # Manual install (run from this folder):
-#   conda env create -f environment.yml
+#   conda env create -f env/environment.yml
 #   conda activate CUBE
-#   python -m pip install --no-deps -r requirements-lock.txt
+#   python -m pip install --no-deps -r env/requirements-lock.txt
 #
 # The second step installs the exact package set of the reference environment (all of CUBE's packages,
 # including DeepLabCut, Anipose and PyTorch with CUDA 13). It needs --no-deps because DeepLabCut declares
-# numpy<2 while CUBE runs numpy 2.4.x. No NVIDIA GPU? Use environment-cpu.yml and requirements-lock-cpu.txt.
+# numpy<2 while CUBE runs numpy 2.4.x. No NVIDIA GPU? Use env/environment-cpu.yml and env/requirements-lock-cpu.txt.
 name: CUBE
 channels:
   - conda-forge

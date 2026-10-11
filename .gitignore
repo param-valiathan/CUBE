@@ -2,21 +2,23 @@
 *
 !.gitignore
 !README.md
-!environment.yml
 !*.py
 !*.bat
 !*.ps1
-!environment-cpu.yml
-!requirements-lock.txt
-!requirements-lock-cpu.txt
 !.gitattributes
+!env/
+!env/environment.yml
+!env/environment-cpu.yml
+!env/requirements-lock.txt
+!env/requirements-lock-cpu.txt
+!assets/
+!assets/CUBE.ico
+!assets/CUBE_logo.png
+!assets/CUBE_logo dark theme.png
 !guided/
 !guided/*.py
 !docs/
 !docs/CUBE_Guide.md
 !docs/CUBE_Guide.docx
 !docs/charuco_board_v2_print.png
-!CUBE.ico
-!CUBE_logo.png
-!CUBE_logo dark theme.png
 __pycache__/

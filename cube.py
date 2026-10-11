@@ -8888,7 +8888,7 @@ class CubeSplash(tk.Toplevel):
         self._logo_img = None
         try:
             from PIL import Image, ImageTk
-            p = HERE / logo_file
+            p = HERE / "assets" / logo_file
             if p.is_file():
                 img = Image.open(p).convert("RGBA")
                 img.thumbnail((440, 200), Image.LANCZOS)
@@ -8964,7 +8964,7 @@ class PipelineApp(tk.Tk):
         self.withdraw()   # hidden while building UI; shown at end of __init__
         self.title("CUBE: Comprehensive Unsupervised Behavioral Explorer  v5.0")
 
-        _ico = HERE / "CUBE.ico"
+        _ico = HERE / "assets" / "CUBE.ico"
         if _ico.is_file():
             try:
                 # default= stamps the icon on every window in this interpreter,

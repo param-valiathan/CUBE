@@ -62,8 +62,8 @@ Log "  CUBE installer" 'White'
 Log "=============================================================" 'White'
 
 # ---- 0. sanity checks -------------------------------------------------------------------------
-if (-not (Test-Path (Join-Path $Here 'requirements-lock.txt'))) {
-    Fail "requirements-lock.txt was not found next to this installer. If CUBE came as a ZIP file, right-click it and choose 'Extract All...' first, then run install_cube.bat from the extracted folder."
+if (-not (Test-Path (Join-Path $Here 'env\requirements-lock.txt'))) {
+    Fail "env\requirements-lock.txt was not found next to this installer. If CUBE came as a ZIP file, right-click it and choose 'Extract All...' first, then run install_cube.bat from the extracted folder."
 }
 if (-not [Environment]::Is64BitOperatingSystem) { Fail "CUBE needs 64-bit Windows." }
 if ($Here -match '[^\x00-\x7F]') {
@@ -143,7 +143,7 @@ if ($Cpu) {
 } else {
     Log "No NVIDIA graphics card found. Installing the CPU package set (Steps 2-5 are not affected; Step 1 pose tracking is slower)." 'Yellow'
 }
-$LockFile = if ($useGpu) { 'requirements-lock.txt' } else { 'requirements-lock-cpu.txt' }
+$LockFile = if ($useGpu) { 'env\requirements-lock.txt' } else { 'env\requirements-lock-cpu.txt' }
 
 # ---- 3. environment ---------------------------------------------------------------------------
 Step "3/5" "Creating the '$EnvName' environment with Python $PythonVersion..."
@@ -217,7 +217,7 @@ if (-not $NoShortcuts) {
             $s.TargetPath = Join-Path $Here 'Launch CUBE.bat'
             $s.WorkingDirectory = $Here
             $s.WindowStyle = 7
-            $ico = Join-Path $Here 'CUBE.ico'
+            $ico = Join-Path $Here 'assets\CUBE.ico'
             if (Test-Path $ico) { $s.IconLocation = $ico }
             $s.Description = 'CUBE - Comprehensive Unsupervised Behavioral Explorer'
             $s.Save()

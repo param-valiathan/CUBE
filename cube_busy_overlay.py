@@ -29,7 +29,7 @@ def is_dark(theme: dict) -> bool:
 
 
 def logo_path(theme: dict) -> Path:
-    return _HERE / ("CUBE_logo dark theme.png" if is_dark(theme) else "CUBE_logo.png")
+    return _HERE / "assets" / ("CUBE_logo dark theme.png" if is_dark(theme) else "CUBE_logo.png")
 
 
 class BusyOverlay(tk.Frame):

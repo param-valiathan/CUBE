@@ -709,7 +709,7 @@ class BSoidAnnotator(tk.Tk):
         self.geometry("1440x880")
         self.minsize(1200, 740)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        _ico = Path(__file__).parent / "CUBE.ico"
+        _ico = Path(__file__).parent / "assets" / "CUBE.ico"
         if _ico.is_file():
             try:
                 self.wm_iconbitmap(str(_ico))

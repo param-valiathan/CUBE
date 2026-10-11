@@ -1,6 +1,6 @@
-﻿<div align="center">
+<div align="center">
 
-<img src="../CUBE_logo.png" alt="CUBE" width="260">
+<img src="../assets/CUBE_logo.png" alt="CUBE" width="260">
 
 # CUBE : Comprehensive Unsupervised Behavioral Explorer
 
@@ -91,9 +91,9 @@ In CUBE choose **Help → System check** (or press the **System check** button).
 With any conda, from the CUBE folder:
 
 ```bat
-conda env create -f environment.yml
+conda env create -f env/environment.yml
 conda activate CUBE
-python -m pip install --no-deps -r requirements-lock.txt
+python -m pip install --no-deps -r env/requirements-lock.txt
 python cube.py
 ```
 
@@ -1564,8 +1564,8 @@ Every pipeline run writes into **one** timestamped run folder created inside the
 | `install_cube.bat`, `install_cube.ps1` | One-click installer: finds or installs conda (Miniforge), picks the GPU or CPU set, creates the `CUBE` environment (Python 3.12.13) and installs the lock file, then runs the system check and creates shortcuts |
 | `Launch CUBE.bat`, `Launch Analyser.bat`, `Launch Video Explorer.bat`, `Launch CUBE (console).bat`, `_cube_launch.bat` | Launchers that locate the environment (via `cube_env_path.txt` or the usual conda folders); the last is the shared helper |
 | `cube_doctor.py` | System check behind **Help → System check** and `python cube.py --check` |
-| `environment.yml`, `environment-cpu.yml` | Conda environment specification (Python 3.12.13 and pip) |
-| `requirements-lock.txt`, `requirements-lock-cpu.txt` | Exact versions of every package, installed with `pip install --no-deps -r` |
+| `env/environment.yml`, `env/environment-cpu.yml` | Conda environment specification (Python 3.12.13 and pip) |
+| `env/requirements-lock.txt`, `env/requirements-lock-cpu.txt` | Exact versions of every package, installed with `pip install --no-deps -r` |
 
 <a id="recipes"></a>
 

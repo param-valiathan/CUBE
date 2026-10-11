@@ -2,9 +2,9 @@
 # Steps 2-5 are unaffected). Easiest route: double-click install_cube.bat, which picks this automatically.
 #
 # Manual install (run from this folder):
-#   conda env create -f environment-cpu.yml
+#   conda env create -f env/environment-cpu.yml
 #   conda activate CUBE
-#   python -m pip install --no-deps -r requirements-lock-cpu.txt
+#   python -m pip install --no-deps -r env/requirements-lock-cpu.txt
 name: CUBE
 channels:
   - conda-forge
