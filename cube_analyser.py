@@ -1159,6 +1159,7 @@ def compute_combined(animal_data: list, groups: dict) -> dict:
             "uid":       uid,
             "name":      ani["name"],
             "exp_group": ani["exp_group"],
+            "subject_id": normalize_subject_id(ani.get("subject_id")),
             "fps":       ani["fps"],
             "df":        ani["df"],
             "metrics":   compute_metrics(ani["df"], groups, ani["fps"]),
@@ -1183,6 +1184,9 @@ def compute_combined(animal_data: list, groups: dict) -> dict:
                 vals["total_duration"].append(m.get("total_duration", 0.0))
                 vals["frequency"].append(float(m.get("frequency", 0)))
                 lat = m.get("latency")
+                # Latency exists only for animals that performed the behaviour.
+                # combined_group_values() applies the same rule to the dots and
+                # the tests, so bars, dots and p-values describe one sample.
                 if lat is not None:
                     vals["latency"].append(lat)
                 vals["mean_bout"].append(m.get("mean_bout", 0.0))
@@ -1208,6 +1212,99 @@ def compute_combined(animal_data: list, groups: dict) -> dict:
 # UNBIASED ANALYTICS - STATISTICAL ENGINE
 #
 
+def normalize_subject_id(raw) -> str:
+    """Canonical animal-ID string: trimmed, inner whitespace collapsed,
+    case-folded.  'Mouse 1', 'mouse  1 ' and 'MOUSE 1' are the same animal.
+    Blank/None -> ''."""
+    return " ".join(str(raw or "").split()).casefold()
+
+
+DESIGN_AUTO = "Auto (detect from Label 3)"
+
+
+def detect_repeated_design(animals: list, min_shared: int = 3) -> dict:
+    """Detect whether Label 3 / Animal ID marks the SAME animals recurring
+    across different experimental groups (levels).
+
+    Returns {"shared": [ids seen in >=2 groups], "n_ids": n distinct non-blank
+    IDs, "dup_within": [(id, group)] pairs where one ID has >1 session in one
+    group, "suggest_repeated": bool}.  suggest_repeated is True when at least
+    `min_shared` IDs span 2+ groups — i.e. the data are not independent.
+    """
+    by_id: dict = {}
+    per_cell: dict = {}
+    for a in animals:
+        sid = normalize_subject_id(a.get("subject_id"))
+        if not sid:
+            continue
+        eg = a.get("exp_group")
+        by_id.setdefault(sid, set()).add(eg)
+        per_cell[(sid, eg)] = per_cell.get((sid, eg), 0) + 1
+    shared = sorted(s for s, egs in by_id.items() if len(egs) >= 2)
+    dup = sorted((s, eg) for (s, eg), n in per_cell.items() if n > 1)
+    return {"shared": shared, "n_ids": len(by_id), "dup_within": dup,
+            "suggest_repeated": len(shared) >= min_shared}
+
+
+def describe_pairing(animals: list, max_lines: int = 12) -> str:
+    """Human-readable diagnosis of why animals do (not) pair across levels:
+    animals per level, and for each ID which levels it is missing from."""
+    levels = sorted({a["exp_group"] for a in animals}, key=str)
+    ids: dict = {}
+    blank = 0
+    for a in animals:
+        sid = normalize_subject_id(a.get("subject_id"))
+        if not sid:
+            blank += 1
+            continue
+        ids.setdefault(sid, set()).add(a["exp_group"])
+    lines = [f"Levels ({len(levels)}): " + ", ".join(str(l) for l in levels),
+             f"{len(ids)} distinct animal ID(s); {blank} file(s) with blank Label 3."]
+    if len(ids) == len(animals) - blank and len(levels) > 1 and \
+            all(len(v) == 1 for v in ids.values()):
+        lines.append("Every ID occurs in only ONE level - the same animal is "
+                     "never repeated across levels. Check that Label 3 is "
+                     "identical for the same animal and that 'Group by' is the "
+                     "condition/time label (not Label 3 / All Labels).")
+    miss = [(sid, [str(l) for l in levels if l not in lv])
+            for sid, lv in sorted(ids.items()) if len(lv) < len(levels)]
+    for sid, m in miss[:max_lines]:
+        lines.append(f"  '{sid}' missing from: " + ", ".join(m))
+    if len(miss) > max_lines:
+        lines.append(f"  ... and {len(miss) - max_lines} more")
+    return "\n".join(lines)
+
+
+def resolve_design(choice: str, animals: list) -> tuple:
+    """Map the GUI design choice to 'independent'/'repeated' and a note.
+
+    Auto picks Repeated when Label 3 IDs recur across groups (previously the
+    user had to know to flip a separate dropdown, and identical Label 3 values
+    were silently treated as independent animals — pseudo-replication).
+    An explicit 'Independent Groups' with recurring IDs is honoured but warned.
+    """
+    info = detect_repeated_design(animals)
+    n_sh = len(info["shared"])
+    if choice == "Repeated Measures":
+        return "repeated", ""
+    if choice == "Independent Groups":
+        if n_sh:
+            return "independent", (
+                f"WARNING: {n_sh} Label 3 / Animal ID value(s) appear in more than one "
+                f"group, so these are NOT independent animals. Consider "
+                f"'Repeated Measures' or 'Auto'.")
+        return "independent", ""
+    # Auto
+    if info["suggest_repeated"]:
+        return "repeated", (f"Auto: {n_sh} animal ID(s) recur across groups -> "
+                            f"Repeated Measures (paired by Label 3).")
+    if n_sh:
+        return "independent", (
+            f"Auto: only {n_sh} recurring animal ID(s) (<3) - too few to pair; "
+            f"treating groups as independent.")
+    return "independent", ""
+
+
 def benjamini_hochberg(pvals) -> "np.ndarray":
     """Benjamini-Hochberg FDR-adjusted q-values for an array of p-values.
 
@@ -1216,15 +1313,24 @@ def benjamini_hochberg(pvals) -> "np.ndarray":
     monotonicity from the largest p downward, and clip to [0, 1].
     """
     p = np.asarray(pvals, dtype=float)
-    n = p.size
-    if n == 0:
+    if p.size == 0:
         return p
-    order  = np.argsort(p)
-    ranked = p[order]
+    # NaN p-values (untestable: e.g. every value identical) are left out of the
+    # family and returned as NaN.  Previously a single NaN propagated through
+    # the running minimum and turned EVERY q-value in the family into NaN.
+    out = np.full(p.shape, np.nan, dtype=float)
+    ok = np.isfinite(p)
+    n = int(ok.sum())
+    if n == 0:
+        return out
+    pv = p[ok]
+    order  = np.argsort(pv)
+    ranked = pv[order]
     q = ranked * n / np.arange(1, n + 1)
     q = np.minimum.accumulate(q[::-1])[::-1]   # monotone non-decreasing in p
-    out = np.empty(n, dtype=float)
-    out[order] = np.clip(q, 0.0, 1.0)
+    q_ok = np.empty(n, dtype=float)
+    q_ok[order] = np.clip(q, 0.0, 1.0)
+    out[ok] = q_ok
     return out
 
 
@@ -1476,6 +1582,52 @@ def draw_sig_brackets(ax, group_names: list, all_pts: list, y_start: float,
     return y
 
 
+def write_stats_support_csvs(stats_df, animals: list, metric: str, out_dir,
+                             stem: str = "stats") -> list:
+    """CSVs that make the Unbiased stats table auditable against its plots:
+      {stem}_per_animal.csv  the exact per-animal values behind every bar/dot
+                             (0 = cluster not expressed by that animal)
+      {stem}_posthoc.csv     every pairwise post-hoc pair (not just the
+                             significant ones drawn), FDR-pooled across clusters
+    Returns written paths.  Failures are swallowed per file."""
+    out_dir = pathlib.Path(out_dir)
+    written = []
+    if stats_df is None or getattr(stats_df, "empty", True):
+        return written
+    try:
+        fn = ((lambda a: compute_per_pair_transition_probs(a["df"]))
+              if metric == "transition_prob" else
+              (lambda a: compute_per_cluster_metrics(a["df"], a["fps"],
+                                                     a.get("kinematics_df"))))
+        rows = []
+        cids = list(stats_df["cluster_id"])
+        for ani in animals:
+            pcm = fn(ani)
+            for cid in cids:
+                here = cid in pcm.index
+                rows.append({"cluster_id": cid, "exp_group": ani["exp_group"],
+                             "animal": ani.get("name", ""),
+                             "subject_id": ani.get("subject_id", ""),
+                             "metric": metric,
+                             "value": float(pcm.loc[cid, metric]) if here else 0.0,
+                             "expressed": int(here)})
+        p = out_dir / f"{stem}_per_animal.csv"
+        pd.DataFrame(rows).to_csv(p, index=False); written.append(p)
+    except Exception:
+        pass
+    try:
+        recs = stats_df.attrs.get("posthoc_recs") or {}
+        prow = [{"cluster_id": cid, "group_a": r["group_a"], "group_b": r["group_b"],
+                 "direction": f"A{r['direction']}B", "p_value": r["p"], "q_value_FDR": r["q"]}
+                for cid, lst in recs.items() for r in lst]
+        if prow:
+            p = out_dir / f"{stem}_posthoc.csv"
+            pd.DataFrame(prow).to_csv(p, index=False); written.append(p)
+    except Exception:
+        pass
+    return written
+
+
 def family_wide_fdr(stats_by_metric: dict) -> pd.DataFrame:
     """Pool p-values across ALL (metric x cluster) tests and apply one BH pass.
 
@@ -1489,9 +1641,13 @@ def family_wide_fdr(stats_by_metric: dict) -> pd.DataFrame:
         if _df is None or getattr(_df, "empty", True):
             continue
         for _, r in _df.iterrows():
+            _p = float(r.get("pval_kw", float("nan")))
+            # Untestable tests (stat NaN, p forced to 1.0) are not part of the family.
+            if not np.isfinite(float(r.get("stat_kw", float("nan")))):
+                _p = float("nan")
             rows.append({"metric": _metric,
                          "cluster_id": r.get("cluster_id"),
-                         "pval_kw": float(r.get("pval_kw", float("nan")))})
+                         "pval_kw": _p})
     if not rows:
         return pd.DataFrame(columns=["metric", "cluster_id",
                                      "pval_kw", "qval_family"])
@@ -1572,7 +1728,7 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
     for ani in animal_data:
         eg  = ani["exp_group"]
         pcm = _compute_fn(ani)
-        sid = str(ani.get("subject_id") or "").strip()
+        sid = normalize_subject_id(ani.get("subject_id"))
         eg_map.setdefault(eg, []).append((sid, pcm))
 
     all_clusters = set()
@@ -1588,10 +1744,19 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
     common_subjects: list = []
     n_excluded_subjects = 0
     if design == "repeated":
-        level_pcm_by_subject = {
-            eg: {sid: pcm for sid, pcm in eg_map[eg] if sid}
-            for eg in eg_names
-        }
+        # Several sessions of the SAME animal inside one level (e.g. two
+        # baseline recordings) are averaged per cluster, instead of silently
+        # keeping only the first and discarding the rest.
+        level_pcm_by_subject = {}
+        for eg in eg_names:
+            _by = {}
+            for sid, pcm in eg_map[eg]:
+                if sid:
+                    _by.setdefault(sid, []).append(pcm)
+            level_pcm_by_subject[eg] = {
+                sid: (lst[0] if len(lst) == 1 else
+                      pd.concat(lst).groupby(level=0).mean(numeric_only=True))
+                for sid, lst in _by.items()}
         subj_sets = [set(level_pcm_by_subject[eg]) for eg in eg_names]
         common_subjects = sorted(set.intersection(*subj_sets)) if subj_sets else []
         all_seen = set().union(*subj_sets) if subj_sets else set()
@@ -1801,7 +1966,15 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
         # ~30 clusters x several metrics, uncorrected p-values are not
         # publishable — qval_kw is the value that should drive significance
         # calls (volcano thresholds, heatmap stars).
-        df_res["qval_kw"] = benjamini_hochberg(df_res["pval_kw"].to_numpy())
+        # Untestable rows (kruskal raised, e.g. every value identical -> stat
+        # NaN, p forced to 1.0) are excluded from the BH family instead of
+        # counting as extra p=1.0 tests, which only inflated the denominator
+        # and cost power for every real test.  They report q = 1.0.
+        def _bh_testable(p_col, stat_col):
+            p = df_res[p_col].to_numpy(dtype=float).copy()
+            p[~np.isfinite(df_res[stat_col].to_numpy(dtype=float))] = np.nan
+            return pd.Series(benjamini_hochberg(p), index=df_res.index).fillna(1.0).to_numpy()
+        df_res["qval_kw"] = _bh_testable("pval_kw", "stat_kw")
         df_res["neg_log10_q"] = -np.log10(
             np.clip(df_res["qval_kw"].to_numpy(), 1e-300, None))
         # FDR for the two-part tests (same cluster family).  Not computed for
@@ -1811,11 +1984,11 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
         # in benjamini_hochberg, e.g. via reversed cumulative min).
         if design != "repeated":
             if "pval_prevalence" in df_res.columns:
-                df_res["qval_prevalence"] = benjamini_hochberg(
-                    df_res["pval_prevalence"].to_numpy())
+                df_res["qval_prevalence"] = _bh_testable(
+                    "pval_prevalence", "stat_prevalence")
             if "pval_kw_present" in df_res.columns:
-                df_res["qval_kw_present"] = benjamini_hochberg(
-                    df_res["pval_kw_present"].to_numpy())
+                df_res["qval_kw_present"] = _bh_testable(
+                    "pval_kw_present", "stat_kw_present")
         else:
             df_res["qval_prevalence"] = float("nan")
             df_res["qval_kw_present"] = float("nan")
@@ -1842,6 +2015,11 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
         df_res["sig_driver"] = df_res.apply(_driver, axis=1)
         df_res = df_res.sort_values("qval_kw").reset_index(drop=True)
     df_res.attrs["design"] = design
+    # Full pooled pairwise post-hoc recs per cluster ({cid: [{group_a, group_b,
+    # p, q, direction}]}) so figures draw brackets from the SAME all-cluster FDR
+    # family as the table, not from a family limited to the panels shown.
+    df_res.attrs["posthoc_recs"] = (
+        dict(zip(_ph_cids, _ph_pooled)) if (with_posthoc and _posthoc_gv_by_cid) else {})
     if design == "repeated":
         df_res.attrs["n_matched_subjects"] = len(common_subjects)
         df_res.attrs["n_excluded_subjects"] = n_excluded_subjects
@@ -3419,21 +3597,9 @@ def build_recombination_comparison_figure(recluster_result: dict,
 
             #   significance stars per merged group  
             if SCIPY_OK and n_eg >= 2:
-                for xi, mg in enumerate(mg_ids):
-                    st = mg_stats[mg]
-                    groups_for_test = [np.array(st["raw"][eg]) for eg in eg_names]
-                    try:
-                        _, pv = sp_stats.kruskal(*groups_for_test)
-                    except Exception:
-                        pv = 1.0
-                    stars = ("***" if pv < 0.001 else
-                             "**"  if pv < 0.01  else
-                             "*"   if pv < 0.05  else "")
-                    if stars:
-                        ymax = ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 2.0
-                        ax.text(x_base[xi], ymax * 0.95, stars,
-                                ha="center", fontsize=11, color="#FF4081",
-                                fontweight="bold")
+                annotate_grouped_bar_significance(
+                    ax, x_base, bar_w, eg_names,
+                    [mg_stats[mg]["raw"] for mg in mg_ids], tick=t["tick"])
 
             # x-axis labels: show RG-N and exactly which raw clusters compose
             # it. Fewer merged groups per row => more room per label, so show
@@ -3695,19 +3861,9 @@ def build_guided_merge_figure(recluster_result: dict, guided_result: dict,
                    label=f"ref ({ref_eg})")
 
         if SCIPY_OK and n_eg >= 2:
-            for xi, mg in enumerate(mg_keys):
-                st = mg_stats[mg]
-                groups_for_test = [np.array(st["raw"][eg]) for eg in eg_names]
-                try:
-                    _, pv = sp_stats.kruskal(*groups_for_test)
-                except Exception:
-                    pv = 1.0
-                stars = ("***" if pv < 0.001 else "**" if pv < 0.01 else
-                          "*" if pv < 0.05 else "")
-                if stars:
-                    ymax = ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 2.0
-                    ax.text(x_base[xi], ymax * 0.95, stars, ha="center",
-                            fontsize=11, color="#FF4081", fontweight="bold")
+            annotate_grouped_bar_significance(
+                ax, x_base, bar_w, eg_names,
+                [mg_stats[mg]["raw"] for mg in mg_keys], tick=t["tick"])
 
         max_show = 6 if n_mg <= 4 else 4 if n_mg <= 8 else 3
         fsize_x  = max(6, 9 - n_mg // 3)
@@ -4031,7 +4187,13 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
         t = T()
 
     _sig_col, _ = fdr_sig_column(stats_df)
-    sig_df  = stats_df[stats_df[_sig_col] < p_thresh].head(top_n)
+    # Show a cluster if its omnibus test is significant OR any pairwise post-hoc
+    # pair is (FDR-pooled across all clusters).  Previously a cluster where one
+    # specific pair differs but the omnibus missed q<thresh was never surfaced.
+    _sel = stats_df[_sig_col] < p_thresh
+    if "posthoc_min_q" in stats_df.columns:
+        _sel = _sel | (stats_df["posthoc_min_q"].fillna(1.0) < p_thresh)
+    sig_df  = stats_df[_sel].head(top_n)
     top_ids = sig_df["cluster_id"].tolist()
     if not top_ids:
         top_ids = stats_df.head(min(top_n, len(stats_df)))["cluster_id"].tolist()
@@ -4075,7 +4237,12 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
     # Control vs Therm Pain) show different stars from one cluster to the next
     # for no reason but which other p-values happened to share its local family.
     posthoc_by_panel = [[] for _ in top_ids]
-    if n_eg > 2:
+    _stored_ph = stats_df.attrs.get("posthoc_recs") or {}
+    if n_eg > 2 and all(c in _stored_ph for c in top_ids):
+        # Same all-cluster FDR family as the stats table (no re-correction over
+        # only the panels shown, which are pre-selected for significance).
+        posthoc_by_panel = [_stored_ph[c] for c in top_ids]
+    elif n_eg > 2:
         panel_group_vals = []
         for cid in top_ids:
             gv = {}
@@ -4145,29 +4312,33 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
             data_ceil = max(data_top, max_pt)
             head_top = max(data_ceil * 1.65, 0.001)
             ax.set_ylim(bottom=0, top=head_top)
-            if n_eg >= 2:
+            if n_eg == 2:
                 bh = head_top * 0.88
-                ax.plot([0, 0, n_eg - 1, n_eg - 1],
+                ax.plot([0, 0, 1, 1],
                         [bh, bh + head_top * 0.025, bh + head_top * 0.025, bh],
                         lw=0.8, color=t["tick"])
                 star_color = "#FF4081" if stars != "ns" else t["muted"]
-                ax.text((n_eg - 1) / 2, bh + head_top * 0.033, stars,
+                ax.text(0.5, bh + head_top * 0.033, stars,
                         ha="center", fontsize=10, color=star_color,
                         fontweight="bold" if stars != "ns" else "normal")
-                # With >2 groups, localise the omnibus effect with pairwise
-                # post-hoc brackets (FDR-adjusted) below the omnibus bracket so
-                # the single star is no longer ambiguous about WHICH pair differs.
-                if n_eg > 2 and stars != "ns":
-                    try:
-                        _ytop = draw_sig_brackets(
-                            ax, eg_names, all_pts,
-                            y_start=data_ceil * 1.06, y_step=head_top * 0.09,
-                            tick_color=t["tick"],
-                            precomputed_recs=posthoc_by_panel[xi])
-                        if _ytop > bh * 0.92:
-                            ax.set_ylim(top=max(head_top, _ytop * 1.12))
-                    except Exception:
-                        pass
+            elif n_eg > 2:
+                # >2 groups: the omnibus test belongs to no single pair, so it
+                # is a corner label; each starred bracket spans exactly the two
+                # bars of its own pairwise (FDR-pooled) post-hoc comparison.
+                star_color = "#FF4081" if stars != "ns" else t["muted"]
+                ax.text(0.02, 0.98, f"KW {stars}", transform=ax.transAxes,
+                        ha="left", va="top", fontsize=8, color=star_color,
+                        fontweight="bold" if stars != "ns" else "normal")
+                try:
+                    _ytop = draw_sig_brackets(
+                        ax, eg_names, all_pts,
+                        y_start=data_ceil * 1.06, y_step=head_top * 0.09,
+                        tick_color=t["tick"],
+                        precomputed_recs=posthoc_by_panel[xi])
+                    if _ytop > head_top * 0.92:
+                        ax.set_ylim(top=max(head_top, _ytop * 1.12))
+                except Exception:
+                    pass
 
             ax.set_xticks(x_pos)
             ax.set_xticklabels(eg_names, rotation=22, ha="right",
@@ -4204,6 +4375,7 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
         bg_names   = list(groups.keys())
         n_bg       = len(bg_names)
         pvals_bg   = compute_combined_pvals(combined, groups)
+        _ph_bg     = compute_combined_posthoc(combined, groups)
         rng2       = np.random.default_rng(13)
 
         ncols_bg = min(n_bg, 5)
@@ -4227,9 +4399,11 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
                 x2 = np.arange(len(eg_names_c))
                 means2, sems2, pts2 = [], [], []
                 for eg in eg_names_c:
-                    vs = [records_c[uid2idx_c[uid]]["metrics"]
-                          .get(bg, {}).get(metric) or 0.0
-                          for uid in expg_c[eg]]
+                    vs = (combined_group_values(combined, bg, metric, eg)
+                          if metric in COMBINED_METRIC_KEYS else
+                          [records_c[uid2idx_c[uid]]["metrics"]
+                           .get(bg, {}).get(metric) or 0.0
+                           for uid in expg_c[eg]])
                     means2.append(float(np.mean(vs)))
                     sems2.append(float(np.std(vs, ddof=1) / np.sqrt(len(vs)))
                                  if len(vs) > 1 else 0.0)
@@ -4247,22 +4421,12 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
                                 edgecolors=ec2, s=22, linewidths=0.7,
                                 alpha=0.88, zorder=4)
 
-                stars2 = ("***" if qv2 is not None and qv2 < 0.001 else
-                          "**"  if qv2 is not None and qv2 < 0.01  else
-                          "*"   if qv2 is not None and qv2 < 0.05  else "ns")
-                dt2  = max((m + s for m, s in zip(means2, sems2)), default=0)
-                mp2  = max((max(p) for p in pts2 if p), default=0)
-                ht2  = max(dt2 * 1.40, mp2 * 1.40, 0.001)
-                ax2.set_ylim(bottom=0, top=ht2)
-                if len(eg_names_c) >= 2:
-                    bh2 = ht2 * 0.78
-                    ax2.plot([0, 0, len(eg_names_c) - 1, len(eg_names_c) - 1],
-                             [bh2, bh2 + ht2 * 0.04, bh2 + ht2 * 0.04, bh2],
-                             lw=0.9, color=t["tick"])
-                    sc2 = "#FF4081" if stars2 != "ns" else t["muted"]
-                    ax2.text((len(eg_names_c) - 1) / 2, bh2 + ht2 * 0.055,
-                             stars2, ha="center", fontsize=10, color=sc2,
-                             fontweight="bold" if stars2 != "ns" else "normal")
+                ax2.set_ylim(bottom=0)
+                if len(eg_names_c) >= 2 and metric in COMBINED_METRIC_KEYS:
+                    annotate_group_significance(
+                        ax2, eg_names_c, pts2, qv2,
+                        _ph_bg.get((metric, bg)),
+                        tick=t["tick"], muted=t["muted"])
 
                 ax2.set_xticks(x2)
                 ax2.set_xticklabels(eg_names_c, rotation=22, ha="right",
@@ -4977,7 +5141,11 @@ def build_group_transition_comparison_figure(
 
             if _ok_volcano:
                 try:
-                    from scipy.stats import ttest_ind as _ttest
+                    # Rank-based (Mann-Whitney U), consistent with the rest of the
+                    # analyser: transition probabilities are zero-inflated/skewed
+                    # and n per group is small, where Welch's t is unreliable.
+                    def _ttest(a, b, equal_var=False):
+                        return sp_stats.mannwhitneyu(a, b, alternative="two-sided")
                     _ann_v: list = []
                     # Collect per-pair stats
                     _pair_stats: list = []
@@ -4989,18 +5157,34 @@ def build_group_transition_comparison_figure(
                         _delta_v = _mean_a - _mean_b
                         try:
                             _, _pv = _ttest(_va, _vb, equal_var=False)
+                            _pv = float(_pv)
                         except Exception:
-                            _pv = 1.0
-                        _pv = max(float(_pv), 1e-300)
-                        _pair_stats.append((pname, _delta_v, _pv))
+                            _pv = float("nan")
+                        # zero variance in both groups -> NaN: untestable, left
+                        # out of the FDR family (previously max(nan, 1e-300)
+                        # silently kept the NaN and the pair vanished).
+                        if np.isfinite(_pv):
+                            _pv = max(_pv, 1e-300)
+                        _pair_stats.append([pname, _delta_v, _pv])
                         if stats_out is not None:
                             stats_out.append({
                                 "transition_pair": pname,
                                 "delta": _delta_v,
                                 f"mean_{eg_a}": _mean_a,
                                 f"mean_{eg_b}": _mean_b,
-                                "pval_welch": _pv,
+                                "pval_mwu": _pv,
                             })
+
+                    # Hundreds of pairs are tested at once: judge significance on
+                    # the BH FDR q-value, not the raw p-value.
+                    _q_all = benjamini_hochberg(
+                        np.array([s[2] for s in _pair_stats], dtype=float))
+                    _n0 = len(stats_out) - len(_pair_stats) if stats_out is not None else 0
+                    for _k, _qk in enumerate(_q_all):
+                        _qk = float(_qk) if np.isfinite(_qk) else 1.0
+                        if stats_out is not None:
+                            stats_out[_n0 + _k]["qval_fdr"] = _qk
+                        _pair_stats[_k][2] = _qk
 
                     _all_deltas = [abs(s[1]) for s in _pair_stats]
                     _top_thresh = (sorted(_all_deltas, reverse=True)[top_n - 1]
@@ -5011,7 +5195,7 @@ def build_group_transition_comparison_figure(
                     ax_c.axvline(0, ls="--", color=t["muted"], lw=0.8, alpha=0.7)
 
                     for pname, dv, pv in _pair_stats:
-                        _y_v  = -np.log10(pv)
+                        _y_v  = -np.log10(max(pv, 1e-300))   # pv is the FDR q here
                         _sig  = pv < 0.05
                         _top  = abs(dv) >= _top_thresh and _sig
                         # Determine source cluster pair from "Ci→Cj" string
@@ -5052,9 +5236,9 @@ def build_group_transition_comparison_figure(
 
                     ax_c.set_xlabel(f"ΔT  ({eg_a} − {eg_b})",
                                     color=t["tick"], fontsize=8)
-                    ax_c.set_ylabel("−log₁₀(p)", color=t["tick"], fontsize=8)
+                    ax_c.set_ylabel("−log₁₀(FDR q)", color=t["tick"], fontsize=8)
                     ax_c.set_title(
-                        "Transition Volcano\n(Welch t-test per pair)",
+                        "Transition Volcano\n(Mann-Whitney U per pair, BH-FDR)",
                         color=t["tick"], fontsize=9, fontweight="bold")
                 except Exception as _exc_v:
                     ax_c.text(0.5, 0.5, f"Volcano error:\n{_exc_v}",
@@ -5403,46 +5587,304 @@ def build_preview_figure(groups, metrics, session_s, t=None) -> plt.Figure:
     return fig
 
 
+COMBINED_METRIC_KEYS = ("total_duration", "frequency", "latency", "mean_bout")
+
+
+def combined_group_values(combined: dict, bg: str, metric_key: str, eg: str) -> list:
+    """Per-animal values of one metric for one behaviour group in one exp group.
+
+    Single source of truth for bars, dots AND statistics in the Combined
+    Analysis tab.  An animal that never performed the behaviour contributes 0
+    to duration/frequency/mean bout, but is OMITTED from latency (it has none;
+    counting it as 0.0 — "instant" — was wrong, and censoring at session length
+    would inject session-length differences into the test).
+    """
+    records, idx = combined["records"], combined["uid_to_idx"]
+    out = []
+    for uid in combined["exp_groups"][eg]:
+        v = records[idx[uid]]["metrics"].get(bg, {}).get(metric_key)
+        if v is None:
+            if metric_key == "latency":
+                continue
+            v = 0.0
+        out.append(float(v))
+    return out
+
+
+def combined_subject_values(combined: dict, bg: str, metric_key: str, eg: str) -> dict:
+    """{subject_id: value} for one exp group (Repeated Measures pairing).
+    Several sessions of the same animal in one level are averaged; animals
+    without an ID, or without a latency (never performed), are omitted."""
+    records, idx = combined["records"], combined["uid_to_idx"]
+    acc: dict = {}
+    for uid in combined["exp_groups"][eg]:
+        rec = records[idx[uid]]
+        sid = rec.get("subject_id") or ""
+        if not sid:
+            continue
+        v = rec["metrics"].get(bg, {}).get(metric_key)
+        if v is None:
+            if metric_key == "latency":
+                continue
+            v = 0.0
+        acc.setdefault(sid, []).append(float(v))
+    return {s: float(np.mean(v)) for s, v in acc.items()}
+
+
+def _combined_is_repeated(combined: dict) -> bool:
+    return combined.get("design") == "repeated"
+
+
+def _combined_paired_p(combined: dict, bg: str, metric_key: str, eg_names: list):
+    """Omnibus p for a repeated design: Wilcoxon (2 levels) / Friedman (>=3)
+    on animals present in every level.  None when untestable."""
+    lv = {eg: combined_subject_values(combined, bg, metric_key, eg) for eg in eg_names}
+    common = sorted(set.intersection(*[set(d) for d in lv.values()])) if lv else []
+    if len(common) < 3:
+        return None
+    arrs = [np.array([lv[eg][s] for s in common], dtype=float) for eg in eg_names]
+    try:
+        if len(arrs) == 2:
+            if np.allclose(arrs[0], arrs[1]):
+                return None
+            _, p = sp_stats.wilcoxon(arrs[0], arrs[1])
+        else:
+            _, p = sp_stats.friedmanchisquare(*arrs)
+        return float(p) if np.isfinite(p) else None
+    except Exception:
+        return None
+
+
 def compute_combined_pvals(combined: dict, groups: dict) -> dict:
     """
     Compute KW p-values for every (metric_key, beh_group) pair, then apply
-    Benjamini-Hochberg FDR correction across all tests simultaneously.
+    Benjamini-Hochberg FDR correction across all tests simultaneously (one
+    family: every metric x behaviour group).  Untestable tests (every value
+    identical) get pval=None, qval=None and are left out of the family.
     Returns {(metric_key, beh_group): {"pval": float|None, "qval": float|None}}.
     """
     if not SCIPY_OK:
         return {}
-    records    = combined["records"]
-    uid_to_idx = combined["uid_to_idx"]
-    exp_groups = combined["exp_groups"]
-    eg_names   = list(exp_groups.keys())
+    eg_names = list(combined["exp_groups"].keys())
     raw_pvals: dict = {}
-    for metric_key in ("total_duration", "frequency", "latency", "mean_bout"):
+    for metric_key in COMBINED_METRIC_KEYS:
         for bg in groups:
-            if len(eg_names) < 2:
-                raw_pvals[(metric_key, bg)] = None
-                continue
-            group_vals = [
-                np.array([records[uid_to_idx[uid]]["metrics"]
-                          .get(bg, {}).get(metric_key) or 0.0
-                          for uid in exp_groups[eg]], dtype=float)
-                for eg in eg_names
-            ]
-            try:
-                _, pv = sp_stats.kruskal(*group_vals)
-            except Exception:
+            pv = None
+            if len(eg_names) >= 2 and _combined_is_repeated(combined):
+                pv = _combined_paired_p(combined, bg, metric_key, eg_names)
+            elif len(eg_names) >= 2:
+                group_vals = [np.array(combined_group_values(combined, bg, metric_key, eg),
+                                       dtype=float) for eg in eg_names]
+                group_vals = [g for g in group_vals if len(g) > 0]
+                if len(group_vals) < 2:
+                    group_vals = []
                 try:
-                    _, pv = sp_stats.f_oneway(*group_vals)
+                    if not group_vals:
+                        raise ValueError("fewer than 2 groups have data")
+                    _, pv = sp_stats.kruskal(*group_vals)
+                    pv = float(pv) if np.isfinite(pv) else None
                 except Exception:
+                    # kruskal raises when all values are identical -> untestable.
+                    # (The old f_oneway fallback returned NaN here, which then
+                    # poisoned the whole BH family.)
                     pv = None
             raw_pvals[(metric_key, bg)] = pv
 
-    # BH FDR correction across the full family of tests
     keys  = list(raw_pvals.keys())
-    p_arr = np.array([raw_pvals[k] if raw_pvals[k] is not None else 1.0 for k in keys])
+    p_arr = np.array([raw_pvals[k] if raw_pvals[k] is not None else np.nan for k in keys],
+                     dtype=float)
     q_arr = benjamini_hochberg(p_arr)
     return {k: {"pval": raw_pvals[k],
                 "qval": float(q_arr[i]) if raw_pvals[k] is not None else None}
             for i, k in enumerate(keys)}
+
+
+def compute_combined_posthoc(combined: dict, groups: dict) -> dict:
+    """Pairwise post-hoc (Dunn / Mann-Whitney) for every (metric, behaviour
+    group), BH-pooled into ONE family across all of them, for >2 exp groups.
+    Returns {(metric_key, beh_group): [ {group_a, group_b, p, q, direction} ]}
+    (empty dict for <3 groups)."""
+    eg_names = list(combined["exp_groups"].keys())
+    if not SCIPY_OK or len(eg_names) < 3:
+        return {}
+    keys = [(m, bg) for m in COMBINED_METRIC_KEYS for bg in groups]
+    paired = _combined_is_repeated(combined)
+    _vals = combined_subject_values if paired else combined_group_values
+    gvs = [{eg: _vals(combined, bg, m, eg) for eg in eg_names}
+           for m, bg in keys]
+    pooled = pairwise_posthoc_pooled(gvs, paired=paired)
+    return dict(zip(keys, pooled))
+
+
+def annotate_grouped_bar_significance(ax, x_base, bar_w: float, eg_names: list,
+                                      raw_per_item: list, tick="#aaaacc",
+                                      star_color="#FF4081") -> list:
+    """Significance for grouped bars (one cluster of len(eg_names) bars per
+    x item, e.g. merged behaviour groups).
+
+    raw_per_item: list (one per x item) of {exp_group: [values]}.
+    Omnibus KW p-values are BH-corrected across ALL items (previously raw p, so
+    with many merged groups a few stars were expected by chance).  Stars (only
+    q<0.05) sit above the item.  With >2 groups, each significant pairwise
+    post-hoc pair (FDR-pooled across items) gets a bracket spanning exactly
+    those two bars.  Returns the list of per-item omnibus q-values."""
+    n_eg = len(eg_names)
+    if not SCIPY_OK or n_eg < 2:
+        return []
+    pvals = []
+    for item in raw_per_item:
+        arrs = [np.asarray(item[eg], dtype=float) for eg in eg_names if len(item[eg])]
+        p = np.nan
+        if len(arrs) >= 2:
+            try:
+                _, p = sp_stats.kruskal(*arrs)
+                p = float(p)
+            except Exception:
+                p = np.nan   # identical values: untestable
+        pvals.append(p)
+    qs = benjamini_hochberg(np.asarray(pvals, dtype=float))
+    posthoc = (pairwise_posthoc_pooled(
+        [{eg: list(item[eg]) for eg in eg_names} for item in raw_per_item])
+        if n_eg > 2 else [[] for _ in raw_per_item])
+    offs = {eg: (i - (n_eg - 1) / 2) * bar_w for i, eg in enumerate(eg_names)}
+    ymax = ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 2.0
+    step = ymax * 0.07
+    top = ymax
+    for xi, (q, recs) in enumerate(zip(qs, posthoc)):
+        y = ymax * 0.97
+        if n_eg > 2:
+            for r in sorted([r for r in recs if r.get("q", 1.0) < 0.05],
+                            key=lambda r: abs(eg_names.index(r["group_a"])
+                                              - eg_names.index(r["group_b"]))):
+                xa = x_base[xi] + offs[r["group_a"]]
+                xb = x_base[xi] + offs[r["group_b"]]
+                x0, x1 = min(xa, xb), max(xa, xb)
+                ax.plot([x0, x0, x1, x1], [y, y + step * 0.25, y + step * 0.25, y],
+                        lw=0.7, color=tick)
+                qq = r["q"]
+                ax.text((x0 + x1) / 2, y + step * 0.27,
+                        "***" if qq < 0.001 else "**" if qq < 0.01 else "*",
+                        ha="center", fontsize=9, color=star_color, fontweight="bold")
+                y += step
+            top = max(top, y + step)
+        elif np.isfinite(q) and q < 0.05:
+            ax.text(x_base[xi], y, "***" if q < 0.001 else "**" if q < 0.01 else "*",
+                    ha="center", fontsize=11, color=star_color, fontweight="bold")
+    if top > ymax:
+        ax.set_ylim(top=top)
+    return [float(q) for q in qs]
+
+
+def write_combined_csvs(combined: dict, groups: dict, out_dir, ts: str) -> list:
+    """Write the Combined Analysis tables — the SAME numbers the plots use
+    (shared combined_group_values / compute_combined_pvals / posthoc family):
+      combined_summary_*.csv   mean/SEM/N per exp group x behaviour x metric, with
+                               omnibus test name, design, p, FDR q and stars
+      combined_per_animal_*.csv one row per animal x behaviour x metric (the dots)
+      combined_posthoc_*.csv   pairwise post-hoc (only for >2 exp groups)
+    Returns the list of written paths."""
+    out_dir = pathlib.Path(out_dir)
+    repeated = _combined_is_repeated(combined)
+    n_eg = len(combined["exp_groups"])
+    test_name = ("Wilcoxon signed-rank" if (repeated and n_eg == 2) else
+                 "Friedman" if repeated else "Kruskal-Wallis")
+    pvals = compute_combined_pvals(combined, groups)
+
+    def _stars(qv):
+        if qv is None:
+            return "N/A"
+        return "***" if qv < 0.001 else "**" if qv < 0.01 else "*" if qv < 0.05 else "ns"
+
+    rows, arows = [], []
+    for eg, beh_dict in combined["grand"].items():
+        for bg in groups:
+            for m in COMBINED_METRIC_KEYS:
+                d = beh_dict[bg][m]
+                pd_ = pvals.get((m, bg)) or {}
+                pv, qv = pd_.get("pval"), pd_.get("qval")
+                rows.append({
+                    "Exp_Group": eg, "Beh_Group": bg, "Metric": m,
+                    "Mean": round(d["mean"], 6), "SEM": round(d["sem"], 6), "N": d["n"],
+                    "Design": "repeated" if repeated else "independent",
+                    "Omnibus_test": test_name,
+                    "p_value": round(pv, 6) if pv is not None else "N/A",
+                    "q_value_FDR": round(qv, 6) if qv is not None else "N/A",
+                    "Significance_FDR": _stars(qv)})
+    for eg, uids in combined["exp_groups"].items():
+        for uid in uids:
+            rec = combined["records"][combined["uid_to_idx"][uid]]
+            for bg in groups:
+                for m in COMBINED_METRIC_KEYS:
+                    v = rec["metrics"].get(bg, {}).get(m)
+                    arows.append({"Exp_Group": eg, "Animal": rec["name"],
+                                  "Subject_ID": rec.get("subject_id", ""),
+                                  "Beh_Group": bg, "Metric": m,
+                                  "Value": ("" if (v is None and m == "latency")
+                                            else (0.0 if v is None else v))})
+    written = []
+    p = out_dir / f"combined_summary_{ts}.csv"
+    pd.DataFrame(rows).to_csv(p, index=False); written.append(p)
+    p = out_dir / f"combined_per_animal_{ts}.csv"
+    pd.DataFrame(arows).to_csv(p, index=False); written.append(p)
+    ph = compute_combined_posthoc(combined, groups)
+    prow = [{"Beh_Group": bg, "Metric": m, "Group_A": r["group_a"],
+             "Group_B": r["group_b"], "Direction": f"A{r['direction']}B",
+             "p_value": round(r["p"], 6), "q_value_FDR": round(r["q"], 6),
+             "Significance_FDR": _stars(r["q"])}
+            for (m, bg), recs in ph.items() for r in recs]
+    if prow:
+        p = out_dir / f"combined_posthoc_{ts}.csv"
+        pd.DataFrame(prow).to_csv(p, index=False); written.append(p)
+    return written
+
+
+def annotate_group_significance(ax, eg_names: list, pts_list: list, q,
+                                recs, tick="#aaaacc", muted="#888888",
+                                sig_color="#FF4081") -> None:
+    """Draw significance on a bar panel so every star sits over the comparison
+    it actually refers to.
+
+    2 groups: one bracket between them, starred from the omnibus (= two-group)
+    q.  >2 groups: the omnibus KW result is a corner label ('KW *' / 'KW ns' —
+    it does not belong to any single pair), and each pairwise post-hoc pair
+    with q<0.05 gets its own bracket spanning exactly those two bars.
+    Uses the axes' current autoscaled top as the data ceiling.
+    """
+    n_eg = len(eg_names)
+    if n_eg < 2:
+        return
+    ceil = ax.get_ylim()[1]
+    if ceil <= 0:
+        ceil = 1.0
+
+    def _stars(v):
+        return "***" if v < 0.001 else "**" if v < 0.01 else "*" if v < 0.05 else "ns"
+
+    if n_eg == 2:
+        if q is None:
+            return
+        s = _stars(q)
+        top = ceil * 1.30
+        bh = ceil * 1.04
+        ax.plot([0, 0, 1, 1], [bh, bh + top * 0.03, bh + top * 0.03, bh],
+                lw=1.0, color=tick)
+        ax.text(0.5, bh + top * 0.04, s, ha="center",
+                fontsize=10, color=(sig_color if s != "ns" else muted),
+                fontweight="bold" if s != "ns" else "normal")
+        ax.set_ylim(0, top)
+        return
+
+    y_top = draw_sig_brackets(
+        ax, eg_names, pts_list, y_start=ceil * 1.04, y_step=ceil * 0.12,
+        tick_color=tick, sig_color=sig_color,
+        precomputed_recs=(recs if recs is not None else []))
+    top = max(ceil * 1.20, y_top + ceil * 0.10)
+    ax.set_ylim(0, top)
+    if q is not None:
+        s = _stars(q)
+        ax.text(0.02, 0.98, f"KW {s}", transform=ax.transAxes, ha="left", va="top",
+                fontsize=8, color=(sig_color if s != "ns" else muted),
+                fontweight="bold" if s != "ns" else "normal")
 
 
 def build_per_group_transition_figure(
@@ -6900,29 +7342,21 @@ def build_combined_figure(groups, combined, eg_colors_override=None, t=None) -> 
         )
         fig.subplots_adjust(hspace=0.62, wspace=0.48,
                             left=0.07, right=0.97, top=0.93, bottom=0.08)
+        _pv_family = compute_combined_pvals(combined, groups) if SCIPY_OK else {}
+        _ph_family = compute_combined_posthoc(combined, groups)
 
         for mi, (metric_key, ylabel) in enumerate(METRICS):
             for bi, bg in enumerate(beh_gnames):
                 ax = axes[mi, bi]
                 beh_color = groups[bg]["color"]     # behavioural group colour
                 x_base = np.arange(n_eg)
+                pts_by_eg = []
 
-                #   compute p-value if scipy available  
-                pval = None
-                if SCIPY_OK and n_eg >= 2:
-                    group_vals = []
-                    for eg in eg_names:
-                        vs = [records[uid_to_idx[uid]]["metrics"]
-                              .get(bg, {}).get(metric_key) or 0.0
-                              for uid in exp_groups[eg]]
-                        group_vals.append(np.array(vs, dtype=float))
-                    try:
-                        _, pval = sp_stats.kruskal(*group_vals)
-                    except Exception:
-                        try:
-                            _, pval = sp_stats.f_oneway(*group_vals)
-                        except Exception:
-                            pval = None
+                # FDR q from the one shared family (all metrics x behaviour
+                # groups) — previously this figure starred RAW p-values while
+                # the per-group figures and exports used FDR, so the same test
+                # could read * here and ns there.
+                qv_cell = (_pv_family.get((metric_key, bg)) or {}).get("qval")
 
                 for ei, eg in enumerate(eg_names):
                     ec   = eg_colors[eg]
@@ -6938,9 +7372,8 @@ def build_combined_figure(groups, combined, eg_colors_override=None, t=None) -> 
                                 color=t["tick"], linewidth=1.4, capsize=4, zorder=3)
 
                     # individual dots
-                    pts = [records[uid_to_idx[uid]]["metrics"]
-                           .get(bg, {}).get(metric_key) or 0.0
-                           for uid in exp_groups[eg]]
+                    pts = combined_group_values(combined, bg, metric_key, eg)
+                    pts_by_eg.append(pts)
                     jitter = rng.uniform(-0.12, 0.12, len(pts))
                     ax.scatter(x_base[ei] + jitter, pts,
                                color=t["ax_bg"], edgecolors=ec,
@@ -6950,29 +7383,13 @@ def build_combined_figure(groups, combined, eg_colors_override=None, t=None) -> 
                     ax.text(x_base[ei], y_max * 0.02, f"n={n}",
                             ha="center", va="bottom", color=t["tick"], fontsize=7)
 
-                #   significance stars — always shown (inc. ns)
-                if pval is not None and n_eg >= 2:
-                    stars = ("***" if pval < 0.001 else "**" if pval < 0.01
-                             else "*" if pval < 0.05 else "ns")
-                    all_pts_flat = [records[uid_to_idx[uid]]["metrics"]
-                                    .get(bg, {}).get(metric_key) or 0.0
-                                    for eg in eg_names for uid in exp_groups[eg]]
-                    data_top = max(
-                        (grand[eg][bg][metric_key]["mean"] +
-                         grand[eg][bg][metric_key]["sem"]
-                         for eg in eg_names), default=0)
-                    head_top = max(data_top * 1.40,
-                                   max(all_pts_flat or [0]) * 1.40, 0.001)
-                    ax.set_ylim(bottom=0, top=head_top)
-                    x0, x1 = 0, n_eg - 1
-                    bh = head_top * 0.80
-                    ax.plot([x0, x0, x1, x1],
-                            [bh, bh + head_top * 0.04, bh + head_top * 0.04, bh],
-                            lw=1.0, color=t["tick"])
-                    star_color = "#FF4081" if stars != "ns" else t["muted"]
-                    ax.text((x0 + x1) / 2, bh + head_top * 0.055, stars,
-                            ha="center", fontsize=10, color=star_color,
-                            fontweight="bold" if stars != "ns" else "normal")
+                #   significance — over the comparison it refers to
+                ax.set_ylim(bottom=0)
+                if n_eg >= 2:
+                    annotate_group_significance(
+                        ax, eg_names, pts_by_eg, qv_cell,
+                        _ph_family.get((metric_key, bg)),
+                        tick=t["tick"], muted=t["muted"])
 
                 ax.set_xticks(x_base)
                 ax.set_xticklabels(eg_names, rotation=22, ha="right",
@@ -7001,7 +7418,8 @@ def build_combined_figure(groups, combined, eg_colors_override=None, t=None) -> 
                    title="Exp Group", title_fontsize=8)
         fig.suptitle(
             "Combined Multi-Animal Analysis  (Mean   SEM, individual animals shown)\n"
-            "Columns = behaviour groups (own y-scale)  -  * p<0.05  ** p<0.01  *** p<0.001",
+            "Columns = behaviour groups (own y-scale)  -  * FDR q<0.05  ** q<0.01  *** q<0.001"
+            "  (BH across all metrics x behaviour groups; >2 groups: KW label + pairwise brackets)",
             color=t["tick"], fontsize=11, fontweight="bold", y=0.98)
     return fig
 
@@ -7037,32 +7455,19 @@ def build_combined_group_figure(bg_name: str, groups: dict, combined: dict,
         ("mean_bout",      "Mean Bout (s)"),
     ]
 
-    # Pass 1: collect raw KW p-values for all 4 metrics, then apply BH correction
+    # q-values come from the SAME family as the overview figure and the CSV
+    # export (BH over every metric x behaviour group).  Previously this figure
+    # corrected over only its own 4 metrics, so identical tests carried
+    # different q-values/stars depending on which figure you looked at, and a
+    # single NaN (identical-values test) turned all 4 q-values NaN -> all "ns".
     metric_keys = [m for m, _ in METRICS]
-    raw_pvals_m: dict = {}
     if SCIPY_OK and n_eg >= 2:
-        for metric_key in metric_keys:
-            group_vals = [
-                np.array([records[uid_to_idx[uid]]["metrics"]
-                           .get(bg_name, {}).get(metric_key) or 0.0
-                           for uid in exp_groups[eg]], dtype=float)
-                for eg in eg_names
-            ]
-            try:
-                _, pv = sp_stats.kruskal(*group_vals)
-            except Exception:
-                try:
-                    _, pv = sp_stats.f_oneway(*group_vals)
-                except Exception:
-                    pv = None
-            raw_pvals_m[metric_key] = pv
-        p_arr_m  = np.array([raw_pvals_m[k] if raw_pvals_m[k] is not None else 1.0
-                              for k in metric_keys])
-        q_arr_m  = benjamini_hochberg(p_arr_m)
-        qvals_m  = {metric_keys[i]: float(q_arr_m[i]) if raw_pvals_m[metric_keys[i]] is not None else None
-                    for i in range(len(metric_keys))}
+        _fam = compute_combined_pvals(combined, groups)
+        qvals_m = {k: (_fam.get((k, bg_name)) or {}).get("qval") for k in metric_keys}
+        _ph_family = compute_combined_posthoc(combined, groups)
     else:
         qvals_m = {k: None for k in metric_keys}
+        _ph_family = {}
 
     with plt.style.context(t["mpl_style"]):
         fig, axes = plt.subplots(2, 2, figsize=(10, 6.5),
@@ -7070,13 +7475,15 @@ def build_combined_group_figure(bg_name: str, groups: dict, combined: dict,
         fig.subplots_adjust(hspace=0.52, wspace=0.42,
                             left=0.10, right=0.85, top=0.87, bottom=0.13)
         fig.suptitle(f"Behaviour Group: {bg_name}  —  Mean ± SEM by Exp Group"
-                     f"\n* FDR q<0.05  ** q<0.01  *** q<0.001  (BH correction across 4 metrics)",
+                     f"\n* FDR q<0.05  ** q<0.01  *** q<0.001  (BH across all metrics x behaviour groups"
+                     f"{'; KW label + pairwise brackets' if n_eg > 2 else ''})",
                      color=bg_color, fontsize=11, fontweight="bold", y=0.99)
 
         for idx, (metric_key, ylabel) in enumerate(METRICS):
             ax    = axes[idx // 2, idx % 2]
             x_base = np.arange(n_eg)
             qval  = qvals_m.get(metric_key)
+            pts_by_eg = []
 
             for ei, eg in enumerate(eg_names):
                 ec   = eg_colors[eg]
@@ -7088,9 +7495,8 @@ def build_combined_group_figure(bg_name: str, groups: dict, combined: dict,
                        linewidth=0, alpha=0.82, zorder=2)
                 ax.errorbar(x_base[ei], mean, yerr=sem, fmt="none",
                             color=t["tick"], linewidth=1.4, capsize=4, zorder=3)
-                pts = [records[uid_to_idx[uid]]["metrics"]
-                       .get(bg_name, {}).get(metric_key) or 0.0
-                       for uid in exp_groups[eg]]
+                pts = combined_group_values(combined, bg_name, metric_key, eg)
+                pts_by_eg.append(pts)
                 jitter = rng.uniform(-0.12, 0.12, len(pts))
                 ax.scatter(x_base[ei] + jitter, pts,
                            color=t["ax_bg"], edgecolors=ec,
@@ -7099,28 +7505,12 @@ def build_combined_group_figure(bg_name: str, groups: dict, combined: dict,
                 ax.text(x_base[ei], y_top * 0.02, f"n={n}",
                         ha="center", va="bottom", color=t["tick"], fontsize=7)
 
-            if qval is not None and n_eg >= 2:
-                stars = ("***" if qval < 0.001 else "**" if qval < 0.01
-                         else "*" if qval < 0.05 else "ns")
-                all_pts_flat = [records[uid_to_idx[uid]]["metrics"]
-                                .get(bg_name, {}).get(metric_key) or 0.0
-                                for eg in eg_names for uid in exp_groups[eg]]
-                data_top = max(
-                    (grand[eg][bg_name][metric_key]["mean"] +
-                     grand[eg][bg_name][metric_key]["sem"]
-                     for eg in eg_names), default=0)
-                head_top = max(data_top * 1.40,
-                               max(all_pts_flat or [0]) * 1.40, 0.001)
-                ax.set_ylim(bottom=0, top=head_top)
-                x0, x1 = 0, n_eg - 1
-                bh = head_top * 0.80
-                ax.plot([x0, x0, x1, x1],
-                        [bh, bh + head_top * 0.04, bh + head_top * 0.04, bh],
-                        lw=1.0, color=t["tick"])
-                star_color = "#FF4081" if stars != "ns" else t["muted"]
-                ax.text((x0 + x1) / 2, bh + head_top * 0.055, stars,
-                        ha="center", fontsize=10, color=star_color,
-                        fontweight="bold" if stars != "ns" else "normal")
+            ax.set_ylim(bottom=0)
+            if n_eg >= 2:
+                annotate_group_significance(
+                    ax, eg_names, pts_by_eg, qval,
+                    _ph_family.get((metric_key, bg_name)),
+                    tick=t["tick"], muted=t["muted"])
 
             ax.set_xticks(x_base)
             ax.set_xticklabels(eg_names, rotation=25, ha="right",
@@ -7270,11 +7660,9 @@ def build_combined_transition_figure(
         ]
         try:
             _, pv = sp_stats.kruskal(*group_vals)
+            pv = float(pv) if np.isfinite(pv) else None
         except Exception:
-            try:
-                _, pv = sp_stats.f_oneway(*group_vals)
-            except Exception:
-                pv = None
+            pv = None   # all-identical values: untestable, left out of the BH family
         raw_pvals[pair] = pv
 
     valid_pairs = [p for p in all_pairs_list if raw_pvals[p] is not None]
@@ -7321,6 +7709,16 @@ def build_combined_transition_figure(
             f"\n* FDR q<0.05  ** q<0.01  *** q<0.001  (BH correction, KW test)",
             color=bg_color, fontsize=11, fontweight="bold", y=0.99)
 
+        posthoc_top = {}
+        if n_eg > 2:
+            try:
+                _gvs = [{eg: [animal_trans.get(uid, {}).get(p, 0.0)
+                              for uid in exp_groups[eg]] for eg in eg_names}
+                        for p in top10]
+                posthoc_top = dict(zip(top10, pairwise_posthoc_pooled(_gvs)))
+            except Exception:
+                posthoc_top = {}
+
         for idx, pair in enumerate(top10):
             row, col = divmod(idx, n_cols)
             ax = axes[row, col]
@@ -7347,24 +7745,12 @@ def build_combined_transition_figure(
                            color=t["ax_bg"], edgecolors=ec,
                            s=34, linewidths=0.9, alpha=0.88, zorder=4)
 
-            # Significance bracket spanning all groups
             stars = _stars(qval)
+            ax.set_ylim(bottom=0)
             if n_eg >= 2:
-                all_pts_flat = [v for pts in pts_list for v in pts]
-                data_top  = max((m + s for m, s in zip(means, sems)), default=0)
-                head_top  = max(data_top * 1.40,
-                                max(all_pts_flat or [0]) * 1.40, 0.001)
-                ax.set_ylim(bottom=0, top=head_top)
-                x0, x1   = 0, n_eg - 1
-                bh        = head_top * 0.80
-                ax.plot([x0, x0, x1, x1],
-                        [bh, bh + head_top * 0.04,
-                         bh + head_top * 0.04, bh],
-                        lw=1.0, color=t["tick"])
-                star_color = "#FF4081" if stars != "ns" else t["muted"]
-                ax.text((x0 + x1) / 2, bh + head_top * 0.055, stars,
-                        ha="center", fontsize=10, color=star_color,
-                        fontweight="bold" if stars != "ns" else "normal")
+                annotate_group_significance(
+                    ax, eg_names, pts_list, qval,
+                    posthoc_top.get(pair), tick=t["tick"], muted=t["muted"])
 
             ax.set_xticks(x_base)
             ax.set_xticklabels(eg_names, rotation=25, ha="right",
@@ -8342,9 +8728,24 @@ class AnimalListPanel(ctk.CTkFrame):
         genotype/treatment) -- Label 3 is not reused for this since Part 4's
         cross-phase repeated-measures test requires it to stay Animal ID."""
         out = []
+        # Label 3 is documented as the Animal ID.  When the same value recurs
+        # across files it is evidently an ID (not a factor), and folding it into
+        # the group name would make every animal its own group in every tab.
+        if group_by == "all":
+            _l3 = [normalize_subject_id(self._read_extra_label(a, "label3"))
+                   for a in self._animals]
+            _l3 = [x for x in _l3 if x]
+            if len(_l3) != len(set(_l3)):
+                group_by = "all_noid"
         for a in self._animals:
             if group_by == "all":
                 eg = self._make_compound(a)
+            elif group_by == "all_noid":
+                # Label 1 | Label 2 only: Label 3 is the animal ID, and putting
+                # it in the group name makes every animal its own level, so
+                # nothing can ever be paired in a Repeated Measures design.
+                eg = " | ".join(p for p in (self._read_eg(a),
+                                            self._read_extra_label(a, "label2")) if p)
             elif group_by == "label2":
                 eg = self._read_extra_label(a, "label2") or self._read_eg(a)
             elif group_by == "label3":
@@ -8359,7 +8760,7 @@ class AnimalListPanel(ctk.CTkFrame):
                 "fps":        a["fps"],
                 "kinematics_df": a.get("kinematics_df"),
                 "exp_group":  eg,
-                "subject_id": self._read_extra_label(a, "label3"),
+                "subject_id": normalize_subject_id(self._read_extra_label(a, "label3")),
                 "label1":     self._read_eg(a),
                 "label2":     self._read_extra_label(a, "label2"),
             })
@@ -8506,13 +8907,14 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         sf = section(ctrl, "Statistical Settings")
         ctk.CTkLabel(sf, text="Experimental Design:", text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._design_var = ctk.StringVar(master=self, value="Independent Groups")
+        self._design_var = ctk.StringVar(master=self, value=DESIGN_AUTO)
         ctk.CTkOptionMenu(sf, variable=self._design_var,
-                          values=["Independent Groups", "Repeated Measures"],
+                          values=[DESIGN_AUTO, "Independent Groups", "Repeated Measures"],
                           width=240).pack(padx=12, pady=(2, 2))
         ctk.CTkLabel(sf,
-                     text="Repeated Measures pairs animals by Label 3 / Animal ID\n"
-                          "across the levels of 'Group by' (e.g. Baseline/Day 3/Day 7).",
+                     text="Auto: if the same Label 3 / Animal ID appears in several\n"
+                          "groups it is analysed as Repeated Measures (paired),\n"
+                          "otherwise as independent groups.",
                      text_color=T()["muted"], font=ctk.CTkFont(size=9),
                      justify="left").pack(anchor="w", padx=12, pady=(0, 4))
         ctk.CTkLabel(sf, text="Group by:", text_color=T()["subtext"],
@@ -9161,15 +9563,22 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             messagebox.showerror("Missing library",
                 "scipy is required:\n  pip install scipy")
             return
-        design = self._design_key()
+        design, _auto_note = resolve_design(self._design_var.get(), animals)
+        if design == "repeated" and self._group_by_key() == "all":
+            animals_raw = self._get_animals(group_by="all_noid")
+            animals = self._apply_bio_filter(animals_raw)
+            _auto_note = (_auto_note + "\n" if _auto_note else "") + (
+                "Group by 'All Labels' used Label 1 | Label 2 only (Label 3 is "
+                "the animal ID used for pairing).")
         if design == "repeated":
-            n_with_sid = sum(1 for a in animals if str(a.get("subject_id") or "").strip())
+            n_with_sid = sum(1 for a in animals if normalize_subject_id(a.get("subject_id")))
             if n_with_sid < 3:
                 messagebox.showwarning("Need Animal IDs",
                     "Repeated Measures needs at least 3 animals with a "
                     "Label 3 / Animal ID value set (used to pair the same "
                     "animal across the levels of 'Group by').")
                 return
+        self._design_note_txt = _auto_note
         self._raw_preview = None  # invalidate cached raw preview
         p_thresh, top_n, metric = self._get_params()
         self._status("Running statistical tests...")
@@ -9195,24 +9604,30 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             messagebox.showwarning("No matched clusters",
                 "Repeated Measures needs at least 3 animals with a matching "
                 f"Label 3 / Animal ID value present at every level of "
-                f"'{gb_label}'. No cluster had enough matched subjects to test.")
+                f"'{gb_label}'.\n\n" + describe_pairing(animals))
             self._status("No matched clusters — check Label 3 / Animal ID pairing.",
                           "#cc4444")
             return
         _sig_col, _sw = fdr_sig_column(self._stats_df)
         n_sig = int((self._stats_df[_sig_col] < p_thresh).sum())
+        _n_ph = 0
+        if "posthoc_min_q" in self._stats_df.columns:
+            _n_ph = int(((self._stats_df["posthoc_min_q"].fillna(1.0) < p_thresh)
+                         & ~(self._stats_df[_sig_col] < p_thresh)).sum())
         _unit = "transition pairs" if metric == "transition_prob" else "clusters"
-        _design_note = ""
+        _design_note = f"\n{self._design_note_txt}" if getattr(self, "_design_note_txt", "") else ""
         if design == "repeated":
             n_matched  = self._stats_df.attrs.get("n_matched_subjects", 0)
             n_excluded = self._stats_df.attrs.get("n_excluded_subjects", 0)
-            _design_note = (f"\n{n_matched} matched animal(s) across all levels"
+            _design_note += (f"\n{n_matched} matched animal(s) across all levels"
                              + (f", {n_excluded} excluded (incomplete Animal ID)."
                                 if n_excluded else "."))
         self._status(
             f"Done. {len(self._stats_df)} {_unit} tested.\n"
             f"{n_sig} significant at {_sw} < {p_thresh} (FDR-corrected)."
-            f"{_design_note}", "#88cc88")
+            + (f"\n+{_n_ph} more with a significant pairwise post-hoc pair "
+               f"(omnibus not significant)." if _n_ph else "")
+            + f"{_design_note}", "#88cc88")
         self._switch_plot(self._plot_mode.get())
 
     def _run_reclustering(self):
@@ -9475,7 +9890,8 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                     eg_colors_override=eg_colors or None,
                     groups=None if metric == "transition_prob" else user_groups or None,
                     combined=user_combined,
-                    design=self._design_key())
+                    design=getattr(self, "_last_design", None)
+                           or resolve_design(self._design_var.get(), animals)[0])
                 if isinstance(result, tuple):
                     fig_clusters, fig_groups = result
                     self._show_figure(fig_clusters)
@@ -9731,6 +10147,9 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                 self._stats_df, getattr(self, "_show_parametric", False))
             out_df.to_csv(out_dir / "stats.csv", index=False)
             n += 1
+            n += len(write_stats_support_csvs(
+                self._stats_df, getattr(self, "_last_animals", None) or [],
+                getattr(self, "_last_metric", "total_duration"), out_dir))
 
         _last_metric_sv = getattr(self, "_last_metric", None)
         try:
@@ -9994,6 +10413,10 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         out_df = drop_parametric_columns(
             self._stats_df, getattr(self, "_show_parametric", False))
         out_df.to_csv(path, index=False)
+        write_stats_support_csvs(
+            self._stats_df, getattr(self, "_last_animals", None) or [],
+            getattr(self, "_last_metric", "total_duration"),
+            pathlib.Path(path).parent, stem=pathlib.Path(path).stem)
         # Family-wide FDR companion (S3): pool p-values across all metrics so
         # significance is judged over the whole reported family, not per-metric.
         # Skipped for transition_prob — pair-level and cluster-level p-values
@@ -11491,6 +11914,59 @@ def _gp_n_jobs(mode: str = "thread") -> int:
     return max(1, min(cores - free, 32))
 
 
+# -- Subject-aware leave-one-out for the Group Predictor ------------------------
+# Plain LeaveOneOut leaves the SAME animal's other recordings (other
+# conditions/sessions) in the training set when one recording is tested, so the
+# classifier can recognise the animal rather than the group and accuracy is
+# optimistic.  This keeps fold fi = "test sample fi" (callers rely on that
+# ordering) but removes every sample of the same animal (Label 3 / Animal ID)
+# from that fold's training set.  Samples without an ID are their own subject.
+_PREDICTOR_CV_SUBJECTS = None
+
+
+def set_predictor_cv_subjects(subjects) -> None:
+    """Register per-sample animal IDs (same order as the feature-matrix rows)
+    for the current Group Predictor run; None/[] clears (plain LOO)."""
+    global _PREDICTOR_CV_SUBJECTS
+    _PREDICTOR_CV_SUBJECTS = (None if subjects is None or len(subjects) == 0
+                              else [normalize_subject_id(s) for s in subjects])
+
+
+class SubjectLeaveOneOut:
+    """Leave-one-out where all samples sharing the test sample's subject are
+    also excluded from training.  Drop-in for sklearn's LeaveOneOut."""
+
+    def __init__(self, subjects):
+        self.subjects = np.asarray(list(subjects), dtype=object)
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return len(self.subjects) if X is None else len(X)
+
+    def split(self, X, y=None, groups=None):
+        n = len(X)
+        idx = np.arange(n)
+        subj = self.subjects
+        if len(subj) != n:      # misaligned -> never guess, use plain LOO
+            subj = np.asarray([""] * n, dtype=object)
+        for i in range(n):
+            s = subj[i]
+            train = idx[idx != i] if s == "" else idx[subj != s]
+            yield train, np.array([i])
+
+
+def predictor_loo():
+    """LeaveOneOut for the Group Predictor: subject-aware when the registered
+    animal IDs contain repeats, otherwise plain sklearn LeaveOneOut."""
+    subs = _PREDICTOR_CV_SUBJECTS
+    if subs:
+        named = [x for x in subs if x]
+        if len(named) != len(set(named)):
+            return SubjectLeaveOneOut(subs)
+    from sklearn.model_selection import LeaveOneOut
+    return LeaveOneOut()
+
+
+
 class GroupPredictorPanel(ctk.CTkFrame):
     """
     'Group Predictor' tab — asks whether a mouse's behavioral profile can
@@ -12495,7 +12971,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
         from sklearn.metrics import balanced_accuracy_score
         from joblib import Parallel, delayed
 
-        cv = LeaveOneOut()
+        cv = predictor_loo()
         n = len(y_enc)
         n_classes = len(np.unique(y_enc))
         fold_splits = list(cv.split(X))   # fold fi: test_idx = [fi]
@@ -12546,15 +13022,12 @@ class GroupPredictorPanel(ctk.CTkFrame):
         # so the null distribution is not biased for imbalanced cohorts
         # (e.g. 3 vs. 30 animals).  Falls back to plain permutation if
         # stratification is impossible (single sample per class).
+        # A plain permutation of y_enc already keeps class proportions exactly.
+        # (StratifiedShuffleSplit(test_size=None) returns only the 90 % train
+        # subset of indices, so y_perm came out shorter than X and every
+        # permutation fold raised IndexError.)
         rng = np.random.default_rng(42)
-        try:
-            from sklearn.model_selection import StratifiedShuffleSplit as _SSS
-            _sss = _SSS(n_splits=n_permutations, test_size=None, random_state=42)
-            all_y_perms = []
-            for _perm_idx, _ in _sss.split(X, y_enc):
-                all_y_perms.append(y_enc[_perm_idx])
-        except Exception:
-            all_y_perms = [rng.permutation(y_enc) for _ in range(n_permutations)]
+        all_y_perms = [rng.permutation(y_enc) for _ in range(n_permutations)]
 
         if progress_fn:
             progress_fn(
@@ -13248,7 +13721,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
         selected: list = []
         trace: list = []
         _ties_by_step: dict = {}
-        loo = LeaveOneOut()
+        loo = predictor_loo()
         _pipe_ft = "transition" if metric == "transition" else "freq_dur"
 
         # Precompute the full feature matrix for freq/dur metrics so _eval_cluster
@@ -13261,7 +13734,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
             try:
                 _X_pre, _y_pre_list, _fn_pre = self._build_freq_or_dur(
                     animal_data, metric, cluster_ids=set(remaining))
-                _y_pre = np.array(_y_pre_list)
+                _y_pre = np.unique(np.array(_y_pre_list), return_inverse=True)[1].astype(int)
                 _col_map_pre = {}
                 for _ci, _fn in enumerate(_fn_pre):
                     try:
@@ -13290,7 +13763,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
                     if metric == "transition":
                         _Xc, _yc_list, _ = self._build_transition(
                             animal_data, cluster_ids=set(_cand))
-                        _yc = np.array(_yc_list)
+                        _yc = np.unique(np.array(_yc_list), return_inverse=True)[1].astype(int)
                     elif (_X_pre is not None
                           and all(cc in _col_map_pre for cc in _cand)):
                         _Xc = _X_pre[:, [_col_map_pre[cc] for cc in _cand]]
@@ -13298,7 +13771,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
                     else:
                         _Xc, _yc_list, _ = self._build_freq_or_dur(
                             animal_data, metric, cluster_ids=set(_cand))
-                        _yc = np.array(_yc_list)
+                        _yc = np.unique(np.array(_yc_list), return_inverse=True)[1].astype(int)
                     if _Xc.shape[1] > 0 and len(np.unique(_yc)) >= 2:
                         candidate_Xs[c] = (_Xc, _yc)
                 except Exception:
@@ -13401,7 +13874,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
         selected: list = []
         trace: list = []
         _ties_by_step: dict = {}
-        loo = LeaveOneOut()
+        loo = predictor_loo()
 
         def _build_for_candidate(candidate):
             _cids = [c for c in candidate if isinstance(c, int)]
@@ -13440,7 +13913,8 @@ class GroupPredictorPanel(ctk.CTkFrame):
                     _Xc_m, _yc_ml, _ = _build_for_candidate(_cand_m)
                     if _Xc_m is None or _Xc_m.shape[1] == 0:
                         continue
-                    _yc_m = np.array(_yc_ml)
+                    # Encode to 0..k-1 (labels are group names; folds cast to int)
+                    _yc_m = np.unique(np.array(_yc_ml), return_inverse=True)[1].astype(int)
                     if len(np.unique(_yc_m)) >= 2:
                         _unit_Xs[u] = (_Xc_m, _yc_m)
                 except Exception:
@@ -13542,7 +14016,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
         selected: list = []
         trace: list = []
         _ties_by_step: dict = {}
-        loo = LeaveOneOut()
+        loo = predictor_loo()
 
         # Precompute raw (un-normalised) per-animal transition count matrices for
         # all clusters once.  _eval_pair then extracts the subset, normalises and
@@ -13551,7 +14025,9 @@ class GroupPredictorPanel(ctk.CTkFrame):
         _cl_arr_pre = np.array(cl)
         _cl_idx_pre = {c: k for k, c in enumerate(cl)}
         _n_pre = len(cl)
-        _y_pairs_pre = [a["exp_group"] for a in animal_data]
+        # Encode group names to 0..k-1: the fold evaluators cast labels to int.
+        _y_pairs_pre = np.unique([a["exp_group"] for a in animal_data],
+                                 return_inverse=True)[1].astype(int)
         _raw_mats_pre: list = []
         for _a in animal_data:
             _lbls = _a["df"]["label"].values
@@ -13600,7 +14076,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
                     try:
                         _Xc_t, _yc_tl, _ = self._build_transition_pairs(
                             animal_data, _cand_t)
-                        _yc_t = np.array(_yc_tl)
+                        _yc_t = np.unique(np.array(_yc_tl), return_inverse=True)[1].astype(int)
                     except Exception:
                         continue
                 if _Xc_t.shape[1] > 0 and len(np.unique(_yc_t)) >= 2:
@@ -13699,7 +14175,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
         _algo_snap = algo if algo is not None else self._algo_var.get()
 
         chance = 1.0 / max(n_classes, 2)
-        loo = LeaveOneOut()
+        loo = predictor_loo()
         v_cache = {}
 
         def _v(key: frozenset) -> float:
@@ -13804,7 +14280,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
                         from sklearn.model_selection import LeaveOneOut as _LOO
                         from sklearn.base import clone as _cl
                         import numpy as _np
-                        _loo = _LOO()
+                        _loo = predictor_loo()
                         try:
                             if metric == "transition":
                                 _X, _yl, _ = self._build_transition(
@@ -13828,7 +14304,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
                             else:
                                 _X, _yl, _ = self._build_freq_or_dur(
                                     animal_data, metric, cluster_ids=key)
-                            _y = _np.array(_yl)
+                            _y = _np.unique(_np.array(_yl), return_inverse=True)[1].astype(int)
                             if _X.shape[1] == 0 or len(_np.unique(_y)) < 2:
                                 return key, chance
                             _pipe = self._make_pipeline(
@@ -13898,7 +14374,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
         _algo_snap = algo if algo is not None else self._algo_var.get()
 
         chance = 1.0 / max(n_classes, 2)
-        loo = LeaveOneOut()
+        loo = predictor_loo()
         v_cache: dict = {}
 
         def _v(key: frozenset) -> float:
@@ -13977,12 +14453,12 @@ class GroupPredictorPanel(ctk.CTkFrame):
                         from sklearn.model_selection import LeaveOneOut as _LOO
                         from sklearn.base import clone as _cl
                         import numpy as _np
-                        _loo = _LOO()
+                        _loo = predictor_loo()
                         try:
                             _pairs = sorted(key)
                             _X, _yl, _ = self._build_transition_pairs(
                                 animal_data, _pairs)
-                            _y = _np.array(_yl)
+                            _y = _np.unique(_np.array(_yl), return_inverse=True)[1].astype(int)
                             if _X.shape[1] == 0 or len(_np.unique(_y)) < 2:
                                 return key, chance
                             _pipe = self._make_pipeline(
@@ -14058,7 +14534,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
         sel_cols: list = []
         trace: list   = []
         _ties_by_step: dict = {}
-        loo  = LeaveOneOut()
+        loo  = predictor_loo()
         step = 0
 
         while remaining and step < max_steps:
@@ -14130,7 +14606,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
             return [], []
 
         n_combos  = math.comb(n_cols, k)
-        loo        = LeaveOneOut()
+        loo        = predictor_loo()
         fold_splits = list(loo.split(X_full))
         results: list = []
 
@@ -14192,7 +14668,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
 
         _algo_snap = algo if algo is not None else self._algo_var.get()
         chance = 1.0 / max(n_classes, 2)
-        loo     = LeaveOneOut()
+        loo     = predictor_loo()
         v_cache: dict = {}
 
         def _v(key: frozenset) -> float:
@@ -14373,6 +14849,22 @@ class GroupPredictorPanel(ctk.CTkFrame):
                          color=T()["error"])
             return
 
+        # Label 3 doubles as the animal ID.  If the same ID recurs across files,
+        # 'Combined' must not include it in the class name (each animal would
+        # become its own class), and the user should know that repeated animals
+        # in several classes make leave-one-out accuracy optimistic (the same
+        # animal's other session sits in the training set).
+        _ids = [a.get("subject_id") for a in animals if a.get("subject_id")]
+        if _gb_key == "all" and len(_ids) != len(set(_ids)):
+            animals = self._get_animals(group_by="all_noid")
+        _rep = detect_repeated_design(animals)
+        if _rep["shared"] or _rep["dup_within"]:
+            self._status(
+                f"Note: {len(_rep['shared']) + len(_rep['dup_within'])} animal ID(s) "
+                f"recur across files/classes - cross-validation holds out ALL recordings "
+                f"of the tested animal together (subject-aware leave-one-out).",
+                color="#cc9944")
+
         # Drop animals without a valid experimental group assignment
         animals = [a for a in animals
                    if a.get("exp_group") and str(a["exp_group"]).strip()]
@@ -14463,6 +14955,9 @@ class GroupPredictorPanel(ctk.CTkFrame):
         min_class_count = min(Counter(yf_enc).values())
         n_total = len(animals)
         n_feats_max = max(Xf.shape[1], Xd.shape[1], Xt.shape[1])
+        set_predictor_cv_subjects(
+            [a.get("subject_id") for a in animals]
+            if Xf.shape[0] == Xd.shape[0] == Xt.shape[0] == len(animals) else None)
 
         # Collect caveats
         caveats = self._collect_caveats(
@@ -14912,13 +15407,24 @@ class GroupPredictorPanel(ctk.CTkFrame):
                             break
                         # Label units as T_i→j for pairs or C{n} for clusters
                         _unit_lbl = (lambda c: f"T_{c[0]}→{c[1]}"
-                                     if isinstance(c, tuple) else f"C{c}")
+                                     if isinstance(c, tuple)
+                                     else (c if isinstance(c, str) else f"C{c}"))
                         self._progress_q.put(("status",
                             f"{mname}: perm-testing combo "
                             f"{_ci_ex + 1}/{len(top_combos)} "
                             f"({{{','.join(_unit_lbl(c) for c in sorted(_combo_ex, key=str))}}})…"))
                         try:
-                            if _greedy_metric == "transition":
+                            if feature_type == "group_transition":
+                                # combo items are group-pair feature names
+                                _Xg_ce, _y_ce_raw, _fn_ce = \
+                                    self._build_group_transitions(
+                                        animal_data, model_sel_groups,
+                                        include_cluster_pairs=any(
+                                            str(n).startswith("T_")
+                                            for n in _combo_ex))
+                                _gc_ce = {n: ci for ci, n in enumerate(_fn_ce)}
+                                _X_ce = _Xg_ce[:, [_gc_ce[n] for n in _combo_ex]]
+                            elif _greedy_metric == "transition":
                                 _X_ce, _y_ce_raw, _ = self._build_transition_pairs(
                                     animal_data, list(_combo_ex))
                             else:
@@ -14939,7 +15445,10 @@ class GroupPredictorPanel(ctk.CTkFrame):
                             _combo_perm_results.append(
                                 (_combo_ex, _cb_acc, _cpval))
                             _combo_perm_scores_map[frozenset(_combo_ex)] = _cp_scores
-                        except Exception:
+                        except Exception as _exc_ce:
+                            self._progress_q.put(("status",
+                                f"{mname}: warning — permutation test failed for "
+                                f"combo {_ci_ex + 1} ({_exc_ce}); p set to 1.0."))
                             _combo_perm_results.append(
                                 (_combo_ex, _combo_acc_ex, 1.0))
                     if _combo_perm_results and not self._cancel_event.is_set():
@@ -14954,7 +15463,8 @@ class GroupPredictorPanel(ctk.CTkFrame):
                         _best_combo_perm_scores = _combo_perm_scores_map.get(
                             frozenset(_best_cpr[0]), np.array([], dtype=float))
                         _unit_lbl2 = (lambda c: f"T_{c[0]}→{c[1]}"
-                                      if isinstance(c, tuple) else f"C{c}")
+                                      if isinstance(c, tuple)
+                                      else (c if isinstance(c, str) else f"C{c}"))
                         self._progress_q.put(("status",
                             f"{mname}: best combo by specificity: "
                             f"{{{','.join(_unit_lbl2(c) for c in sorted(_best_cpr[0], key=str))}}} "
@@ -14990,7 +15500,24 @@ class GroupPredictorPanel(ctk.CTkFrame):
                         trace = trace[:_cut + 1]
 
                     # ── Path A: greedy/exhaustive-informed LOO ────────────────
-                    if _greedy_metric == "transition":
+                    if feature_type == "group_transition":
+                        # Trace items are group-pair feature names ("G_a→G_b"),
+                        # not (i, j) cluster tuples: slice the group matrix.
+                        _sel_names = [n for n, _ in trace]
+                        _Xg_all, y_loo_raw, _fn_all = self._build_group_transitions(
+                            animal_data, model_sel_groups,
+                            include_cluster_pairs=any(
+                                n.startswith("T_") for n in _sel_names))
+                        _gcol = {n: ci for ci, n in enumerate(_fn_all)}
+                        _sel_names = [n for n in _sel_names if n in _gcol]
+                        X_loo = _Xg_all[:, [_gcol[n] for n in _sel_names]]
+                        fn_loo = _sel_names
+                        _sel_method = ("exhaustive" if _search_method == "exhaustive"
+                                       else "greedy")
+                        self._progress_q.put(("status",
+                            f"{mname}: LOO on {len(_sel_names)} {_sel_method}-selected "
+                            f"group transition(s) ({len(y_loo_raw)} folds)…"))
+                    elif _greedy_metric == "transition":
                         _sel_pairs = [pair for pair, _ in trace]
                         X_loo, y_loo_raw, fn_loo = self._build_transition_pairs(
                             animal_data, _sel_pairs)
@@ -15074,7 +15601,16 @@ class GroupPredictorPanel(ctk.CTkFrame):
                                 break
                             try:
                                 _alt_set = _prefix_ids + [_alt]
-                                if _greedy_metric == "transition":
+                                if feature_type == "group_transition":
+                                    _Xg_alt, _y_alt_raw, _fn_alt = \
+                                        self._build_group_transitions(
+                                            animal_data, model_sel_groups,
+                                            include_cluster_pairs=any(
+                                                str(n).startswith("T_")
+                                                for n in _alt_set))
+                                    _gc_alt = {n: ci for ci, n in enumerate(_fn_alt)}
+                                    _X_alt = _Xg_alt[:, [_gc_alt[n] for n in _alt_set]]
+                                elif _greedy_metric == "transition":
                                     _X_alt, _y_alt_raw, _ = \
                                         self._build_transition_pairs(
                                             animal_data, _alt_set)
@@ -15137,7 +15673,9 @@ class GroupPredictorPanel(ctk.CTkFrame):
                             })
 
                     # ── Fixed feature IDs (used in every LOO fold) ────────────
-                    if _greedy_metric == "transition":
+                    if feature_type == "group_transition":
+                        _fixed_ids = [n for n, _ in trace]
+                    elif _greedy_metric == "transition":
                         _fixed_ids = [f"{pair[0]}→{pair[1]}"
                                       for pair, _ in trace]
                     else:
@@ -15157,6 +15695,11 @@ class GroupPredictorPanel(ctk.CTkFrame):
                         "feature_type":    feature_type,
                         "sel_groups":      model_sel_groups,
                     }
+                    if feature_type == "group_transition":
+                        # The nested null re-runs greedy selection over cluster
+                        # ids / cluster pairs; it has no group-pair mode, and a
+                        # failing permutation returns chance (a bogus null).
+                        _nested_params = None
                     self._progress_q.put(("progress", _base_p + 0.90 * _model_slice))
 
                     kappa = float(cohen_kappa_score(y_loo, pred_labels))
@@ -19301,6 +19844,11 @@ def build_region_crosstab_figure(agg: dict, region_names: list,
             if SCIPY_OK and per_animal and n_lbl >= 2:
                 head_top *= 1.22
                 bh = max_val * 1.06 if max_val > 0 else 0.85
+                # One KW per region -> BH-FDR across the regions shown (raw p
+                # before, so the more regions, the more chance stars).  With >2
+                # labels the omnibus result belongs to no single pair, so it is
+                # a "KW" label rather than a bracket implying first-vs-last.
+                _reg_p = {}
                 for ri, rn in enumerate(region_names):
                     group_vals = []
                     for lbl in labels:
@@ -19314,17 +19862,26 @@ def build_region_crosstab_figure(agg: dict, region_names: list,
                         _, pv = sp_stats.kruskal(*group_vals)
                     except Exception:
                         continue
-                    stars = ("***" if pv < 0.001 else "**" if pv < 0.01
-                             else "*" if pv < 0.05 else "ns")
+                    if np.isfinite(pv):
+                        _reg_p[ri] = float(pv)
+                _reg_q = dict(zip(_reg_p, benjamini_hochberg(
+                    np.array(list(_reg_p.values()), dtype=float))))
+                for ri, qv in _reg_q.items():
+                    stars = ("***" if qv < 0.001 else "**" if qv < 0.01
+                             else "*" if qv < 0.05 else "ns")
                     x0 = bar_x_by_label[labels[0]][ri]
                     x1 = bar_x_by_label[labels[-1]][ri]
-                    ax.plot([x0, x0, x1, x1],
-                            [bh, bh + head_top * 0.02, bh + head_top * 0.02, bh],
-                            lw=0.8, color=t["tick"])
                     star_color = "#FF4081" if stars != "ns" else t["muted"]
-                    ax.text((x0 + x1) / 2, bh + head_top * 0.03, stars,
-                            ha="center", fontsize=9, color=star_color,
-                            fontweight="bold" if stars != "ns" else "normal")
+                    _fw = "bold" if stars != "ns" else "normal"
+                    if n_lbl == 2:
+                        ax.plot([x0, x0, x1, x1],
+                                [bh, bh + head_top * 0.02, bh + head_top * 0.02, bh],
+                                lw=0.8, color=t["tick"])
+                        ax.text((x0 + x1) / 2, bh + head_top * 0.03, stars,
+                                ha="center", fontsize=9, color=star_color, fontweight=_fw)
+                    else:
+                        ax.text((x0 + x1) / 2, bh + head_top * 0.03, f"KW {stars}",
+                                ha="center", fontsize=8, color=star_color, fontweight=_fw)
             ax.set_ylim(top=head_top)
             # Legend placed outside the axes (not "best") -- with narrow
             # bars, dense sig brackets, and jittered points all competing
@@ -19819,9 +20376,9 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         sf = section("Statistical Settings")
         ctk.CTkLabel(sf, text="Experimental Design:", text_color=T()["subtext"],
                      font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
-        self._design_var = ctk.StringVar(master=self, value="Independent Groups")
+        self._design_var = ctk.StringVar(master=self, value=DESIGN_AUTO)
         ctk.CTkOptionMenu(sf, variable=self._design_var,
-                          values=["Independent Groups", "Repeated Measures"],
+                          values=[DESIGN_AUTO, "Independent Groups", "Repeated Measures"],
                           width=250).pack(padx=12, pady=(2, 2))
         ctk.CTkLabel(sf, text="Repeated Measures pairs animals by Label 3 / "
                      "Animal ID across the levels of 'Group by' (e.g. "
@@ -20729,14 +21286,35 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         brackets, just at different sizes. Returns group_values."""
         eg_colors = self._eg_color_map(sessions)
         group_values: dict = {}
+        subj_acc: dict = {}     # eg -> {subject_id: [values]} (Repeated Measures pairing)
         export_rows = []
         for s in sessions:
             val = value_fn(s)
             if val is None or (isinstance(val, float) and not np.isfinite(val)):
                 continue
             group_values.setdefault(s["exp_group"], []).append(float(val))
+            _sid = normalize_subject_id(s.get("subject_id"))
+            if _sid:
+                subj_acc.setdefault(s["exp_group"], {}).setdefault(_sid, []).append(float(val))
             export_rows.append({"animal": s.get("name"), "exp_group": s["exp_group"],
-                                 ylabel: float(val)})
+                                 "subject_id": _sid, ylabel: float(val)})
+        # Repeated Measures: the same animals appear in several groups, so
+        # independent-group tests would be pseudo-replicated.  Test paired on the
+        # animals present in EVERY group instead (Wilcoxon / Friedman).
+        try:
+            _choice = self._design_var.get()
+        except Exception:
+            _choice = "Independent Groups"
+        _paired = resolve_design(_choice, sessions)[0] == "repeated"
+        _subj_vals = None
+        if _paired:
+            _lv = {eg: {sid: float(np.mean(v)) for sid, v in d.items()}
+                   for eg, d in subj_acc.items() if eg in group_values}
+            if len(_lv) == len(group_values) and len(_lv) >= 2:
+                _common = set.intersection(*[set(d) for d in _lv.values()])
+                if len(_common) >= 3:
+                    _subj_vals = {eg: {s: d[s] for s in sorted(_common)}
+                                  for eg, d in _lv.items()}
         if hasattr(self, "_export_tables"):
             self._export_tables.append((self._slugify(title), pd.DataFrame(export_rows)))
         egs = [eg for eg in eg_colors if eg in group_values]
@@ -20788,39 +21366,64 @@ class ParadigmResultsPanel(ctk.CTkFrame):
             # than silently adding nothing, which draw_sig_brackets alone
             # does when no pair reaches q < 0.05.
             omnibus_pv = None
-            if SCIPY_OK:
+            _ph_pre = None     # paired post-hoc recs (None -> independent post-hoc)
+            if SCIPY_OK and _subj_vals is not None:
+                _arrs = [np.array(list(_subj_vals[eg].values()), dtype=float) for eg in egs]
+                try:
+                    if len(_arrs) == 2:
+                        if not np.allclose(_arrs[0], _arrs[1]):
+                            stat_omnibus_stat, omnibus_pv = sp_stats.wilcoxon(_arrs[0], _arrs[1])
+                    else:
+                        stat_omnibus_stat, omnibus_pv = sp_stats.friedmanchisquare(*_arrs)
+                except Exception:
+                    omnibus_pv = None
+                if len(egs) > 2:
+                    _ph_pre = pairwise_posthoc({eg: _subj_vals[eg] for eg in egs}, paired=True)
+            elif SCIPY_OK:
                 kw_groups = [np.asarray(group_values[eg], dtype=float) for eg in egs]
                 if all(len(g) >= 1 for g in kw_groups) and any(len(g) >= 2 for g in kw_groups):
                     try:
                         stat_omnibus_stat, omnibus_pv = sp_stats.kruskal(*kw_groups)
                     except Exception:
                         omnibus_pv = None
+            if omnibus_pv is not None and not np.isfinite(omnibus_pv):
+                omnibus_pv = None
             stat_omnibus_pv = omnibus_pv
             if omnibus_pv is not None:
                 stars = ("***" if omnibus_pv < 0.001 else "**" if omnibus_pv < 0.01
                          else "*" if omnibus_pv < 0.05 else "ns")
                 y = data_ceil + span * 0.08
                 x0, x1 = 0, len(egs) - 1
-                ax.plot([x0, x0, x1, x1],
-                        [y, y + span * 0.02, y + span * 0.02, y],
-                        lw=0.8, color=t["tick"])
                 star_color = "#FF4081" if stars != "ns" else t["muted"]
-                ax.text((x0 + x1) / 2, y + span * 0.03, stars, ha="center",
-                        fontsize=10, color=star_color,
-                        fontweight="bold" if stars != "ns" else "normal")
+                if len(egs) == 2:
+                    ax.plot([x0, x0, x1, x1],
+                            [y, y + span * 0.02, y + span * 0.02, y],
+                            lw=0.8, color=t["tick"])
+                    ax.text((x0 + x1) / 2, y + span * 0.03, stars, ha="center",
+                            fontsize=10, color=star_color,
+                            fontweight="bold" if stars != "ns" else "normal")
+                else:
+                    # >2 groups: the omnibus test belongs to no single pair, so
+                    # a corner label — not a first-vs-last bracket.
+                    _lbl = "Friedman" if _subj_vals is not None else "KW"
+                    ax.text(0.02, 0.98, f"{_lbl} {stars}", transform=ax.transAxes,
+                            ha="left", va="top", fontsize=8, color=star_color,
+                            fontweight="bold" if stars != "ns" else "normal")
                 bracket_top = y + span * 0.05
-                # >2 groups: localise WHICH pair(s) drive a significant
-                # omnibus result with pairwise post-hoc brackets beneath it.
-                if len(egs) > 2 and stars != "ns":
+                # >2 groups: localise WHICH pair(s) differ with pairwise
+                # post-hoc brackets (each spans exactly its two bars).
+                if len(egs) > 2:
                     bracket_top = draw_sig_brackets(
                         ax, egs, [group_values[eg] for eg in egs],
                         y_start=bracket_top + span * 0.06, y_step=span * 0.12,
-                        tick_color=t["tick"], out_recs=stat_posthoc_recs)
+                        tick_color=t["tick"], out_recs=stat_posthoc_recs,
+                        precomputed_recs=_ph_pre)
             else:
                 bracket_top = draw_sig_brackets(
                     ax, egs, [group_values[eg] for eg in egs],
                     y_start=data_ceil + span * 0.08, y_step=span * 0.12,
-                    tick_color=t["tick"], out_recs=stat_posthoc_recs)
+                    tick_color=t["tick"], out_recs=stat_posthoc_recs,
+                    precomputed_recs=_ph_pre)
         # Export the omnibus KW + pairwise post-hoc results alongside the
         # per-animal raw-data table appended above, so 'Save All Results'
         # captures the same stats shown as stars/brackets on the figure.
@@ -21659,7 +22262,7 @@ class ParadigmResultsPanel(ctk.CTkFrame):
             "Preference index (post − pre, or absolute if no pre-test)",
             "Place Preference / CPP score", t, one_sample_ref=0.0)
         figs.append(fig)
-        if self._design_var.get() == "Repeated Measures":
+        if resolve_design(self._design_var.get(), sessions)[0] == "repeated":
             paired_animals = [{"exp_group": s["exp_group"],
                                "subject_id": s["subject_id"],
                                "preference_index": s["env_ctx"].get("derived", {})
@@ -21873,7 +22476,8 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                 fig5.tight_layout()
             figs.append(fig5)
 
-            if self._design_var.get() == "Repeated Measures" and len(all_phases) >= 3:
+            if (resolve_design(self._design_var.get(), sessions)[0] == "repeated"
+                    and len(all_phases) >= 3):
                 animal_rows = []
                 for s in sessions:
                     phase = self._fc_phase_of(s)
@@ -22531,6 +23135,14 @@ class BSOiDApp(ctk.CTk):
                           values=["Label 1", "Label 2", "Label 3 / Animal ID",
                                   "All Labels"],
                           width=120).pack(side="left", padx=2, pady=6)
+        ctk.CTkLabel(btns, text="Design:",
+                     text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=11)).pack(side="left", padx=(12, 2), pady=6)
+        if not hasattr(self, "_combined_design_var"):
+            self._combined_design_var = ctk.StringVar(master=self, value=DESIGN_AUTO)
+        ctk.CTkOptionMenu(btns, variable=self._combined_design_var,
+                          values=[DESIGN_AUTO, "Independent Groups", "Repeated Measures"],
+                          width=170).pack(side="left", padx=2, pady=6)
 
         # Scrollable plot area: tk.Canvas + vertical scrollbar
         self._scroll_canvas = tk.Canvas(
@@ -22922,6 +23534,11 @@ class BSOiDApp(ctk.CTk):
         _gb_key = AnimalListPanel._label_key_to_str(
             getattr(self, "_combined_group_by_var", ctk.StringVar(value="Label 1")).get())
         animals = self._animal_panel.get_animals(group_by=_gb_key)
+        _design, _design_note = resolve_design(
+            getattr(self, "_combined_design_var", ctk.StringVar(value=DESIGN_AUTO)).get(),
+            animals)
+        if _design == "repeated" and _gb_key == "all":
+            animals = self._animal_panel.get_animals(group_by="all_noid")
         if not groups:
             messagebox.showwarning("No Groups", "Define groups in the Group Editor first.")
             return
@@ -22940,9 +23557,12 @@ class BSOiDApp(ctk.CTk):
             return
         try:
             self._combined = compute_combined(animals, groups)
+            self._combined["design"] = _design
         except Exception:
             messagebox.showerror("Compute Error", traceback.format_exc())
             return
+        if _design_note:
+            self._status(_design_note, "#cc9944")
         n_computed = len(self._combined["records"])
         if n_computed != len(animals):
             messagebox.showerror("Data Integrity Error",
@@ -23007,7 +23627,9 @@ class BSOiDApp(ctk.CTk):
         n_ani    = len(self._combined["records"])
         self._status(
             f"Combined: {n_ani} animals  -  {len(eg_names)} exp group(s)  -  "
-            f"{len(groups)} behaviour group(s)  ✓", "#88cc88")
+            f"{len(groups)} behaviour group(s)  -  "
+            f"{'Repeated Measures (paired by Label 3)' if _design == 'repeated' else 'independent groups'}"
+            + (f"\n{_design_note}" if _design_note else "") + "  ✓", "#88cc88")
 
     def _export_combined(self):
         if not self._combined:
@@ -23036,39 +23658,7 @@ class BSOiDApp(ctk.CTk):
                             dpi=300 if ext == "png" else None,
                             bbox_inches="tight",
                             facecolor=fig.get_facecolor())
-        grand  = self._combined["grand"]
-        # Pre-compute p-values (BH FDR corrected) for all metric × beh_group combos
-        pvals_all = compute_combined_pvals(self._combined, groups)
-        STAR_THRESH = [(0.001, "***"), (0.01, "**"), (0.05, "*")]
-
-        def _stars(qv):
-            if qv is None:
-                return "N/A"
-            for thresh, sym in STAR_THRESH:
-                if qv < thresh:
-                    return sym
-            return "ns"
-
-        rows = []
-        for eg_name, beh_dict in grand.items():
-            for beh_group in groups:
-                for metric in ("total_duration", "frequency", "latency", "mean_bout"):
-                    d       = beh_dict[beh_group][metric]
-                    pv_dict = pvals_all.get((metric, beh_group)) or {}
-                    pv      = pv_dict.get("pval")
-                    qv      = pv_dict.get("qval")
-                    rows.append({
-                        "Exp_Group":        eg_name,
-                        "Beh_Group":        beh_group,
-                        "Metric":           metric,
-                        "Mean":             round(d["mean"], 4),
-                        "SEM":              round(d["sem"],  4),
-                        "N":                d["n"],
-                        "p_value_KW":       round(pv, 6) if pv is not None else "N/A",
-                        "q_value_FDR":      round(qv, 6) if qv is not None else "N/A",
-                        "Significance_FDR": _stars(qv),
-                    })
-        pd.DataFrame(rows).to_csv(out / f"combined_summary_{ts}.csv", index=False)
+        write_combined_csvs(self._combined, groups, out, ts)
         _trans_stats_list = getattr(self, "_combined_trans_stats", [])
         if _trans_stats_list:
             pd.concat(_trans_stats_list, ignore_index=True).to_csv(
@@ -23153,38 +23743,8 @@ class BSOiDApp(ctk.CTk):
                         dpi=300 if ext == "png" else None,
                         bbox_inches="tight",
                         facecolor=fig.get_facecolor())
-            # p-value CSV (BH FDR corrected across all metric × beh_group tests)
-            pvals_all   = compute_combined_pvals(self._combined, groups)
-            STAR_THRESH = [(0.001, "***"), (0.01, "**"), (0.05, "*")]
-            def _stars(qv):
-                if qv is None:
-                    return "N/A"
-                for thresh, sym in STAR_THRESH:
-                    if qv < thresh:
-                        return sym
-                return "ns"
-            grand = self._combined["grand"]
-            rows  = []
-            for eg_name, beh_dict in grand.items():
-                for beh_group in groups:
-                    for metric in ("total_duration", "frequency", "latency", "mean_bout"):
-                        d       = beh_dict[beh_group][metric]
-                        pv_dict = pvals_all.get((metric, beh_group)) or {}
-                        pv      = pv_dict.get("pval")
-                        qv      = pv_dict.get("qval")
-                        rows.append({
-                            "Exp_Group":        eg_name,
-                            "Beh_Group":        beh_group,
-                            "Metric":           metric,
-                            "Mean":             round(d["mean"], 4),
-                            "SEM":              round(d["sem"],  4),
-                            "N":                d["n"],
-                            "p_value_KW":       round(pv, 6) if pv is not None else "N/A",
-                            "q_value_FDR":      round(qv, 6) if qv is not None else "N/A",
-                            "Significance_FDR": _stars(qv),
-                        })
-            pd.DataFrame(rows).to_csv(
-                out_combined / f"combined_summary_{ts}.csv", index=False)
+            # CSVs: summary + per-animal + post-hoc (BH FDR across all metric x beh_group tests)
+            write_combined_csvs(self._combined, groups, out_combined, ts)
             _trans_stats_list = getattr(self, "_combined_trans_stats", [])
             if _trans_stats_list:
                 pd.concat(_trans_stats_list, ignore_index=True).to_csv(
