@@ -13,7 +13,7 @@
 
 </div>
 
-CUBE turns raw behavioural video into discrete behaviour clusters and group-level statistics without hand-labelling.
+**CUBE v5** (Comprehensive Unsupervised Behavioral Explorer) is an open-source, point-and-click pipeline for unsupervised discovery and quantification of animal behaviour from DeepLabCut pose estimation. It turns raw behavioural video into discrete behaviour clusters and group-level statistics without hand-labelling, in 2D or with multi-camera 3D pose. CUBE builds on the approach introduced by B-SOiD (Hsu & Yttri 2021) and extends it with multi-scale features, cluster validation, temporal smoothing, interactive annotation and a statistics suite.
 
 ```mermaid
 flowchart LR
@@ -62,8 +62,8 @@ python cube.py
 
 CUBE was developed by Param Valiathan in the laboratory of Patrik Ernfors at Karolinska Institutet ([research group](https://ki.se/en/mbb/research-division-of-molecular-neurobiology)). A preprint is in preparation; until it appears, please cite the software:
 
-> Valiathan P. CUBE: Comprehensive Unsupervised Behavioral Explorer. Developed in the laboratory of Patrik Ernfors, Karolinska Institutet. https://github.com/param-valiathan/CUBE
+> Valiathan P. CUBE: Comprehensive Unsupervised Behavioral Explorer, version 5. Developed in the laboratory of Patrik Ernfors, Karolinska Institutet. https://github.com/param-valiathan/CUBE
 
 Please also cite the work CUBE builds on: B-SOiD (Hsu & Yttri 2021, *Nat. Commun.* 12:5188), DeepLabCut (Mathis et al. 2018, *Nat. Neurosci.* 21:1281), UMAP (McInnes et al. 2018, arXiv:1802.03426), HDBSCAN (McInnes et al. 2017, *JOSS* 2:205) and, for 3D mode, Anipose (Karashchuk et al. 2021, *Cell Rep.* 36:109730).
 
-A software licence has not been specified yet. Please contact the authors before redistributing or building on the code commercially.
+Until the preprint is released, CUBE is provided under the [CUBE Pre-publication Source-Available Licence](LICENSE): you may read the code and run unmodified copies for personal, non-commercial evaluation and academic research, with attribution. Redistribution, modification for distribution, derivative software and commercial use need the author's prior written permission. The licence is intended to be replaced by an open-source licence when the preprint appears.
