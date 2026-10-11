@@ -1299,63 +1299,68 @@ def show_help(parent):
     SECTIONS = [
         ("  Workflow",
          "Add video folders → Step 1a (2D DLC) or 1b (3D DLC) → Step 2 (Pre-processing) → "
-         "Step 3 (Clustering) → Step 4 (Annotate clips) → Step 5 (Analyse).\n"
-         "Each step saves progress automatically.  After a crash, load the "
-         "session JSON and continue from the last completed step."),
+         "Step 3 (Clustering) → Step 4 (Video Annotation) → Step 5 (Behaviour Analysis).\n"
+         "The session is saved automatically after every step.  To continue later, click Load "
+         "and choose the session file (autosave.pipeline_session.json in the Output folder)."),
         ("  Step 1a — 2D DLC Inference",
-         "Requires DeepLabCut installed in the active conda environment.\n"
-         "Uses SuperAnimal quadruped model for 2D single-camera videos.  Video adapt fine-tunes per video "
-         "(better tracking, slower).  Outputs H5 pose files and labeled videos "
-         "in <video>_results/ subfolders.\n"
-         "Pseudo-label folders are deleted automatically after each video to "
-         "keep disk usage low and avoid Windows path-length errors."),
+         "Requires DeepLabCut installed in the same conda environment as CUBE.\n"
+         "Uses the SuperAnimal quadruped model for single-camera videos.  Video adapt "
+         "fine-tunes the model on your videos (better tracking, slower); Smart Adapt "
+         "adapts once and reuses the model.  Outputs a filtered H5 pose file per video "
+         "(and an overlay video) in <video>_results/ subfolders.\n"
+         "Already have DeepLabCut output files?  Skip to Step 2."),
         ("  Step 1b — 3D DLC + Anipose (Alternate)",
-         "Requires aniposelib and DeepLabCut installed in the active conda environment.\n"
-         "Used for multi-camera 3D recordings as an alternate to Step 1a.\n"
-         "Per-camera DLC Zoo adaptation → aniposelib triangulation → fused 4-coordinate 3D H5."),
-        ("  Step 2 — CUBE Pre-processing",
-         "Reads *_filtered.h5 files.  Drops the 'individuals' level added by "
-         "SuperAnimal.  Filters bodyparts to those meeting the confidence "
-         "threshold across ALL sessions.  Exports BSOID_Project_Ready/ with "
-         "h5/, csv/, videos/, output/ subdirectories.\n"
-         "File names are automatically shortened to prevent MAX_PATH errors."),
-        ("  Step 3 — CUBE Clustering (V2 Engine)",
+         "Requires aniposelib and DeepLabCut in the same environment.\n"
+         "For synchronised multi-camera recordings, as an alternative to Step 1a: "
+         "per-camera DLC adaptation and tracking → calibration (automatic from a Charuco "
+         "calibration recording) → aniposelib triangulation → one 3D H5 file per session.\n"
+         "Rigs with up to 3 cameras and no calibration can use the homography fallback "
+         "(a fused 2D view; set in 3D DLC Settings)."),
+        ("  Step 2 — Pre-processing",
+         "Reads the *_filtered.h5 files, normalises their format and keeps the bodyparts "
+         "that meet the confidence threshold in enough sessions (default: confidence 0.30 "
+         "in at least 85% of sessions, minimum 6 bodyparts).  Writes the cleaned keypoint "
+         "files and a bodypart confidence report to the 'CUBE 2 - Preclustering files' folder "
+         "of the run."),
+        ("  Step 3 — CUBE Clustering",
          "Fully programmatic — no external app required.\n"
-         "V2 features: fps-adaptive scales (100+200 ms at 30fps; 50+100+200 ms "
-         "at 60fps+), optional body-size normalisation (nose-to-tailbase), "
-         "smoothed velocity+acceleration, angular body-axis features.\n"
-         "→ UMAP (n_components=3) → HDBSCAN (auto-sweep) → MLP classifier.\n"
-         "Only required user input: Min / Max bout duration (seconds).\n"
-         "Outputs: bout_lengths CSVs, frame labels, epoch stats, UMAP plot,\n"
-         "ethograms, validation_dashboard.png, validation_report.json."),
+         "Features: multi-scale movement features (100 + 200 ms; 50 ms added at 60 fps or "
+         "more), egocentric and order-aware features, optional body-size normalisation.\n"
+         "→ UMAP (3 dimensions) → HDBSCAN (automatic sweep, 15–25 preferred clusters) with "
+         "split/merge refinement → random-forest classifier → HMM smoothing.\n"
+         "The only required input is the Bout Duration Filter (default 0.30–10 s).\n"
+         "Outputs: bout tables, frame labels, epoch tables, plots, example clips and "
+         "validation_report.json in the 'CUBE 3 - Clusters' folder of the run."),
         ("  Experimental Groups",
          "Assign a group name to each video folder using the 'Experimental "
          "Groups' panel.\nSelect a folder in the list, type a group name "
          "(e.g. 'Control' or 'Drug'), and click Apply.\n"
          "Groups are saved in the session and pre-populated in the Analyser "
-         "when Step 5 is launched, enabling automatic split-group plots and "
-         "Kruskal-Wallis statistics."),
+         "when Step 5 is launched, enabling split-group plots and statistics."),
         ("  Step 4 — Video Annotation",
-         "Opens the Video Explorer.  Browse example clips per cluster.\n"
-         "Assign clusters to named behaviour groups.  Export TSV mapping.\n"
+         "Opens the Video Explorer.  Browse the example clips of each cluster and "
+         "assign clusters to named behaviours.  The names are exported as "
+         "cluster_behaviour_mapping.tsv.\n"
          "Keyboard: arrows navigate | Space replay | N new group | "
-         "I ignore | 1–9 assign"),
+         "I ignore | 1–9 assign | Ctrl+S save | Ctrl+Z undo\n"
+         "A second tab, Guided labelling, lets you mark your own examples so that "
+         "clusters follow the behaviours you define."),
         ("  Step 5 — Behaviour Analysis",
          "Opens the CUBE Analyser (requires customtkinter).\n"
-         "Group Editor → Full Analysis → Combined multi-animal → "
-         "Unbiased Analytics with Kruskal-Wallis, volcano plot, reclustering."),
+         "Open a Step 3 output folder → Group Editor → Combined Analysis (labels, "
+         "ethograms, group comparisons) → Unbiased Analytics (statistics, volcano "
+         "plot, reclustering) → Behavioral Explorer, Group Predictor and Paradigm Results."),
         ("  Sessions",
          "Sessions are auto-saved after every step to:\n"
-         "  <output_root>/autosave.pipeline_session.json\n"
-         "Load via the 'Load' button.  Step cards show ✓ Complete / ✗ Error."),
+         "  <Output folder>/autosave.pipeline_session.json\n"
+         "Use Save for a named copy and Load to restore a session.  Step cards show "
+         "✓ Complete / ✗ Error."),
         ("  Troubleshooting",
-         "cube_core.py not found: place in same folder as this script.\n"
-         "DLC not found: activate your DLC conda environment first.\n"
-         "H5 MultiIndex error: Steps 2 and 3 fix this automatically.\n"
-         "UMAP/HDBSCAN missing: pip install umap-learn + "
-         "conda install -c conda-forge hdbscan\n"
+         "DLC not found: install DeepLabCut in the same conda environment as CUBE.\n"
+         "UMAP/HDBSCAN missing: recreate the environment from environment.yml.\n"
          "customtkinter missing: pip install customtkinter\n"
-         "validation_report.json: check this file after Step 3 for quality gates."),
+         "validation_report.json: check this file after Step 3 for quality gates.\n"
+         "Full guide: the CUBE website (linked from the GitHub page) and CUBE_GUIDE.md."),
     ]
 
     canvas = tk.Canvas(win, bg=C["bg"], highlightthickness=0)
@@ -4789,9 +4794,9 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s, "Turned-away confidence threshold",
-                 lambda r: _spin_f(r, "turned_away_conf_thresh", 0.0, 1.0, 0.05, 0.30))
+                 lambda r: _spin_f(r, "turned_away_conf_thresh", 0.0, 1.0, 0.05, 0.50))
         tk.Label(s,
-                 text="    Low-confidence fraction that flags a bin as turned-away. 0.30 = validated default.",
+                 text="    Share of face points with low confidence that flags a bin as turned-away. 0.5 (majority) = validated default.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s, "Auto-flag impure clusters",
@@ -4920,16 +4925,16 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s3b, "Min cluster frequency (%)",
-                 lambda r: _spin_f(r, "min_cluster_freq", 0.0, 10.0, 0.1, 0.5))
+                 lambda r: _spin_f(r, "min_cluster_freq", 0.0, 10.0, 0.1, 0.2))
         tk.Label(s3b,
-                 text="    Clusters below this share of total time are pruned before MLP training.",
+                 text="    Clusters below this share of total time are removed before the classifier is trained.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
 
         # ── Iterative split + merge refinement (issue 4) ────────────────────────
         s3c = _adv_section(p, "ITERATIVE SPLIT / MERGE REFINEMENT  (advanced, on by default)", C["orange"], default_open=False)
         _adv_row(s3c, "Merge threshold  (0 = off)",
-                 lambda r: _spin_f(r, "hdbscan_merge_thresh", 0.0, 1.0, 0.01, 0.0))
+                 lambda r: _spin_f(r, "hdbscan_merge_thresh", 0.0, 1.0, 0.01, 0.08))
         tk.Label(s3c,
                  text="    0 = merge pass off. >0 merges clusters only weakly split from a shared parent.",
                  font=("Segoe UI", 7), bg=C["card"],
@@ -4947,7 +4952,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s3c, "Split silhouette thresh  (0 = off)",
-                 lambda r: _spin_f(r, "hdbscan_split_silhouette_thresh", -1.0, 1.0, 0.05, 0.0))
+                 lambda r: _spin_f(r, "hdbscan_split_silhouette_thresh", -1.0, 1.0, 0.05, 0.2))
         tk.Label(s3c,
                  text="    Clusters below this mean silhouette are candidates for local re-clustering.",
                  font=("Segoe UI", 7), bg=C["card"],
@@ -5027,9 +5032,9 @@ class AdvancedCUBEWindow(tk.Toplevel):
 
         # ── Temporally-aware clustering (TRAJECTORY_SHAPE_AND_KINETIC_FLOW_PLAN.md,
         # Aug 2026) ─────────────────────────────────────────────────────────────
-        s3d = _adv_section(p, "TEMPORALLY-AWARE CLUSTERING  (opt-in, off by default)", C["orange"], default_open=False)
+        s3d = _adv_section(p, "TEMPORALLY-AWARE CLUSTERING  (on by default)", C["orange"], default_open=False)
         _adv_row(s3d, "Order-sensitive shape feature",
-                 lambda r: _check(r, "order_shape_features_enabled", False))
+                 lambda r: _check(r, "order_shape_features_enabled", True))
         tk.Label(s3d,
                  text="    Captures movement ORDER (e.g. reach-then-retract vs. retract-then-reach), not just amount. Changes cluster output.",
                  font=("Segoe UI", 7), bg=C["card"],
@@ -5053,7 +5058,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s3d, "Kinetic flow field",
-                 lambda r: _check(r, "kinetic_flow_field_enabled", False))
+                 lambda r: _check(r, "kinetic_flow_field_enabled", True))
         tk.Label(s3d,
                  text="    Diagnostics only by itself — must be on for the reweight strength below to have any effect.",
                  font=("Segoe UI", 7), bg=C["card"],
@@ -5133,7 +5138,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
         _adv_row(s_hmm, "Min edge prob (syntax graph)",
                  lambda r: _spin_f(r, "hmm_min_prob", 0.01, 0.50, 0.01, 0.05))
         tk.Label(s_hmm,
-                 text="    Smooths MLP output with an HMM, removing single-frame flicker from jitter.\n"
+                 text="    Smooths the classifier output with an HMM, removing single-frame flicker from jitter.\n"
                       "    States = 0 uses n_clusters (smoothing only); fewer states = macro-behaviours.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
@@ -5157,7 +5162,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
         _adv_row(s_rep, "Seed sweep parallel jobs",
                  lambda r: _spin_i(r, "seed_sweep_n_jobs", -1, _cpu_n, 1, -1))
         tk.Label(s_rep,
-                 text="    -1 = auto-managed (default, see System Resources below)  |  1 = sequential (safest)  |  N = pin exact count.",
+                 text="    -1 = auto-managed (default, see System Resources below)  |  1 = one worker at a time  |  N = pin exact count.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s_rep, "Consensus auto-trigger threshold  (0 = off, default 0.55)",
@@ -5214,14 +5219,14 @@ class AdvancedCUBEWindow(tk.Toplevel):
                  text="    Detects cores/RAM at run start; re-checks before each heavy stage. Recommended on.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
-        _adv_row(s_sys, "Target utilization  (fraction of cores, default 0.65)",
-                 lambda r: _spin_f(r, "system_resource_target_pct", 0.50, 0.70, 0.01, 0.65))
+        _adv_row(s_sys, "Target utilization  (fraction of cores, default 0.50)",
+                 lambda r: _spin_f(r, "system_resource_target_pct", 0.30, 0.70, 0.01, 0.50))
         tk.Label(s_sys,
-                 text="    Ideal sustained load during the HDBSCAN sweep — the 60-70% band.",
+                 text="    Ideal sustained load during the HDBSCAN sweep.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
-        _adv_row(s_sys, "Hard cap  (fraction of cores, default 0.80)",
-                 lambda r: _spin_f(r, "system_resource_cap_pct", 0.70, 0.90, 0.01, 0.80))
+        _adv_row(s_sys, "Hard cap  (fraction of cores, default 0.65)",
+                 lambda r: _spin_f(r, "system_resource_cap_pct", 0.50, 0.90, 0.01, 0.65))
         tk.Label(s_sys,
                  text="    Never exceeded regardless of core count, even under auto-management.",
                  font=("Segoe UI", 7), bg=C["card"],
@@ -5229,7 +5234,7 @@ class AdvancedCUBEWindow(tk.Toplevel):
         _adv_row(s_sys, "HDBSCAN sweep parallel jobs",
                  lambda r: _spin_i(r, "hdbscan_sweep_n_jobs", -1, _cpu_n, 1, -1))
         tk.Label(s_sys,
-                 text="    -1 = auto-managed (recommended)  |  1 = sequential (safest)  |  N = pin exact worker count.",
+                 text="    -1 = auto-managed (recommended)  |  1 = one worker at a time  |  N = pin exact worker count.",
                  font=("Segoe UI", 7), bg=C["card"],
                  fg=C["dim"]).pack(anchor="w", padx=8, pady=(0, 2))
         _adv_row(s_sys, "Recluster split parallel jobs",

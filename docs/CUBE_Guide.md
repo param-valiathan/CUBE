@@ -15,7 +15,7 @@
 </div>
 
 > [!NOTE]
-> This README is the complete user guide. Each section explains **what a step computes and why**, then lists its tunable parameters with a code-verified default, suggested values, and the direction in which each setting moves the result.
+> This guide is complete. Each section explains **what a step computes and why**, then lists its tunable parameters with a code-verified default, suggested values, and the direction in which each setting moves the result.
 
 ## 🧭 Contents
 
@@ -566,7 +566,7 @@ A homography maps points on one plane (the floor) between two views. CUBE uses i
 | `dlc_3d_overlay_2d` | `True` | draw each camera's keypoints (grayscale background, small dots) before compositing the quad | 🟢 |
 | `dlc_3d_overlay_dot_radius` | `3` | dot size in px (kept small so the quad is not obscured) | 🟢 |
 | `dlc_3d_overlay_skeleton` | `True` | also draw thin (1 px) skeleton lines | 🟢 |
-| `dlc_3d_export_skeleton_video` | `True` | matplotlib 3D animation piped to FFmpeg. Runs in an isolated subprocess with one automatic retry, because native crashes in the render loop cannot be caught as Python exceptions. Adds minutes per session | 🟢 |
+| `dlc_3d_export_skeleton_video` | `True` | matplotlib 3D animation piped to FFmpeg. Runs in an isolated subprocess with one automatic retry. Adds minutes per session | 🟢 |
 | `dlc_3d_export_legend` | `True` | bodypart legend PNG | 🟢 |
 | `dlc_3d_export_reprojection_qc` | `True` | reprojects the 3D result into each camera and overlays it on the video. A direct visual check of calibration plus triangulation | 🟢 |
 | `dlc_3d_reprojection_qc_ll_gate` | `0.4` | display gate for the reprojection QC | 🟢 |
@@ -598,7 +598,7 @@ After Step 1b the main panel's folder list is replaced by the per-session output
 > - *Wild single-frame spikes:* check that the hard bone-length ceilings and displacement clamp are on; check the reprojection QC video for which camera is wrong.
 > - *Two cameras that should face opposite directions appear nearly parallel:* a double-sided target or insufficient multi-camera board sightings; repeat the calibration recording following the capture protocol above.
 
-﻿## 🧬 Steps 2–3 — Pre-processing and Behavioural Clustering
+## 🧬 Steps 2–3 — Pre-processing and Behavioural Clustering
 
 Step 2 turns tracking output into a clean, comparable set of pose files. Step 3 is the analytical core: it converts pose into a time-binned feature matrix, embeds it with UMAP, finds dense groups with HDBSCAN, trains a frame-level classifier on those groups, smooths the result with an HMM, and writes bouts, labels, plots and example clips.
 
@@ -629,7 +629,7 @@ Step 2 scans each source folder for `*_filtered.h5` files and decides which body
 
 | Parameter | Default | What it does | Direction | Risk |
 |---|---|---|---|---|
-| `min_confidence` (`MIN_BODYPART_CONFIDENCE`) | `0.35` | Median likelihood a bodypart must reach in a session to count as "good" there | Raise → fewer bodyparts survive (cleaner but may drop informative limbs); lower → more survive, noisier | 🟡 |
+| `min_confidence` (GUI: `bsoid_min_conf`) | `0.30` | Median likelihood a bodypart must reach in a session to count as "good" there (the app passes 0.30; the function's own fallback is 0.35) | Raise → fewer bodyparts survive (cleaner but may drop informative limbs); lower → more survive, noisier | 🟡 |
 | `min_session_frac` | `0.85` | Fraction of sessions in which the bodypart must be good | Raise → stricter; lower → tolerant of a few bad videos | 🟡 |
 | `min_keep` | `6` | If fewer bodypart pass, the top-N by confidence are kept anyway (with a warning) | Raise on rich skeletons; never set below ~4 | 🟢 |
 | `conf_metric` | `"median"` | `"median"` or `"mean"` of per-frame likelihood | `"mean"` is more sensitive to brief dropouts | 🟢 |
@@ -967,8 +967,8 @@ The clustering is fitted on a subsample; a classifier learns the cluster assignm
 | `mlp_confidence_thresh` | `0.0` | `> 0` sets low-confidence bins to unclassified (`-1`) | Raise → fewer, more confident labels | 🟡 |
 | `cv_folds` | `5` | Cross-validation folds for the reported accuracy | — | 🟢 |
 
-> [!WARNING]
-> **Documentation conflict, resolved by the code.** Older guides describe an `MLPClassifier` as the default. The shipped default is a class-balanced `RandomForestClassifier`. scikit-learn's `MLPClassifier` has no class-weight support, so on data with a large size imbalance between clusters it cannot down-weight majority clusters. Cross-validated accuracy is similar for both; the practical difference is *which* behaviours the classifier captures. Use `mlp_classifier = "mlp"` to restore the old behaviour exactly. The reported accuracy is a diagnostic of how learnable the clusters are, not a validation against ground truth.
+> [!NOTE]
+> **Default classifier.** The default is a class-balanced `RandomForestClassifier`; earlier versions used an `MLPClassifier`. scikit-learn's `MLPClassifier` has no class-weight support, so on data with a large size imbalance between clusters it cannot down-weight majority clusters. Cross-validated accuracy is similar for both; the practical difference is *which* behaviours the classifier captures. Use `mlp_classifier = "mlp"` to restore the old behaviour exactly. The reported accuracy is a diagnostic of how learnable the clusters are, not a validation against ground truth.
 
 ### ⛓️ HMM temporal smoothing
 
@@ -990,7 +990,7 @@ Classifier output is per bin and can flicker between neighbouring clusters for a
 | `hmm_smoothing_level` | `"bin"` | `"frame"` = old behaviour | 🟢 |
 | `hmm_random_state` | `42` | Reproducibility | 🟢 |
 
-To reproduce the pre-2026 pipeline exactly, set all three of `hmm_emission_mode="categorical"`, `hmm_smoothing_level="frame"`, `hmm_transition_prior="global"`. `compat_mode = "legacy_v2"` restores older numeric defaults for keys you did not set explicitly.
+To reproduce the earlier pipeline exactly, set all three of `hmm_emission_mode="categorical"`, `hmm_smoothing_level="frame"`, `hmm_transition_prior="global"`. `compat_mode = "legacy_v2"` restores older numeric defaults for keys you did not set explicitly.
 
 ### ⏱️ Bout construction
 
@@ -1057,9 +1057,6 @@ HDBSCAN-side stages (primary sweep, split pass, seed sweep, consensus) are paral
 | `system_resource_cap_pct` | `0.65` | Hard ceiling, never exceeded; shrinks further under RAM pressure | 🟡 |
 | `hdbscan_sweep_n_jobs`, `seed_sweep_n_jobs`, `consensus_n_jobs`, `hdbscan_split_n_jobs` | `-1` | Pin an integer for an exact worker count; `1` = sequential | 🟡 |
 | `video_export_n_jobs` / `video_export_max_parallel` | `-1` / `4` | Parallel labeled-video export; the cap protects the GPU encoder's concurrent-session limit | 🟡 |
-
-> [!WARNING]
-> Fully parallel dispatch of UMAP/HDBSCAN fits on Windows has been associated with rare native crashes. If a run dies silently without a Python traceback, set the three sweep/seed/consensus job counts to `1` and re-run; results do not change, only speed.
 
 ### 🧾 Reproducibility record
 
@@ -1474,7 +1471,7 @@ Starting points, not rules. Every key is described, with its default and directi
 | Camera focal lengths differ wildly in `calibration.toml` | Identical cameras solved independently | Use shared intrinsics (default) and check board dimensions |
 | 3D skeleton collapses toward one point | Calibration or board mismatch, or degenerate frames | Check reprojection error; recalibrate; inspect likelihood QC plots |
 | Pose inference is very slow or GPU memory spills | Batch size too large for the card | Lower the inference and detector batch sizes |
-| Skeleton video fails with a native crash | Intermittent native-library fault during rendering | Re-run; finished outputs are skipped and the render retries |
+| Skeleton video is missing or incomplete | The render did not finish | Re-run; finished outputs are skipped and the render retries |
 | A step re-ran nothing | Outputs already exist | Delete the specific output file or folder to force a re-run |
 | Labelled video looks shifted from the animal | Heavy smoothing | Use lighter smoothing; there is no timing offset between keypoints and video |
 | Analyser shows no groups | Group labels not assigned | Assign group labels in the Analyser before running comparisons |
