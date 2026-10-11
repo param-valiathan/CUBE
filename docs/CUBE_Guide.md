@@ -74,32 +74,43 @@ CUBE builds on B-SOiD and sits alongside other well-validated tools such as VAME
 
 ## ⚙️ Installation and launch
 
-CUBE targets Windows with an NVIDIA GPU (pose inference only; clustering runs on CPU).
+**Requirements:** Windows 10 or 11 (64-bit), an internet connection for the installation and about 15 GB of free disk space. You do not need to install Python or Anaconda; the installer sets up its own. An NVIDIA GPU is strongly recommended for pose inference (Step 1) and is not needed for Steps 2–5, which run on the CPU.
+
+### Install (three steps)
+
+1. **Get CUBE.** Download the ZIP from GitHub, right-click it and choose **Extract All…** (running the installer from inside the ZIP does not work), and put the folder somewhere simple such as `C:\CUBE`.
+2. **Double-click `install_cube.bat`.** It installs Python 3.12.13 in its own `CUBE` environment and every package CUBE needs: the analysis tools (Steps 2–5), DeepLabCut with PyTorch (Step 1) and Anipose (Step 1b). It picks the GPU or the CPU build of PyTorch automatically (the GPU build needs NVIDIA driver 580 or newer; older drivers get the CPU build plus a message). The first run downloads several GB and takes 10–30 minutes. Wait for *CUBE is installed*. Running it again repairs a damaged installation. It needs no administrator rights and writes `install_log.txt`; send that file if you need help.
+3. **Start CUBE** with the Desktop icon, or `Launch CUBE.bat`. The launcher finds the environment by itself; if it cannot, it tells you to run `install_cube.bat`. If CUBE closes with an error, a message box names `CUBE_logs\last_launch_errors.txt`, and `Launch CUBE (console).bat` keeps a window open so the error can be read.
+
+### Check the installation
+
+In CUBE choose **Help → System check** (or press the **System check** button). For each step it shows what is installed and what is missing, whether the GPU was found, and how to fix problems; **Copy report** puts the text on the clipboard for support requests. Without opening CUBE: `python cube.py --check`. Starting Step 1a or 1b with DeepLabCut or PyTorch missing shows a plain-language message instead of failing mid-run; with pose files from elsewhere, start at Step 2.
+
+### Installing by hand (advanced)
+
+With any conda, from the CUBE folder:
 
 ```bat
 conda env create -f environment.yml
 conda activate CUBE
+python -m pip install --no-deps -r requirements-lock.txt
 python cube.py
 ```
 
-> [!TIP]
-> For GPU pose inference, install a CUDA build of PyTorch from pytorch.org **before** creating the environment's `deeplabcut` package, then verify with `python -c "import torch; print(torch.cuda.is_available())"`.
+`environment.yml` only creates Python 3.12.13 and pip; `requirements-lock.txt` pins every package at the tested version (PyTorch 2.9.1 with CUDA 13, DeepLabCut 3.0.0rc14, Anipose 0.8.0, numpy 2.4). `--no-deps` is needed because DeepLabCut's metadata asks for `numpy<2`. On a computer without an NVIDIA GPU use `environment-cpu.yml` and `requirements-lock-cpu.txt`. Installer options, from a terminal: `install_cube.bat -Cpu`, `-Gpu`, `-Recreate`.
 
-Verify the install:
+### Launchers and entry points
 
-```bat
-python -c "import cv2, customtkinter, imageio_ffmpeg, aniposelib, h5py, deeplabcut, hdbscan, umap; print('OK')"
-```
+Each tool is also reachable from the main window.
 
-Standalone entry points (each is also reachable from the main window):
-
-| Command | Tool |
-|---------|------|
-| `python cube.py` | Main six-step pipeline |
-| `python bonsai_video_corrector.py` | Step 0 on its own |
-| `python cube_analyser.py` | Step 5 on an existing results folder |
-| `python cube_video_explorer.py` | Step 4 on an existing results folder |
-| `python calibrate_cameras.py --help` | Build `calibration.toml` from a calibration recording |
+| Double-click | Command | Tool |
+|---|---|---|
+| `Launch CUBE.bat` | `python cube.py` | Main six-step pipeline |
+| (Step 0 button) | `python bonsai_video_corrector.py` | Step 0 on its own |
+| `Launch Analyser.bat` | `python cube_analyser.py` | Step 5 on an existing results folder |
+| `Launch Video Explorer.bat` | `python cube_video_explorer.py` | Step 4 on an existing results folder |
+| | `python calibrate_cameras.py --help` | Build `calibration.toml` from a calibration recording |
+| | `python cube.py --check` | System check without opening the window |
 
 The window theme (`dark` or `light`) is stored in `theme.txt`, written when you toggle the theme in the GUI.
 
@@ -1458,7 +1469,11 @@ Every pipeline run writes into **one** timestamped run folder created inside the
 | `cube_homography_calibrator.py` | Standalone window that calibrates a floor-plane homography for two/three-camera rigs |
 | `reproject_3d_to_2d_overlay.py` | Read-only QC tool: reprojects triangulated 3D results into each camera view next to the raw 2D detections |
 | `fasthdbscan_adapter.py` | Compatibility adapter that makes `fast_hdbscan` the default HDBSCAN implementation inside `cube_core.py` |
-| `environment.yml` | Conda environment specification |
+| `install_cube.bat`, `install_cube.ps1` | One-click installer: finds or installs conda (Miniforge), picks the GPU or CPU set, creates the `CUBE` environment (Python 3.12.13) and installs the lock file, then runs the system check and creates shortcuts |
+| `Launch CUBE.bat`, `Launch Analyser.bat`, `Launch Video Explorer.bat`, `Launch CUBE (console).bat`, `_cube_launch.bat` | Launchers that locate the environment (via `cube_env_path.txt` or the usual conda folders); the last is the shared helper |
+| `cube_doctor.py` | System check behind **Help → System check** and `python cube.py --check` |
+| `environment.yml`, `environment-cpu.yml` | Conda environment specification (Python 3.12.13 and pip) |
+| `requirements-lock.txt`, `requirements-lock-cpu.txt` | Exact versions of every package, installed with `pip install --no-deps -r` |
 
 <a id="recipes"></a>
 
@@ -1485,6 +1500,14 @@ Starting points, not rules. Every key is described, with its default and directi
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
+| Launching says *CUBE has not been installed* | The `CUBE` environment is missing | Run `install_cube.bat` (safe to run any number of times) |
+| `install_cube.bat` stops with a network message | A download was interrupted or blocked | Run it again; finished packages are kept. On a company network allow `pypi.org`, `conda.anaconda.org`, `github.com` and `download.pytorch.org` |
+| The installer says `requirements-lock.txt` was not found | CUBE was started from inside the ZIP | Extract the ZIP (**Extract All…**) and run the installer from the extracted folder |
+| Windows SmartScreen blocks a `.bat` file | Unsigned script | Choose *More info → Run anyway*; the scripts are plain text |
+| *Pose tracking is not set up* when starting Step 1 | DeepLabCut or PyTorch is missing | Run `install_cube.bat`; with existing DeepLabCut output, start at Step 2 |
+| System check: *no GPU available* | No NVIDIA GPU, an old driver, or the CPU build was installed | No GPU: ignore (only Step 1 is slow). With a GPU: install driver 580 or newer, then run `install_cube.bat -Gpu` |
+| CUBE closes immediately or shows an error box | Any startup error | Read `CUBE_logs\last_launch_errors.txt` or use `Launch CUBE (console).bat`; send it with the System check *Copy report* text |
+| *Path too long* errors | Very deep folder names on Windows | Keep video folders short and near the drive root, e.g. `D:\Videos\Mouse1` |
 | Calibration finds zero corners | Board dimensions entered do not match the printed board | Set squares across/down, square length and marker length to the physical board |
 | Camera focal lengths differ wildly in `calibration.toml` | Identical cameras solved independently | Use shared intrinsics (default) and check board dimensions |
 | 3D skeleton collapses toward one point | Calibration or board mismatch, or degenerate frames | Check reprojection error; recalibrate; inspect likelihood QC plots |

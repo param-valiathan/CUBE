@@ -34,16 +34,37 @@ Methods, every parameter (defaults, suggested values, direction of effect), reci
 
 ## ⚙️ Install and run
 
-Windows, NVIDIA GPU recommended for pose inference.
+Windows 10 or 11. No programming knowledge and no separate Python or Anaconda installation needed. An NVIDIA GPU is recommended for pose tracking (Step 1) and not needed for Steps 2–5.
+
+1. **Download.** Click **Code → Download ZIP**, right-click the ZIP and choose **Extract All…** (installing from inside the ZIP does not work). Put the folder somewhere simple, for example `C:\CUBE`.
+2. **Install.** Double-click **`install_cube.bat`** and wait for *CUBE is installed* (10–30 minutes the first time, several GB of downloads). It sets up its own Python 3.12.13 environment with every package, including DeepLabCut, PyTorch and Anipose, and chooses the GPU or CPU build automatically. Running it again repairs a broken installation. No administrator rights are needed.
+3. **Start.** Double-click the **CUBE** icon on your Desktop (or **`Launch CUBE.bat`**).
+
+**Is everything working?** In CUBE choose **Help → System check**. It lists what is installed, whether your GPU is found, and how to fix anything missing. From a terminal, `python cube.py --check` prints the same report.
+
+| Problem | What to do |
+|---|---|
+| "Run install_cube.bat first" when starting | The installation did not finish. Run `install_cube.bat` again. |
+| The installer stops with a network message | Run it again; it continues where it stopped. Some company networks block `pypi.org`, `conda.anaconda.org` or `download.pytorch.org`. |
+| Windows SmartScreen warns about a `.bat` file | Choose *More info → Run anyway*. The scripts are plain text and can be read in Notepad. |
+| System check: "no GPU available" | Without an NVIDIA GPU, ignore it (only Step 1 is slow). With one, update the NVIDIA driver (580 or newer) and run `install_cube.bat -Gpu` from a terminal. |
+| CUBE closes with an error | Double-click `Launch CUBE (console).bat` to read the message, and send it with the **Copy report** text from System check and `install_log.txt`. |
+
+<details>
+<summary>Advanced install (command line, any conda)</summary>
+
+CUBE is developed and tested with **Python 3.12.13**. From the CUBE folder:
 
 ```bat
 conda env create -f environment.yml
 conda activate CUBE
+python -m pip install --no-deps -r requirements-lock.txt
 python cube.py
 ```
 
-> [!TIP]
-> For GPU inference, install a CUDA build of PyTorch from pytorch.org before the `deeplabcut` package, and check with `python -c "import torch; print(torch.cuda.is_available())"`.
+`--no-deps` is required: the lock file pins the exact tested set of packages (PyTorch 2.9.1 with CUDA 13, DeepLabCut 3.0.0rc14, Anipose 0.8.0, numpy 2.4 and all dependencies), and DeepLabCut's own metadata asks for `numpy<2`. Without an NVIDIA GPU use `environment-cpu.yml` and `requirements-lock-cpu.txt`. Installer options: `install_cube.bat -Cpu`, `-Gpu`, `-Recreate`.
+
+</details>
 
 ## 🗂️ Repository layout
 
@@ -56,7 +77,10 @@ python cube.py
 | `cube_video_explorer.py`, `guided/` | Step 4: cluster review and guided labelling |
 | `cube_analyser.py` | Step 5: group statistics and paradigm readouts |
 | `docs/` | The user guide |
-| `environment.yml` | Conda environment |
+| `install_cube.bat`, `install_cube.ps1` | One-click installer (Python 3.12 environment plus every package) |
+| `Launch CUBE.bat`, `Launch Analyser.bat`, `Launch Video Explorer.bat` | Double-click launchers that find the environment automatically |
+| `cube_doctor.py` | The system check behind **Help → System check** and `python cube.py --check` |
+| `environment.yml`, `environment-cpu.yml`, `requirements-lock.txt`, `requirements-lock-cpu.txt` | Conda environment (Python 3.12.13) and the exact package versions, GPU and CPU variants |
 
 ## 📚 Credits and citation
 

@@ -32,9 +32,15 @@ Sessions are saved as JSON after every step so analysis can resume after crash.
 
 Requirements
 ------------
-    pip install pillow opencv-python-headless scipy scikit-learn umap-learn customtkinter plotly
-    conda install -c conda-forge hdbscan
+    Double-click install_cube.bat (creates the 'CUBE' environment with every package at its tested
+    version), then Launch CUBE.bat.  `python cube.py --check` prints a system check.
 """
+
+# `--check` must work even when the environment is broken, so it is answered before any heavy import.
+import sys as _sys_early
+if __name__ == "__main__" and "--check" in _sys_early.argv[1:]:
+    import cube_doctor as _cube_doctor_early
+    raise SystemExit(_cube_doctor_early.main())
 
 # Force single-threaded BLAS/MKL before any numpy import so loky workers
 # spawned from this process inherit the correct threading config on Windows.
@@ -1285,6 +1291,100 @@ class FolderList(tk.Frame):
 #  HELP WINDOW
 #  
 
+def show_system_check(parent):
+    """Plain-language readiness report (Help > System check). Runs in a background thread so the
+    window opens instantly; 'Copy report' puts the text on the clipboard for support requests."""
+    import threading
+    win = tk.Toplevel(parent)
+    win.title("CUBE — System check")
+    win.configure(bg=C["bg"])
+    win.geometry("820x640")
+    win.after(10, lambda w=win: _raise_window(w))
+    tk.Label(win, text="System check", font=("Segoe UI", 13, "bold"),
+             bg=C["bg"], fg=C["accent"]).pack(pady=(14, 2))
+    tk.Label(win, text="Shows whether this computer is ready for each CUBE step, and how to fix anything missing.",
+             font=("Segoe UI", 9), bg=C["bg"], fg=C["text"]).pack(pady=(0, 8))
+
+    box = tk.Frame(win, bg=C["bg"])
+    box.pack(fill="both", expand=True, padx=14)
+    txt = tk.Text(box, wrap="word", font=("Consolas", 10), bg=C["log_bg"], fg=C["text"],
+                  relief="flat", padx=10, pady=8)
+    sb = tk.Scrollbar(box, command=txt.yview)
+    txt.configure(yscrollcommand=sb.set)
+    sb.pack(side="right", fill="y")
+    txt.pack(side="left", fill="both", expand=True)
+    for tag, col in (("ok", "#2e9e57"), ("warn", "#d9930d"), ("fail", "#d64545"), ("info", C["text"])):
+        txt.tag_configure(tag, foreground=col)
+    txt.tag_configure("head", font=("Consolas", 10, "bold"), foreground=C["accent"])
+    state = {"report": ""}
+
+    def _render(results):
+        import cube_doctor as cd
+        state["report"] = cd.format_report(results)
+        txt.configure(state="normal")
+        txt.delete("1.0", "end")
+        for group in ["System"] + list(cd.GROUPS):
+            rows = [r for r in results if r["group"] == group]
+            if not rows:
+                continue
+            txt.insert("end", group + "\n", "head")
+            for r in rows:
+                txt.insert("end", f"  {cd._ICON[r['status']]} ", r["status"])
+                txt.insert("end", f"{r['name']}: {r['detail']}\n")
+                if r["fix"] and r["status"] in (cd.WARN, cd.FAIL):
+                    txt.insert("end", f"           -> {r['fix']}\n", r["status"])
+            txt.insert("end", "\n")
+        n_fail = sum(r["status"] == cd.FAIL for r in results)
+        n_warn = sum(r["status"] == cd.WARN for r in results)
+        msg = ("Required items are missing. CUBE may not run correctly." if n_fail else
+               f"CUBE can run. {n_warn} item(s) need attention for some steps." if n_warn else
+               "Everything is ready.")
+        txt.insert("end", msg + "\n", "fail" if n_fail else "warn" if n_warn else "ok")
+        txt.configure(state="disabled")
+
+    def _run():
+        txt.configure(state="normal")
+        txt.delete("1.0", "end")
+        txt.insert("end", "Checking...\n")
+        txt.configure(state="disabled")
+
+        box_out = {}                      # the worker only fills this dict; Tk is touched from the main thread only
+
+        def work():
+            try:
+                import cube_doctor as cd
+                box_out["res"] = cd.run_checks()
+            except Exception as e:
+                box_out["err"] = str(e)
+
+        def poll():
+            if not win.winfo_exists():
+                return
+            if "res" in box_out:
+                _render(box_out["res"])
+            elif "err" in box_out:
+                txt.configure(state="normal")
+                txt.delete("1.0", "end")
+                txt.insert("end", f"The system check could not run: {box_out['err']}\n", "fail")
+                txt.configure(state="disabled")
+            else:
+                win.after(100, poll)
+
+        threading.Thread(target=work, daemon=True).start()
+        win.after(100, poll)
+
+    def _copy():
+        win.clipboard_clear()
+        win.clipboard_append(state["report"] or txt.get("1.0", "end"))
+
+    bar = tk.Frame(win, bg=C["bg"])
+    bar.pack(pady=10)
+    for label, cmd in (("Check again", _run), ("Copy report", _copy), ("Close", win.destroy)):
+        tk.Button(bar, text=label, font=("Segoe UI", 9), bg=C["btn"], fg=C["btn_fg"],
+                  relief="flat", padx=14, pady=5, cursor="hand2", command=cmd).pack(side="left", padx=4)
+    _run()
+
+
 def show_help(parent):
     win = tk.Toplevel(parent)
     win.title("CUBE — User Guide")
@@ -1302,6 +1402,9 @@ def show_help(parent):
          "Step 3 (Clustering) → Step 4 (Video Annotation) → Step 5 (Behaviour Analysis).\n"
          "The session is saved automatically after every step.  To continue later, click Load "
          "and choose the session file (autosave.pipeline_session.json in the Output folder)."),
+        ("  Something not working?",
+         "Open Help > System check (or the System check button). It lists what is installed, whether a GPU "
+         "is available, and how to fix anything missing. Run install_cube.bat to repair the installation."),
         ("  Step 1a — 2D DLC Inference",
          "Requires DeepLabCut installed in the same conda environment as CUBE.\n"
          "Uses the SuperAnimal quadruped model for single-camera videos.  Video adapt "
@@ -1357,10 +1460,10 @@ def show_help(parent):
          "✓ Complete / ✗ Error."),
         ("  Troubleshooting",
          "DLC not found: install DeepLabCut in the same conda environment as CUBE.\n"
-         "UMAP/HDBSCAN missing: recreate the environment from environment.yml.\n"
-         "customtkinter missing: pip install customtkinter\n"
+         "Help > System check lists exactly what is missing and how to fix it.\n"
+         "Any package missing: double-click install_cube.bat to repair the installation.\n"
          "validation_report.json: check this file after Step 3 for quality gates.\n"
-         "Full guide: the CUBE website (linked from the GitHub page) and CUBE_GUIDE.md."),
+         "Full guide: the CUBE website (linked from the GitHub page) and the guide in the docs folder."),
     ]
 
     canvas = tk.Canvas(win, bg=C["bg"], highlightthickness=0)
@@ -1966,7 +2069,7 @@ def _run_dlc_step(session: SessionState, settings: SettingsPanel,
     try:
         import cv2
     except ImportError:
-        raise ImportError("OpenCV not found.  pip install opencv-python-headless")
+        raise ImportError("OpenCV not found. Run install_cube.bat to repair the installation.")
 
     import gc
 
@@ -2468,12 +2571,12 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
     try:
         import cv2
     except ImportError:
-        raise ImportError("OpenCV not found.  pip install opencv-python-headless")
+        raise ImportError("OpenCV not found. Run install_cube.bat to repair the installation.")
 
     try:
         import numpy as _np
     except ImportError:
-        raise ImportError("NumPy not found.  pip install numpy")
+        raise ImportError("NumPy not found. Run install_cube.bat to repair the installation.")
 
     folders = session["video_folders"]
     if not folders:
@@ -2950,7 +3053,7 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
                 _use_ruamel = True
             except ImportError:
                 logger.warn(
-                    "  ruamel.yaml not found (pip install ruamel.yaml); "
+                    "  ruamel.yaml not found (run install_cube.bat to repair); "
                     "using PyYAML fallback — YAML comments may be stripped.")
 
             for pcfg_path in _pcfg_targets:
@@ -8952,14 +9055,20 @@ class PipelineApp(tk.Tk):
 
         helpm = tk.Menu(menubar, tearoff=0)
         helpm.add_command(label="Help", command=lambda: show_help(self))
+        helpm.add_command(label="System check...", command=lambda: show_system_check(self))
         menubar.add_cascade(label="Help", menu=helpm)
 
         self.config(menu=menubar)
 
     def _open_step0(self):
-        script = Path(__file__).parent.parent / "3D DLC" / "bonsai_video_corrector.py"
+        here = Path(__file__).resolve().parent
+        candidates = [here / "bonsai_video_corrector.py",
+                      here.parent / "3D DLC" / "bonsai_video_corrector.py"]
+        script = next((p for p in candidates if p.exists()), candidates[0])
         if not script.exists():
-            messagebox.showerror("Step 0", f"Not found:\n{script}")
+            messagebox.showerror("Step 0",
+                "Step 0 (multi-camera synchronisation) was not found.\n\n"
+                "Place bonsai_video_corrector.py in the CUBE folder:\n" + str(here))
             return
         subprocess.Popen([sys.executable, str(script)],
                           creationflags=subprocess.CREATE_NEW_CONSOLE)
@@ -8981,7 +9090,8 @@ class PipelineApp(tk.Tk):
         for txt, cmd in [
             ("Step 0",        self._open_step0),
             ("Help",          lambda: show_help(self)),
-            ("Theme",         self._toggle_theme),
+            ("System check",  lambda: show_system_check(self)),
+            ("Theme",        self._toggle_theme),
             ("Save",          self._save_session),
             ("Load",          self._load_session),
             ("Output",        self._set_output),
@@ -9503,9 +9613,26 @@ class PipelineApp(tk.Tk):
 
     #   STEP LAUNCHERS
 
+    def _step1_ready(self, three_d: bool = False) -> bool:
+        """Friendly pre-flight for pose tracking: explain a missing DeepLabCut/PyTorch/Anipose
+        up front instead of failing deep inside the run."""
+        try:
+            import cube_doctor
+            why = cube_doctor.step1_blocker(three_d=three_d)
+        except Exception:
+            return True                      # never block a run because the check itself broke
+        if why:
+            messagebox.showerror("Pose tracking is not set up", why +
+                                 "\n\nHelp > System check shows exactly what is missing.\n"
+                                 "Already have DeepLabCut output files? You can skip Step 1 and start at Step 2.")
+            return False
+        return True
+
     def _launch_dlc(self):
         if not CORE_OK:
             messagebox.showerror("Missing", "cube_core.py not found.")
+            return
+        if not self._step1_ready():
             return
         if not self._session["video_folders"]:
             messagebox.showwarning("No folders",
@@ -9524,6 +9651,8 @@ class PipelineApp(tk.Tk):
     def _launch_3d_dlc(self):
         if not CORE_OK:
             messagebox.showerror("Missing", "cube_core.py not found.")
+            return
+        if not self._step1_ready(three_d=True):
             return
         # Clicking "Run Step 1b — 3D DLC" already IS the user's 3D-mode
         # intent (a distinct action from Step 1a's 2D launch) — no
@@ -9797,7 +9926,7 @@ class PipelineApp(tk.Tk):
         if not CTK_OK:
             messagebox.showerror("Missing dependency",
                 "customtkinter is required for the Analyser.\n"
-                "Run:  pip install customtkinter")
+                "Run install_cube.bat to repair the installation.")
             return
         if self._running:
             messagebox.showwarning("Busy", "Another step is already running.")
@@ -10390,20 +10519,14 @@ def _check_and_warn():
         missing_scripts.append("cube_video_explorer.py")
 
     missing_pkgs = []
-    for pkg, install in [
-        ("umap",          "pip install umap-learn"),
-        ("hdbscan",       "conda install -c conda-forge hdbscan"),
-        ("sklearn",       "pip install scikit-learn"),
-        ("PIL",           "pip install pillow"),
-        ("cv2",           "pip install opencv-python-headless"),
-    ]:
+    for pkg in ("umap", "hdbscan", "sklearn", "PIL", "cv2"):
         try:
             __import__(pkg)
         except ImportError:
-            missing_pkgs.append(f"{pkg}   '  {install}")
+            missing_pkgs.append(pkg)
 
     if not CTK_OK:
-        missing_pkgs.append("customtkinter   '  pip install customtkinter")
+        missing_pkgs.append("customtkinter")
 
     msgs = []
     if missing_scripts:
@@ -10412,6 +10535,8 @@ def _check_and_warn():
     if missing_pkgs:
         msgs.append("\nMissing Python packages:")
         msgs += [f"   -  {p}" for p in missing_pkgs]
+        msgs.append("\nTo fix: close CUBE and double-click install_cube.bat in the CUBE folder.\n"
+                    "Help > System check shows the full list once CUBE is running.")
 
     if msgs:
         msgs.append(f"\nExpected folder:\n  {HERE}")
@@ -10466,7 +10591,23 @@ def _deferred_imports():
 #  ENTRY POINT
 #
 
-def main():
+CUBE_VERSION = "5"
+
+
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(prog="cube.py", description="CUBE: Comprehensive Unsupervised Behavioral Explorer")
+    ap.add_argument("--check", action="store_true",
+                    help="print a system check (what is installed, GPU, FFmpeg) and exit without opening the app")
+    ap.add_argument("--version", action="store_true", help="print the CUBE version and exit")
+    args = ap.parse_args(argv)
+    if args.version:
+        print(f"CUBE v{CUBE_VERSION}")
+        return 0
+    if args.check:
+        import cube_doctor
+        return cube_doctor.main()
+
     # Tell Windows who this process is before any window is created.
     # This ensures the taskbar always uses the CUBE icon, not Python's feather.
     try:
@@ -10478,7 +10619,8 @@ def main():
 
     app = PipelineApp()
     app.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

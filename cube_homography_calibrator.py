@@ -10,9 +10,10 @@ compute and cache the floor-plane homography relating them. Not yet
 auto-triggered from Step 2 -- that wiring is a later phase of the plan.
 
 Run standalone:
-    "C:\\Users\\param\\anaconda3\\envs\\CUBE\\python.exe" cube_homography_calibrator.py
+    python   (with the CUBE environment active) cube_homography_calibrator.py
+    (the path is saved in cube_env_path.txt by install_cube.bat)
 
-Requirements: pillow, opencv-python-headless (already in the CUBE env).
+Requirements: pillow and OpenCV (already in the CUBE env).
 """
 
 import tkinter as tk
