@@ -62,7 +62,7 @@ python cube.py
 
 CUBE was developed by Param Valiathan in the laboratory of Patrik Ernfors at Karolinska Institutet ([research group](https://ki.se/en/mbb/research-division-of-molecular-neurobiology)). A preprint is in preparation; until it appears, please cite the software:
 
-> Valiathan P. CUBE: Comprehensive Unsupervised Behavioural Explorer. Developed in the laboratory of Patrik Ernfors, Karolinska Institutet. https://github.com/param-valiathan/CUBE
+> Valiathan P. CUBE: Comprehensive Unsupervised Behavioral Explorer. Developed in the laboratory of Patrik Ernfors, Karolinska Institutet. https://github.com/param-valiathan/CUBE
 
 Please also cite the work CUBE builds on: B-SOiD (Hsu & Yttri 2021, *Nat. Commun.* 12:5188), DeepLabCut (Mathis et al. 2018, *Nat. Neurosci.* 21:1281), UMAP (McInnes et al. 2018, arXiv:1802.03426), HDBSCAN (McInnes et al. 2017, *JOSS* 2:205) and, for 3D mode, Anipose (Karashchuk et al. 2021, *Cell Rep.* 36:109730).
 
