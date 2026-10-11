@@ -56,7 +56,7 @@ Steps are launched from the main window (`cube.py`) and can be chained. Every st
 
 ### How CUBE relates to other tools
 
-CUBE builds on B-SOiD and sits alongside other well-validated tools such as VAME and keypoint-MoSeq. These tools were designed for different needs, and none is best in every setting. The points below describe where CUBE's design differs; they are design choices, not measured differences in performance, and CUBE has not been benchmarked head-to-head against these tools.
+CUBE builds on B-SOiD and sits alongside other well-validated tools such as VAME and keypoint-MoSeq. These tools were designed for different needs, and none is best in every setting. The points below describe where CUBE's design differs. They reflect design choices rather than measured differences in performance. CUBE is under active development, and suggestions are very welcome.
 
 **Where CUBE's design differs**
 
