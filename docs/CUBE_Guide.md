@@ -1291,7 +1291,7 @@ Three parallel models, each measuring a different dimension of behaviour:
 
 **Pipeline.** VarianceThreshold (drop near-constant features) → RobustScaler (median/IQR) → PolynomialFeatures interaction terms (frequency/duration only) → adaptive PCA (only when features outnumber animals; capped at `min(n_animals − 2, 15)`) → classifier.
 
-**Classifier.** Elastic-net logistic regression (default; L1 selects, L2 handles the correlated clusters typical of this data; multinomial for ≥ 3 groups; `class_weight="balanced"`) or a linear SVM with Platt scaling. A random forest is deliberately not offered: with 5–6 animals per group it memorises the training animals.
+**Classifier.** Elastic-net logistic regression (default; L1 selects, L2 handles the correlated clusters typical of this data; multinomial for ≥ 3 groups; `class_weight="balanced"`) a linear SVM with Platt scaling, a shrinkage LDA (no tuning, stable at small n) or PLS-DA (two latent components, robust to collinearity). A random forest is deliberately not offered: with 5–6 animals per group it memorises the training animals.
 
 **Validation.** Leave-one-out cross-validation (the maximum training set for small cohorts), reported as accuracy, **balanced accuracy** and Cohen's κ. Significance is a **permutation test** (group labels shuffled, full LOO repeated) with the Phipson–Smyth correction `p = (count ≥ observed + 1) / (n_perm + 1)`.
 
@@ -1316,7 +1316,8 @@ With three or more groups the default models try to separate *every* group from 
 | Group-level stats | on | Omnibus usage tests, per-cluster effect sizes, bout-structure features | Leave on; it is cheap and answers *which* behaviours differ |
 | CLR-transform usage | off | Centred log-ratio of cluster usage (cluster source only). Time spent in clusters sums to 100 %, so one cluster rising forces others to fall; CLR removes that artefact | Run once on and once off. If conclusions agree they are robust; if they differ, trust the CLR run when one or two clusters dominate the session |
 | Feature source | Individual clusters | What the models see | Start with clusters. Try Behaviour groups when you have many noisy clusters or want interpretable features; use Mix to combine both |
-| Algorithm | Elastic Net | Classifier | Run Elastic Net first, then the linear SVM as a cross-check. Agreement between the two is reassuring |
+| Algorithm | Elastic Net | Classifier for the three main models. **Elastic Net** (default): L1 selects, L2 shares weight across correlated clusters, gives probabilities. **SVM (linear)**: same accuracy class, but its probabilities (Platt scaling) are less reliable at small n, so use it mainly as a cross-check. **Shrinkage LDA**: no tuning, very stable when animals are few; good when many features each carry a little signal. **PLS-DA**: projects onto 2 latent components, robust to collinearity and common in phenotyping work | Start with Elastic Net, then rerun with Shrinkage LDA. If you only have 5-8 animals per group prefer LDA or PLS-DA |
+| Model agreement | on | Re-fits the same features with all four classifiers (leave-one-out only, no permutations) and compares them | Leave on. Conclusions that hold for all four are robust; if only one classifier finds the effect, treat it as fragile |
 | Max contributors | 5 | Number of clusters/groups the model may use | With fewer than 20 animals keep it at 3-5 (roughly at most one feature per four animals). Use `All` only with 30+ animals |
 | Permutations | 199 | Resolution of the p-value (smallest possible p = 1 / (n + 1)) | 199 while exploring, 999 for a figure you will publish. Pairwise contrasts use the same number |
 
@@ -1325,6 +1326,7 @@ With three or more groups the default models try to separate *every* group from 
 - **Classifier contrasts** (`contrast_summary`): one dot per contrast, with the area under the ROC curve (AUC) and its 95 % bootstrap interval. 0.5 is chance. Green means the BH-corrected q is below 0.05. The label also gives balanced accuracy and the *minimum detectable accuracy*, the accuracy a model must exceed to reach p < 0.05 given your sample size; if your observed accuracy is below it, you do not have the power to claim an effect.
 - **Omnibus usage tests** (`omnibus_usage_tests`): the Jensen-Shannon distance and PERMANOVA ask whether the *overall* distribution of time across clusters differs between groups, before looking at any single cluster. The histograms are the permutation null; the red line is your data. The PCA plot shows animals coloured by group (R² is the share of variation explained by group).
 - **Per-cluster effects** (`usage_effects`): a heatmap of Hedges g (effect size, A minus B; about 0.5 is medium and 0.8 is large) for the clusters with the largest effects. `*` marks q < 0.05 and `**` q < 0.01 after FDR correction across clusters. If the same animals appear in more than one group, a mixed model with a random intercept per animal is used; otherwise a Mann-Whitney test. The `test` column in the CSV says which.
+- **Model agreement** (`model_agreement`): balanced accuracy of the four classifiers on the same features, and a matrix of Cohen's kappa between their leave-one-out predictions (1 = identical predictions). Large differences between classifiers mean the result depends on the method; `model_agreement_predictions.csv` shows, animal by animal, which classifiers got it right.
 - **Sequence features** (`sequence_features`, `sequence_effects`): bouts per minute, mean bout length, bout-length variability, usage entropy, transition entropy (how predictable the next behaviour is) and the share of the dominant cluster. Use them to see whether the drug changes *how* behaviour is structured, not just how much of each behaviour occurs.
 
 **Common situations**
@@ -1344,10 +1346,12 @@ With three or more groups the default models try to separate *every* group from 
 - **Selection is optimistic until nested.** If you pick the target after seeing the data, or run many configurations, correct for it. Use the nested permutation test for any claim you publish.
 - **No signal?** Try a larger permutation count only after checking the minimum detectable accuracy; try CLR on; try Behaviour groups instead of clusters; check that the animals' recordings are long enough for stable cluster usage.
 
+**What is saved.** **Export Results** (and **Save All Results**) wait for the background contrast analyses to finish, then write: the model summary, per-animal predictions, confusion matrices, feature importances and permutation nulls; every contrast plot as a PNG with its CSV (contrast_summary, model_agreement plus model_agreement_kappa and model_agreement_predictions, omnibus_tests plus omnibus_pcoa and omnibus_null, usage_effects, sequence_features, sequence_effects); and un_config.json, which records the target group, classifier, feature source, permutations, CLR setting, group sizes, contrasts tested and all warnings, so every saved result can be reproduced and interpreted later.
+
 | Control | Default | Options / effect | Risk |
 |---|---|---|---|
 | Feature source | Individual clusters | Behaviour groups / Mix / Custom (the transition model always uses clusters) | 🟢 |
-| Algorithm | Elastic Net | Linear SVM | 🟢 |
+| Algorithm | Elastic Net | Linear SVM / Shrinkage LDA / PLS-DA (see the target-group section for when to use each) | 🟢 |
 | Permutation count | `199` | `99`, `199`, `499`, `999` (resolution ±0.05 … ±0.005); use ≥ 499 for publication | 🟢 |
 | Max contributors | `5` | Number of clusters/transitions selected; `All` runs greedy then upgrades to exhaustive at the peak k | 🟡 |
 | Nested permutation test | on request | Repeats the *selection* inside every permutation; wider null, required for publication-grade claims | 🟡 |

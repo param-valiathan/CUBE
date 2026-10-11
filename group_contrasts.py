@@ -1,4 +1,4 @@
-﻿"""Group-contrast statistics + themed figures for the Group Predictor tab.
+"""Group-contrast statistics + themed figures for the Group Predictor tab.
 
 Pure functions (no tkinter, no pyplot state).  Figure builders take a theme dict
 ``th`` with keys fig_bg / ax_bg / text / spine / muted (CUBE's ``T()``) so every
@@ -251,6 +251,98 @@ def sequence_features(animals) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# ── extra classifiers (sklearn-compatible, picklable for loky) ───────────────
+
+from sklearn.base import BaseEstimator, ClassifierMixin  # noqa: E402
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis  # noqa: E402
+
+
+class BalancedShrinkageLDA(LinearDiscriminantAnalysis):
+    """Shrinkage (Ledoit-Wolf) LDA with uniform class priors, so an imbalanced
+    target-vs-rest split is not dominated by the larger class."""
+    _no_sample_weight = True
+
+    def __init__(self, shrinkage="auto"):
+        super().__init__(solver="lsqr", shrinkage=shrinkage)
+
+    def fit(self, X, y):
+        k = len(np.unique(y))
+        self.priors = np.full(k, 1.0 / k)
+        return super().fit(X, y)
+
+
+class PLSDAClassifier(BaseEstimator, ClassifierMixin):
+    """Partial-least-squares discriminant analysis (PLS regression on one-hot
+    targets, argmax of the prior-corrected prediction).  coef_ is (n_classes,
+    n_features) so the panel's importance code works unchanged."""
+    _no_sample_weight = True
+
+    def __init__(self, n_components=2):
+        self.n_components = n_components
+
+    def fit(self, X, y):
+        from sklearn.cross_decomposition import PLSRegression
+        X = np.asarray(X, float)
+        self.classes_, yi = np.unique(y, return_inverse=True)
+        k = len(self.classes_)
+        Y = np.eye(k)[yi]
+        self.prior_ = Y.mean(axis=0)
+        p_full = X.shape[1]
+        self.keep_ = np.nan_to_num(X.std(axis=0)) > 1e-10      # drop constant columns
+        self.coef_ = np.zeros((k, p_full))
+        self.pls_ = None
+        if self.keep_.any() and k > 1:
+            Xk = X[:, self.keep_]
+            nc = int(max(1, min(self.n_components, np.linalg.matrix_rank(Xk), X.shape[0] - 1)))
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    self.pls_ = PLSRegression(n_components=nc, scale=False).fit(Xk, Y)
+                c = np.asarray(self.pls_.coef_)
+                c = c if c.shape == (k, Xk.shape[1]) else c.T
+                if np.isfinite(c).all():
+                    self.coef_[:, self.keep_] = c
+                else:
+                    self.pls_ = None
+            except Exception:
+                self.pls_ = None
+        return self
+
+    def _scores(self, X):
+        X = np.asarray(X, float)
+        k = len(self.classes_)
+        if self.pls_ is None:                       # degenerate fit: predict the prior
+            return np.tile(self.prior_ - self.prior_ + 1.0 / k, (len(X), 1)) + 1e-9 * self.prior_
+        s = np.asarray(self.pls_.predict(X[:, self.keep_])).reshape(len(X), -1)
+        s = np.nan_to_num(s, nan=1.0 / k)
+        return s - self.prior_ + 1.0 / k           # balance the classes
+
+    def predict_proba(self, X):
+        s = np.clip(self._scores(X), 1e-6, None)
+        return s / s.sum(axis=1, keepdims=True)
+
+    def decision_function(self, X):
+        s = self._scores(X)
+        return s[:, 1] - s[:, 0] if s.shape[1] == 2 else s
+
+    def predict(self, X):
+        return self.classes_[np.argmax(self._scores(X), axis=1)]
+
+
+def pairwise_kappa(preds: dict) -> pd.DataFrame:
+    """Cohen's kappa between each pair of classifiers' leave-one-out predictions."""
+    from sklearn.metrics import cohen_kappa_score
+    names = list(preds)
+    M = pd.DataFrame(np.nan, index=names, columns=names)
+    for a in names:
+        for b in names:
+            try:
+                M.loc[a, b] = 1.0 if a == b else float(cohen_kappa_score(preds[a], preds[b]))
+            except Exception:
+                pass
+    return M
+
+
 # ── figures ──────────────────────────────────────────────────────────────────
 
 def _fig(w, h, th):
@@ -359,6 +451,44 @@ def plot_effects(eff: pd.DataFrame, th: dict, title: str, top=20):
     cb.ax.tick_params(colors=th["text"], labelsize=7)
     ax.set_title(title, fontsize=10, loc="left", color=th["text"])
     fig.subplots_adjust(left=0.25, right=0.95, bottom=0.2, top=0.9)
+    return fig
+
+
+def plot_agreement(summary: pd.DataFrame, kappa: pd.DataFrame, chance: float, th: dict):
+    """Balanced accuracy per classifier (left) and pairwise prediction agreement (right)."""
+    fig = _fig(10, 3.8, th)
+    ax = fig.add_subplot(1, 2, 1)
+    _style(ax, th)
+    cols = [PALETTE[i % len(PALETTE)] for i in range(len(summary))]
+    ax.bar(range(len(summary)), summary["bal_acc"], color=cols, alpha=0.9)
+    for i, v in enumerate(summary["bal_acc"]):
+        ax.text(i, v + 0.015, f"{v:.2f}", ha="center", fontsize=8, color=th["text"])
+    ax.axhline(chance, color=th["muted"], ls="--", lw=1)
+    ax.set_xticks(range(len(summary)))
+    ax.set_xticklabels(summary["classifier"], rotation=20, ha="right", fontsize=8)
+    ax.set_ylim(0, 1.08)
+    ax.set_ylabel("leave-one-out balanced accuracy")
+    ax.set_title("Same features, four classifiers", fontsize=10, loc="left", color=th["text"])
+    ax2 = fig.add_subplot(1, 2, 2)
+    ax2.set_facecolor(th["ax_bg"])
+    K = kappa.to_numpy(dtype=float)
+    im = ax2.imshow(K, cmap="viridis", vmin=-0.2, vmax=1.0)
+    n = len(kappa)
+    ax2.set_xticks(range(n)); ax2.set_yticks(range(n))
+    ax2.set_xticklabels(kappa.columns, rotation=30, ha="right", fontsize=7, color=th["text"])
+    ax2.set_yticklabels(kappa.index, fontsize=7, color=th["text"])
+    for i in range(n):
+        for j in range(n):
+            if np.isfinite(K[i, j]):
+                ax2.text(j, i, f"{K[i, j]:.2f}", ha="center", va="center", fontsize=8,
+                         color="white" if K[i, j] < 0.6 else "black")
+    for s in ax2.spines.values():
+        s.set_color(th["spine"])
+    cb = fig.colorbar(im, ax=ax2, fraction=0.046, pad=0.03)
+    cb.set_label("Cohen's kappa between predictions", color=th["text"], fontsize=8)
+    cb.ax.tick_params(colors=th["text"], labelsize=7)
+    ax2.set_title("Prediction agreement", fontsize=10, loc="left", color=th["text"])
+    fig.subplots_adjust(left=0.08, right=0.97, bottom=0.27, top=0.88, wspace=0.55)
     return fig
 
 

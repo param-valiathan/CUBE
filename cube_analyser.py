@@ -11983,7 +11983,8 @@ class GroupPredictorPanel(ctk.CTkFrame):
     get_groups_fn()  → {group_name: {"labels": [int], "color": str}}
     """
 
-    _ALGO_OPTS = ["Elastic Net Logistic Reg.", "SVM (linear)"]
+    _ALGO_OPTS = ["Elastic Net Logistic Reg.", "SVM (linear)",
+                  "Shrinkage LDA", "PLS-DA"]
     EXHAUSTIVE_COMBO_LIMIT = 15_000
 
     def __init__(self, parent, get_animals_fn, get_groups_fn=None, **kw):
@@ -12143,6 +12144,11 @@ class GroupPredictorPanel(ctk.CTkFrame):
         self._groupstats_var = tk.BooleanVar(master=self, value=True)
         ctk.CTkCheckBox(tg_f, text="Group-level stats (omnibus, per-cluster,\nsequence features)",
                         variable=self._groupstats_var,
+                        text_color=T()["subtext"],
+                        font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=2)
+        self._agree_var = tk.BooleanVar(master=self, value=True)
+        ctk.CTkCheckBox(tg_f, text="Model agreement (all 4 classifiers)",
+                        variable=self._agree_var,
                         text_color=T()["subtext"],
                         font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=2)
         self._clr_var = tk.BooleanVar(master=self, value=False)
@@ -12984,6 +12990,14 @@ class GroupPredictorPanel(ctk.CTkFrame):
                         l1_ratios=l1r, cv=inner_cv, max_iter=5000, tol=1e-3,
                         class_weight="balanced", random_state=42)
                 steps.append(clf)
+            elif "LDA" in algo:
+                # Ledoit-Wolf shrinkage LDA, uniform priors: stable at small n,
+                # no hyperparameter search, so identical in greedy and full mode.
+                from group_contrasts import BalancedShrinkageLDA
+                steps.append(BalancedShrinkageLDA())
+            elif "PLS" in algo:
+                from group_contrasts import PLSDAClassifier
+                steps.append(PLSDAClassifier(n_components=2))
             else:   # SVM
                 from sklearn.svm import SVC
                 if greedy_mode:
@@ -13042,6 +13056,8 @@ class GroupPredictorPanel(ctk.CTkFrame):
         fold_splits = list(cv.split(X))   # fold fi: test_idx = [fi]
         n_folds = len(fold_splits)
         _clf_name = pipeline.steps[-1][0]  # e.g. "logisticregression", "svc"
+        if getattr(pipeline.steps[-1][1], "_no_sample_weight", False):
+            sample_weight = None           # LDA / PLS-DA fits take no weights
 
         # ── LOO pass: actual predictions (parallel across folds) ──────────────
         # Send a regex-compatible message so _run_worker's progress bar advances.
@@ -15035,6 +15051,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
                 "k": None, "algo": None, "n_perm": None,
                 "pairwise": bool(self._pairwise_var.get()),
                 "groupstats": bool(self._groupstats_var.get()),
+                "agreement": bool(self._agree_var.get()),
                 "clr": bool(self._clr_var.get() and src == "clusters"),
             }
         self._extras = None
@@ -15813,7 +15830,9 @@ class GroupPredictorPanel(ctk.CTkFrame):
                     cm = confusion_matrix(y_loo, pred_labels)
                     p2 = _clone(pipeline)
                     _p2_fit_kw = ({f"{p2.steps[-1][0]}__sample_weight": _sw}
-                                  if _sw is not None else {})
+                                  if _sw is not None
+                                  and not getattr(p2.steps[-1][1], "_no_sample_weight", False)
+                                  else {})
                     p2.fit(X_loo, y_loo, **_p2_fit_kw)
                     importances, coef_matrix = \
                         self._extract_importances(p2, X_loo.shape[1])
@@ -15855,7 +15874,9 @@ class GroupPredictorPanel(ctk.CTkFrame):
                     # Final fit on all data for importances / coef_matrix
                     p2 = _clone(pipeline)
                     _p2_fit_kw = ({f"{p2.steps[-1][0]}__sample_weight": _sw}
-                                  if _sw is not None else {})
+                                  if _sw is not None
+                                  and not getattr(p2.steps[-1][1], "_no_sample_weight", False)
+                                  else {})
                     p2.fit(X, y_enc, **_p2_fit_kw)
                     importances, coef_matrix = self._extract_importances(p2, X.shape[1])
 
@@ -17839,6 +17860,7 @@ class GroupPredictorPanel(ctk.CTkFrame):
 
     def export_csv_data(self, out_dir: pathlib.Path) -> int:
         """Write all predictor result CSVs to out_dir. Returns number of files written."""
+        self._wait_for_extras()
         valid = [r for r in self._results
                  if not r.get("error") and r.get("acc") is not None]
         if not valid:
@@ -17986,6 +18008,12 @@ class GroupPredictorPanel(ctk.CTkFrame):
         except Exception as exc:
             print(f"[Group Predictor] contrast export failed: {exc}")
 
+        # 7. Run configuration + warnings, so every saved result is reproducible
+        try:
+            n += self._write_run_config(out_dir)
+        except Exception as exc:
+            print(f"[Group Predictor] run-config export failed: {exc}")
+
         return n
 
     def _export_csv(self):
@@ -18021,7 +18049,8 @@ class GroupPredictorPanel(ctk.CTkFrame):
     def _start_extras(self, results):
         """Launch the pairwise-contrast + group-stats thread after the main models."""
         ctx = self._extras_ctx
-        if not ctx or not (ctx["pairwise"] or ctx["groupstats"] or ctx["target"]):
+        if not ctx or not (ctx["pairwise"] or ctx["groupstats"] or ctx["target"]
+                        or ctx["agreement"]):
             return
         self._extras_running = True
         self._extras = None
@@ -18138,6 +18167,38 @@ class GroupPredictorPanel(ctk.CTkFrame):
                 rows += prow
             out["contrasts"] = pd.DataFrame(rows)
 
+            # ── model agreement: same features, all four classifiers (LOO only) ─
+            if ctx["agreement"]:
+                cand = [r for r in valid if r["name"] in ("Frequency", "Total Duration")]
+                best = max(cand, key=lambda r: r.get("bal_acc", 0)) if cand else None
+                X = ctx["Xf"] if (best and best["name"] == "Frequency") else ctx["Xd"]
+                lab = np.array([a["exp_group"] for a in ctx["animals"]], dtype=object)
+                classes, y = np.unique(lab, return_inverse=True)
+                set_predictor_cv_subjects(subj)
+                preds, arows = {}, []
+                from sklearn.metrics import balanced_accuracy_score
+                for algo in self._ALGO_OPTS:
+                    nmin = int(np.bincount(y).min())
+                    pipe = self._make_pipeline(nmin, len(y), X.shape[1], "freq_dur",
+                                               k=ctx["k"], algo=algo, greedy_mode=True)
+                    _, _, _, pl, pb, bal = self._run_loo(pipe, X, y, 0, None)
+                    preds[algo] = pl
+                    row = {"classifier": algo, "bal_acc": float(bal),
+                           "acc": float((pl == y).mean())}
+                    if len(classes) == 2 and np.asarray(pb).shape[1] == 2:
+                        row["auc"] = gc.auc_boot_ci(y, np.asarray(pb)[:, 1], n_boot=300)[0]
+                    arows.append(row)
+                out["agreement"] = pd.DataFrame(arows)
+                out["agreement_kappa"] = gc.pairwise_kappa(preds)
+                out["agreement_chance"] = 1.0 / len(classes)
+                pdf = pd.DataFrame({"animal": [a["name"] for a in ctx["animals"]],
+                                    "true_group": lab})
+                for algo, pl in preds.items():
+                    pdf[f"pred_{algo}"] = classes[pl]
+                pdf["n_correct"] = sum((pl == y).astype(int) for pl in preds.values())
+                out["agreement_predictions"] = pdf
+                out["agreement_features"] = best["name"] if best else "Total Duration"
+
             # ── group-level stats ─────────────────────────────────────────────
             if ctx["groupstats"]:
                 Xraw = ctx["Xd_raw"]
@@ -18190,6 +18251,13 @@ class GroupPredictorPanel(ctk.CTkFrame):
         if c is not None and len(c):
             add("contrast_summary", lambda: gc.plot_contrast_summary(c, th),
                 [("contrast_summary.csv", c)])
+        ag = ex.get("agreement")
+        if ag is not None and len(ag):
+            add("model_agreement",
+                lambda: gc.plot_agreement(ag, ex["agreement_kappa"], ex["agreement_chance"], th),
+                [("model_agreement.csv", ag),
+                 ("model_agreement_kappa.csv", ex["agreement_kappa"].reset_index()),
+                 ("model_agreement_predictions.csv", ex["agreement_predictions"])])
         om = ex.get("omnibus")
         if om:
             add("omnibus_usage_tests",
@@ -18241,6 +18309,54 @@ class GroupPredictorPanel(ctk.CTkFrame):
                          justify="left", wraplength=760).pack(anchor="w", padx=12, pady=(0, 4))
         for _base, fig, _dfs in self._extras_figures():
             embed(fig)
+
+    def _wait_for_extras(self, timeout: float = 900.0):
+        """Block (pumping the Tk loop) until the background contrast analyses finish,
+        so Save/Export never writes an incomplete set of results."""
+        import time as _t
+        t0 = _t.time()
+        while self._extras_running and _t.time() - t0 < timeout:
+            try:
+                self.update()
+            except Exception:
+                break
+            _t.sleep(0.05)
+
+    def _write_run_config(self, out_dir: pathlib.Path) -> int:
+        """run_config.json: every setting and caveat behind the saved results."""
+        import json
+        import datetime
+        ctx = self._extras_ctx or {}
+        ex = self._extras or {}
+        orig = ctx.get("orig") or []
+        cfg = {
+            "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "target_group": ctx.get("target"),
+            "feature_source": ctx.get("src"),
+            "algorithm_main_models": ctx.get("algo"),
+            "max_contributors": ctx.get("k"),
+            "permutations": ctx.get("n_perm"),
+            "clr_transform": ctx.get("clr"),
+            "pairwise_contrasts": ctx.get("pairwise"),
+            "group_level_stats": ctx.get("groupstats"),
+            "model_agreement": ctx.get("agreement"),
+            "predict_by": self._factor_var.get(),
+            "n_animals": len(orig),
+            "animals_per_group": {g: int(sum(1 for o in orig if o == g))
+                                  for g in sorted(set(orig))},
+            "repeated_animal_ids": bool(ctx.get("subjects")
+                                        and len([s for s in ctx["subjects"] if s])
+                                        != len({s for s in ctx["subjects"] if s})),
+            "contrast_pairs": [list(p) for p in ex.get("pairs", [])],
+            "pairwise_feature_set": ex.get("pairwise_metric"),
+            "agreement_feature_set": ex.get("agreement_features"),
+            "warnings": ex.get("warnings", []),
+            "contrast_analysis_error": ex.get("error"),
+            "contrast_analyses_complete": bool(ex) and not self._extras_running,
+        }
+        (out_dir / "run_config.json").write_text(json.dumps(cfg, indent=2, default=str),
+                                                 encoding="utf-8")
+        return 1
 
     def export_extras(self, out_dir: pathlib.Path) -> int:
         """Save every contrast figure (PNG, current theme) together with its CSV(s)."""
