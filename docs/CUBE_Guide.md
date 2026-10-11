@@ -1240,7 +1240,7 @@ Animals need a non-blank Label 3. By default every animal with data at two or mo
 | Mode | What it shows |
 |---|---|
 | Top-N Bar | N most frequent clusters ranked by group mean, with significance brackets |
-| Volcano | Effect size versus significance for all clusters |
+| Volcano | Effect size versus significance for all clusters; with behaviour groups, clusters are coloured by group with a legend and a labelled ring at each group's mean |
 | Heatmap | Cluster × animal usage (Ward-ordered) |
 | Elbow/Silhouette | Within-cluster sum of squares and silhouette for reclustering at different k |
 | Cluster Hierarchy | Pose-space dendrogram of the primary clustering |
@@ -1293,6 +1293,10 @@ Most neuroscience cohorts have 5 to 12 animals per group. At that size a rank te
 | Grp Transitions volcano (Unbiased) | A dotted line marks q = 0.10; exported pairs include Hedges' g with CI, number of animals expressing the transition and tier | `grp_transitions_stats.csv` |
 
 All figures follow the dark or light theme and are saved together with their CSV by the tab's export and by **Save All Results**.
+
+**User-defined groups of clusters.** Everything above also applies to behaviour groups you define in the Group Editor, not only to raw clusters. In **Combined Analysis** the tests run per behaviour group and metric (frequency, total duration, latency, mean bout) with the same options, and **Export Combined** writes `combined_effects_*` (effect size with 95 % CI per group, metric and group pair), `combined_omnibus_*` (Jensen-Shannon and PERMANOVA on overall behaviour-group usage; independent designs) and `stats_policy.json` next to the summary and post-hoc tables. In **Unbiased Analytics** the Top-N and heatmap figures show the behaviour-group panels with the same marks, and Export / Save All writes the group statistics into a `behaviour_groups/` subfolder. The **Effect Sizes** and **Group Omnibus** views and the cluster-level `stats_effects_*` / `stats_omnibus_*` files remain per cluster. In the **Group Predictor**, behaviour groups used as features (Behavior groups or Mix) get the same target-group contrasts, effect sizes and omnibus tests.
+
+**Volcano plots with behaviour groups.** The volcano plot colours each cluster by its behaviour group and lists every group in the legend with its cluster count. A ring with the group name marks each group's mean position, so a group's overall pattern can be read at a glance. Top-N clusters keep their group colour and are marked with a star and a pink ring; suggestive clusters (0.05 ≤ q < 0.10) have an amber outline and a dotted threshold line. The Grp Transitions volcano colours transitions by the behaviour group of the source cluster, with its own legend.
 
 **Suggested workflow for a small cohort.** (1) Leave the defaults on and run the statistics. (2) Read the **Group Omnibus** result first: if the overall usage pattern differs, per-cluster results are more credible. (3) Look at **Effect Sizes** and the forest plot, not only the stars. (4) Treat `*` as a finding and `+` as a hypothesis to test in the next cohort. (5) Name behaviours and analyse behaviour groups rather than raw clusters when you can: fewer tests means a smaller correction.
 

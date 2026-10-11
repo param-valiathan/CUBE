@@ -3161,11 +3161,12 @@ def build_volcano_figure(stats_df: pd.DataFrame, top_n: int, p_thresh: float,
                 cid_to_group[cid] = (gname, ginfo["color"])
 
     with plt.style.context(t["mpl_style"]):
-        fig, ax = plt.subplots(figsize=(9, 6), facecolor=t["fig_bg"])
+        fig, ax = plt.subplots(figsize=(10.5, 6.6), facecolor=t["fig_bg"])
         ax.set_facecolor(t["ax_bg"])
 
         neg_log_thresh = -np.log10(p_thresh)
         top_ids = set(stats_df.head(top_n)["cluster_id"].tolist())
+        _sugg_on = bool(SP.POLICY["suggestive_tier"]) and _has_q
 
         _ann: list = []   # (x, y, label_text) — filled below, placed after loop
 
@@ -3181,7 +3182,15 @@ def build_volcano_figure(stats_df: pd.DataFrame, top_n: int, p_thresh: float,
             top  = cid in top_ids
             in_grp = cid in cid_to_group
 
-            if top:
+            sugg = (_sugg_on and not sig and row[_sig_col] < SP.SUGGESTIVE_Q)
+            if top and in_grp:
+                # keep the behaviour-group colour; the pink ring marks "top-N"
+                color  = cid_to_group[cid][1]
+                marker = "*"
+                size   = 190
+                zorder = 6
+                edge   = "#FF4081"
+            elif top:
                 color  = "#FF4081"
                 marker = "*"
                 size   = 140
@@ -3205,6 +3214,12 @@ def build_volcano_figure(stats_df: pd.DataFrame, top_n: int, p_thresh: float,
                 size   = 60
                 zorder = 4
                 edge   = "none"
+            elif sugg:
+                color  = "#FFE9A8"
+                marker = "o"
+                size   = 45
+                zorder = 3
+                edge   = "#FFA000"
             else:
                 color  = t["muted"]
                 marker = "o"
@@ -3213,7 +3228,9 @@ def build_volcano_figure(stats_df: pd.DataFrame, top_n: int, p_thresh: float,
                 edge   = "none"
 
             ax.scatter(x, y, c=color, s=size, marker=marker,
-                       alpha=0.85, edgecolors=edge, linewidths=0.6, zorder=zorder)
+                       alpha=0.9, edgecolors=edge,
+                       linewidths=(1.8 if (top and in_grp) else 0.9 if edge != "none" else 0.6),
+                       zorder=zorder)
             if top:   # only label the top-N units; group colours/markers carry group info
                 _lbl = f"C{cid}" if isinstance(cid, (int, np.integer)) else str(cid)
                 _ann.append((float(x), float(y), _lbl))
@@ -3248,6 +3265,33 @@ def build_volcano_figure(stats_df: pd.DataFrame, top_n: int, p_thresh: float,
 
         ax.axhline(neg_log_thresh, color="#888888", lw=1, ls="--", alpha=0.7,
                    label=f"{_sig_word} = {p_thresh}")
+        if _sugg_on and SP.SUGGESTIVE_Q > p_thresh:
+            ax.axhline(-np.log10(SP.SUGGESTIVE_Q), color="#888888", lw=1, ls=":",
+                       alpha=0.7)
+        # Behaviour-group centroids: one ring + name per user-defined group, so
+        # a group's overall position is readable without decoding every diamond.
+        _grp_present: dict = {}
+        if cid_to_group:
+            _cent: dict = {}
+            for _, _r in stats_df.iterrows():
+                try:
+                    _c = int(_r["cluster_id"])
+                except (ValueError, TypeError):
+                    _c = _r["cluster_id"]
+                if _c in cid_to_group:
+                    _cent.setdefault(cid_to_group[_c][0], []).append(
+                        (float(_r[_x_col]), float(_r[_y_col]), cid_to_group[_c][1]))
+            for _gi, (gname, pts) in enumerate(_cent.items()):
+                gx = float(np.mean([q[0] for q in pts]))
+                gy = float(np.mean([q[1] for q in pts]))
+                gcol = pts[0][2]
+                _grp_present[gname] = (gcol, len(pts))
+                ax.scatter(gx, gy, s=420, facecolors="none", edgecolors=gcol,
+                           linewidths=2.2, zorder=7)
+                ax.annotate(gname, (gx, gy), xytext=(0, -17 - 11 * (_gi % 2)),
+                            textcoords="offset points",
+                            ha="center", fontsize=8, fontweight="bold", color=gcol,
+                            zorder=8)
         _x_label = ("Effect Size (ε², Kruskal-Wallis)" if _has_eps
                     else "Effect Size (η²)")
         _y_label = ("−log₁₀(FDR q-value)" if _has_q else "−log₁₀(p-value)")
@@ -3260,18 +3304,29 @@ def build_volcano_figure(stats_df: pd.DataFrame, top_n: int, p_thresh: float,
             if _has_q else f"Volcano Plot — {_unit_word} Significance",
             color=t["tick"], fontweight="bold")
 
+        from matplotlib.lines import Line2D as _L2D
         legend_handles = [
-            mpatches.Patch(color="#FF4081",
-                           label=f"Top {top_n} {'transition pairs' if _is_trans else 'clusters'}"),
+            _L2D([], [], marker="*", ls="", ms=11, mfc="#FF4081", mec="#FF4081",
+                 label=f"Top {top_n} {'transition pairs' if _is_trans else 'clusters'}"
+                       + (" (ring = top-N)" if _grp_present else "")),
             mpatches.Patch(color="#FFC107",
                            label=f"Significant ({_sig_word} < {p_thresh})"),
         ]
+        if _sugg_on and SP.SUGGESTIVE_Q > p_thresh:
+            legend_handles.append(_L2D([], [], marker="o", ls="", ms=7, mfc="#FFE9A8",
+                                       mec="#FFA000",
+                                       label=f"Suggestive ({_sig_word} < {SP.SUGGESTIVE_Q}, dotted line)"))
+        if _grp_present:
+            legend_handles.append(_L2D([], [], ls="", label="Behaviour groups (ring = group mean):"))
+            for gname, (gcol, gn) in _grp_present.items():
+                legend_handles.append(_L2D([], [], marker="D", ls="", ms=7, mfc=gcol,
+                                           mec=gcol, label=f"{gname}  ({gn} clusters)"))
         ax.legend(handles=legend_handles, fontsize=8, framealpha=0.8,
                   facecolor=t["ax_bg"], labelcolor=t["tick"],
                   bbox_to_anchor=(1.02, 1.0), loc="upper left",
                   borderaxespad=0)
         _style_ax(ax, t)
-        fig.tight_layout(rect=[0, 0, 0.80, 1])
+        fig.tight_layout(rect=[0, 0, 0.78, 1])
     return fig
 
 
@@ -5507,7 +5562,14 @@ def build_group_transition_comparison_figure(
                             _ci_int = -1
                         _in_grp = _ci_int in cid_to_grp
 
-                        if _top:
+                        _edge_v = "none" if not _sig else t["spine"]
+                        _lw_v = 0.4
+                        if _top and _in_grp:
+                            # keep the source cluster's behaviour-group colour;
+                            # the pink ring marks the top transitions
+                            _col_v = cid_to_grp[_ci_int][1]; _mk_v = "*"; _sz_v = 150; _zv = 6
+                            _edge_v = "#FF4081"; _lw_v = 1.6
+                        elif _top:
                             _col_v = "#FF4081"; _mk_v = "o"; _sz_v = 80; _zv = 5
                         elif _in_grp and _sig:
                             _col_v = cid_to_grp[_ci_int][1]; _mk_v = "D"
@@ -5522,8 +5584,7 @@ def build_group_transition_comparison_figure(
 
                         ax_c.scatter(dv, _y_v, color=_col_v, marker=_mk_v,
                                      s=_sz_v, zorder=_zv,
-                                     edgecolors="none" if not _sig else t["spine"],
-                                     linewidths=0.4)
+                                     edgecolors=_edge_v, linewidths=_lw_v)
                         if _top:
                             _ann_v.append((dv, _y_v, pname))
 
@@ -5535,6 +5596,20 @@ def build_group_transition_comparison_figure(
                             arrowprops=dict(arrowstyle="-", color=t["muted"],
                                             lw=0.5))
 
+                    if cid_to_grp:
+                        # legend on the volcano itself (colour = source cluster's group)
+                        from matplotlib.lines import Line2D as _L2
+                        _vg: dict = {}
+                        for _gn, _gc in cid_to_grp.values():
+                            _vg[_gn] = _gc
+                        _vh = [_L2([], [], marker="D", ls="", ms=5, mfc=_c, mec=_c, label=_g)
+                               for _g, _c in _vg.items()]
+                        _vh.append(_L2([], [], marker="*", ls="", ms=8, mfc="none",
+                                       mec="#FF4081", label="top transitions"))
+                        ax_c.legend(handles=_vh, fontsize=6, framealpha=0.3,
+                                    facecolor=t["ax_bg"], labelcolor=t["tick"],
+                                    title="colour = source cluster's group",
+                                    title_fontsize=5.5, loc="best")
                     ax_c.set_xlabel(f"ΔT  ({eg_a} − {eg_b})",
                                     color=t["tick"], fontsize=8)
                     ax_c.set_ylabel("−log₁₀(FDR q)", color=t["tick"], fontsize=8)
@@ -6225,6 +6300,40 @@ def write_effect_size_outputs(combined: dict, groups: dict, out_dir, ts: str) ->
             written.append(png)
     except Exception as exc:
         print(f"[Combined] effect-size plot failed: {exc}")
+    # Omnibus test on overall behaviour-group usage (independent designs)
+    try:
+        if not paired and len(groups) >= 2:
+            import group_contrasts as _gc
+            recs = combined["records"]
+            idx = combined["uid_to_idx"]
+            uids, lab = [], []
+            for eg, us in combined["exp_groups"].items():
+                for u in us:
+                    uids.append(u); lab.append(eg)
+            M = np.array([[float(recs[idx[u]]["metrics"].get(bg, {}).get("total_duration") or 0.0)
+                           for bg in groups] for u in uids], float)
+            lab = np.array(lab, dtype=object)
+            if len(M) > len(set(lab)):
+                Z = _gc.clr(M)
+                js = _gc.js_permutation_test(M, lab)
+                pm = _gc.permanova(Z, lab)
+                pcs, ev = _gc.pcoa(Z)
+                pth = out_dir / f"combined_omnibus_{ts}.csv"
+                pd.DataFrame([{"test": "Jensen-Shannon distance (behaviour-group usage)",
+                               "statistic": js[0], "pval": js[1], "R2": np.nan},
+                              {"test": "PERMANOVA (Aitchison/CLR)", "statistic": pm["F"],
+                               "pval": pm["p"], "R2": pm["R2"]}]).to_csv(pth, index=False)
+                written.append(pth)
+                pth = out_dir / f"combined_omnibus_pcoa_{ts}.csv"
+                pd.DataFrame({"animal": [recs[idx[u]]["name"] for u in uids], "group": lab,
+                              "PC1": pcs[:, 0], "PC2": pcs[:, 1]}).to_csv(pth, index=False)
+                written.append(pth)
+                fig = _gc.plot_omnibus(js, pm, pcs, ev, lab, _plot_theme_dict())
+                png = out_dir / f"combined_omnibus_{ts}.png"
+                fig.savefig(png, dpi=200, facecolor=fig.get_facecolor(), bbox_inches="tight")
+                written.append(png)
+    except Exception as exc:
+        print(f"[Combined] omnibus failed: {exc}")
     return written
 
 
@@ -10568,6 +10677,15 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             n += len(write_stats_support_csvs(
                 self._stats_df, getattr(self, "_last_animals", None) or [],
                 getattr(self, "_last_metric", "total_duration"), out_dir))
+
+        try:
+            _ug, _uc = self._get_user_groups(), self._get_user_combined()
+            if _ug and _uc:
+                _gdir = out_dir / "behaviour_groups"
+                _gdir.mkdir(parents=True, exist_ok=True)
+                n += len(write_combined_csvs(_uc, _ug, _gdir, "user_groups"))
+        except Exception as exc:
+            print(f"[Unbiased] behaviour-group statistics export failed: {exc}")
 
         _last_metric_sv = getattr(self, "_last_metric", None)
         try:
