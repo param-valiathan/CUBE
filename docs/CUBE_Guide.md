@@ -54,6 +54,24 @@ flowchart LR
 
 Steps are launched from the main window (`cube.py`) and can be chained. Every stage writes its result to disk and **skips work that already exists**, so an interrupted run resumes where it stopped.
 
+### How CUBE relates to other tools
+
+CUBE builds on B-SOiD and sits alongside other well-validated tools such as VAME and keypoint-MoSeq. These tools were designed for different needs, and none is best in every setting. The points below describe where CUBE's design differs; they are design choices, not measured differences in performance, and CUBE has not been benchmarked head-to-head against these tools.
+
+**Where CUBE's design differs**
+
+1. **A single application from recording to figures.** Video alignment, pose estimation, pre-processing, clustering, annotation and statistics are run from one point-and-click interface, so a complete analysis does not require programming or moving files between separate programs. Every stage of a run is saved to one folder.
+2. **Temporally aware, animal-centred clustering with a reproducibility check.** Features describe posture and movement in animal-centred (egocentric) coordinates together with the order of movements. Clustering is repeated across random seeds and the agreement between runs is reported. When agreement is low, CUBE builds a representative (medoid) or consensus partition, so that the result depends less on a single seed.
+3. **Researcher-guided refinement and correction.** Clusters are named by watching example clips, and can be merged, split or recombined by hand, with a dendrogram view to support the decision. Optional guided labelling lets you supply your own labelled examples, so manual input remains possible at each stage rather than only at the end.
+4. **Built-in analysis and figures.** The analyser produces ethograms, bout statistics, bar charts, transition analyses and group comparisons that highlight clusters whose usage changes between conditions, including behaviours that were not defined in advance. A Group Predictor, based on regularised logistic regression (a generalised linear model) with permutation testing, asks whether behavioural profiles distinguish the groups.
+5. **Arena-aware clustering.** Optionally, clustering can take the position of the animal in traced regions of the arena into account, such as the open arms of an elevated plus maze, so that spatial context can help separate behaviours without letting position replace movement as the classification signal.
+
+**Related tools**
+
+- **B-SOiD** (Hsu and Yttri 2021) introduced the pose-feature, UMAP, HDBSCAN and fast-classifier approach that CUBE follows. CUBE keeps its speed and its lack of GPU training.
+- **VAME** (Luxem et al. 2022) learns a temporal embedding with a neural network. CUBE does not adopt that architecture or its training cost, and uses temporally aware features and smoothing to address a related question by simpler means.
+- **keypoint-MoSeq** (Weinreb et al. 2024) models keypoint uncertainty explicitly. CUBE uses a simpler analogue, in which low per-body-part confidence is used as a feature so that unreliable frames can be separated from behaviour clusters.
+
 ## ⚙️ Installation and launch
 
 CUBE targets Windows with an NVIDIA GPU (pose inference only; clustering runs on CPU).
