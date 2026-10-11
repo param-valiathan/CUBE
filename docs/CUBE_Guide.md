@@ -1,4 +1,4 @@
-<div align="center">
+﻿<div align="center">
 
 <img src="../CUBE_logo.png" alt="CUBE" width="260">
 
@@ -1294,6 +1294,55 @@ Three parallel models, each measuring a different dimension of behaviour:
 **Classifier.** Elastic-net logistic regression (default; L1 selects, L2 handles the correlated clusters typical of this data; multinomial for ≥ 3 groups; `class_weight="balanced"`) or a linear SVM with Platt scaling. A random forest is deliberately not offered: with 5–6 animals per group it memorises the training animals.
 
 **Validation.** Leave-one-out cross-validation (the maximum training set for small cohorts), reported as accuracy, **balanced accuracy** and Cohen's κ. Significance is a **permutation test** (group labels shuffled, full LOO repeated) with the Phipson–Smyth correction `p = (count ≥ observed + 1) / (n_perm + 1)`.
+
+#### Detecting one group among several (target group, contrasts and group statistics)
+
+With three or more groups the default models try to separate *every* group from every other. That is often the wrong question. In a baseline / saline / drug design you usually only need to know whether the **drug** group can be told apart from the other two; telling baseline from saline is irrelevant and only dilutes the result. The **Target Group & Contrasts** section of the sidebar handles this.
+
+**Step by step**
+
+1. Load animals and assign experimental groups in the Combined Analysis tab (Label 1/2/3). Give each animal a Label 3 ID if the same animals appear in several groups (for example baseline and drug recordings of the same mice); CUBE then holds out all recordings of the tested animal together.
+2. Choose **Predict by** (Combined, or one label factor). The **Target group** list fills with the groups for that choice. Hover over the list to refresh it after reloading animals.
+3. Pick the **Target group** (for example `Drug`). Leave `(all groups)` for the classic multiclass question.
+4. Keep **Pairwise contrasts** and **Group-level stats** ticked. Click **Run Models**. The three models finish first; the contrast analyses appear below them a little later and the status line says when they are done.
+5. Click **Export Results** to save every table and every plot (PNG plus CSV).
+
+**What each control does, and what to try**
+
+| Control | Default | What it does | What to try |
+|---|---|---|---|
+| Target group | `(all groups)` | Relabels animals as *target* vs *rest*; features, model fit, cross-validation and permutation test all optimise that single contrast (chance becomes 50 %) | Set it to the treatment group. Run once with `(all groups)` too: if the target run is much stronger, the other groups were diluting the signal |
+| Pairwise contrasts | on | Also tests target vs each other group separately (all pairs when no target is set and there are 3+ groups), with BH-corrected p-values | Leave on. If the pooled "target vs rest" result is strong but one pairwise result is weak, the effect is specific to that comparison |
+| Group-level stats | on | Omnibus usage tests, per-cluster effect sizes, bout-structure features | Leave on; it is cheap and answers *which* behaviours differ |
+| CLR-transform usage | off | Centred log-ratio of cluster usage (cluster source only). Time spent in clusters sums to 100 %, so one cluster rising forces others to fall; CLR removes that artefact | Run once on and once off. If conclusions agree they are robust; if they differ, trust the CLR run when one or two clusters dominate the session |
+| Feature source | Individual clusters | What the models see | Start with clusters. Try Behaviour groups when you have many noisy clusters or want interpretable features; use Mix to combine both |
+| Algorithm | Elastic Net | Classifier | Run Elastic Net first, then the linear SVM as a cross-check. Agreement between the two is reassuring |
+| Max contributors | 5 | Number of clusters/groups the model may use | With fewer than 20 animals keep it at 3-5 (roughly at most one feature per four animals). Use `All` only with 30+ animals |
+| Permutations | 199 | Resolution of the p-value (smallest possible p = 1 / (n + 1)) | 199 while exploring, 999 for a figure you will publish. Pairwise contrasts use the same number |
+
+**Reading the outputs**
+
+- **Classifier contrasts** (`contrast_summary`): one dot per contrast, with the area under the ROC curve (AUC) and its 95 % bootstrap interval. 0.5 is chance. Green means the BH-corrected q is below 0.05. The label also gives balanced accuracy and the *minimum detectable accuracy*, the accuracy a model must exceed to reach p < 0.05 given your sample size; if your observed accuracy is below it, you do not have the power to claim an effect.
+- **Omnibus usage tests** (`omnibus_usage_tests`): the Jensen-Shannon distance and PERMANOVA ask whether the *overall* distribution of time across clusters differs between groups, before looking at any single cluster. The histograms are the permutation null; the red line is your data. The PCA plot shows animals coloured by group (R² is the share of variation explained by group).
+- **Per-cluster effects** (`usage_effects`): a heatmap of Hedges g (effect size, A minus B; about 0.5 is medium and 0.8 is large) for the clusters with the largest effects. `*` marks q < 0.05 and `**` q < 0.01 after FDR correction across clusters. If the same animals appear in more than one group, a mixed model with a random intercept per animal is used; otherwise a Mann-Whitney test. The `test` column in the CSV says which.
+- **Sequence features** (`sequence_features`, `sequence_effects`): bouts per minute, mean bout length, bout-length variability, usage entropy, transition entropy (how predictable the next behaviour is) and the share of the dominant cluster. Use them to see whether the drug changes *how* behaviour is structured, not just how much of each behaviour occurs.
+
+**Common situations**
+
+| Design | Suggested setup |
+|---|---|
+| Baseline vs saline vs drug, different animals per group | Target = Drug, defaults |
+| Same animals recorded at baseline and after drug (repeated measures) | Give every recording a Label 3 animal ID. Target = Drug. Cross-validation holds out all recordings of the tested animal and the per-cluster tests use the mixed model |
+| Three or more doses | No target; read the pairwise table, or set the highest dose as target |
+| Sex or genotype as well as treatment | Set *Predict by* to one factor at a time, or Combined to treat each combination as a group |
+
+**Pitfalls**
+
+- **Small groups.** With fewer than six animals in a group the page shows a warning. Treat results as exploratory and look at effect sizes and confidence intervals, not only p-values.
+- **Pooled "rest" is not neutral.** Target vs rest assumes the other groups behave alike. If baseline and saline differ, use the pairwise table.
+- **Accuracy is only valid for the chosen contrast.** Do not quote a target-mode accuracy as if it separated all groups.
+- **Selection is optimistic until nested.** If you pick the target after seeing the data, or run many configurations, correct for it. Use the nested permutation test for any claim you publish.
+- **No signal?** Try a larger permutation count only after checking the minimum detectable accuracy; try CLR on; try Behaviour groups instead of clusters; check that the animals' recordings are long enough for stable cluster usage.
 
 | Control | Default | Options / effect | Risk |
 |---|---|---|---|

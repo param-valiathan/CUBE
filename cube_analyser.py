@@ -12006,6 +12006,13 @@ class GroupPredictorPanel(ctk.CTkFrame):
         # Multi-factor prediction target
         self._factor_var = tk.StringVar(master=self, value="Combined")
 
+        # Target-group / contrast extras (see group_contrasts.py)
+        self._target_cache: list = []
+        self._target_cache_key = None
+        self._extras: dict | None = None      # result tables + metadata of last run
+        self._extras_ctx: dict | None = None  # inputs captured in _run for the extras
+        self._extras_running = False
+
         # Threading state
         import queue as _queue
         import threading as _threading
@@ -12103,8 +12110,46 @@ class GroupPredictorPanel(ctk.CTkFrame):
                          ("Factor 2 only",         "Factor2"),
                          ("Factor 3 only",         "Factor3")]:
             ctk.CTkRadioButton(pb_f, text=lbl, variable=self._factor_var,
-                               value=val).pack(anchor="w", padx=16, pady=2)
+                               value=val,
+                               command=self._refresh_target_options,
+                               ).pack(anchor="w", padx=16, pady=2)
         ctk.CTkFrame(pb_f, height=6, fg_color="transparent").pack()   # spacer
+
+        # Target group + contrast options
+        tg_f = section("Target Group & Contrasts")
+        ctk.CTkLabel(tg_f,
+                     text="Pick one group to detect (e.g. Drug) and the\n"
+                          "models optimise target vs. everything else.\n"
+                          "Pairwise contrasts then test it against each\n"
+                          "other group separately (FDR-corrected).",
+                     text_color=T()["muted"],
+                     font=ctk.CTkFont(size=10),
+                     justify="left").pack(anchor="w", padx=12, pady=(2, 4))
+        self._ALL_GROUPS = "(all groups)"
+        self._target_var = ctk.StringVar(master=self, value=self._ALL_GROUPS)
+        self._target_menu = ctk.CTkOptionMenu(
+            tg_f, variable=self._target_var, values=[self._ALL_GROUPS],
+            width=220)
+        self._target_menu.pack(padx=12, pady=(0, 4))
+        # Groups depend on the loaded animals: refresh when the pointer reaches
+        # the menu (before any click) so the list is never stale.
+        self._target_menu.bind("<Enter>",
+                               lambda e: self._refresh_target_options(), add="+")
+        self._pairwise_var = tk.BooleanVar(master=self, value=True)
+        ctk.CTkCheckBox(tg_f, text="Pairwise contrasts (target vs each group)",
+                        variable=self._pairwise_var,
+                        text_color=T()["subtext"],
+                        font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=2)
+        self._groupstats_var = tk.BooleanVar(master=self, value=True)
+        ctk.CTkCheckBox(tg_f, text="Group-level stats (omnibus, per-cluster,\nsequence features)",
+                        variable=self._groupstats_var,
+                        text_color=T()["subtext"],
+                        font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=2)
+        self._clr_var = tk.BooleanVar(master=self, value=False)
+        ctk.CTkCheckBox(tg_f, text="CLR-transform usage (compositional)",
+                        variable=self._clr_var,
+                        text_color=T()["subtext"],
+                        font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(2, 10))
 
         # Permutation count
         pf = section("Permutation Test")
@@ -12197,6 +12242,26 @@ class GroupPredictorPanel(ctk.CTkFrame):
             wraplength=230, justify="left",
             font=ctk.CTkFont(size=11))
         self._status_lbl.pack(anchor="w", padx=12, pady=4)
+
+    def _refresh_target_options(self):
+        """Fill the Target-group dropdown with the exp_groups of the loaded
+        animals for the chosen 'Predict by' factor (cached until reset())."""
+        factor = self._factor_var.get()
+        key = {"Combined": "all", "Factor1": "label1",
+               "Factor2": "label2", "Factor3": "label3"}.get(factor, "label1")
+        if self._target_cache_key != key:
+            try:
+                animals = self._get_animals(group_by=key) or []
+            except Exception:
+                animals = []
+            self._target_cache = sorted(
+                {str(a["exp_group"]) for a in animals
+                 if a.get("exp_group") and str(a["exp_group"]).strip()})
+            self._target_cache_key = key if animals else None
+        vals = [self._ALL_GROUPS] + list(self._target_cache)
+        self._target_menu.configure(values=vals)
+        if self._target_var.get() not in vals:
+            self._target_var.set(self._ALL_GROUPS)
 
     def _on_source_changed(self):
         src = self._source_var.get()
@@ -14873,6 +14938,24 @@ class GroupPredictorPanel(ctk.CTkFrame):
                          color=T()["error"])
             return
 
+        # Target-group mode: collapse labels to target vs. rest so every model,
+        # feature search and permutation test optimises exactly that contrast.
+        # Work on copies - the shared animal list must stay untouched.
+        _tgt = self._target_var.get()
+        animals = [dict(a, exp_group=str(a["exp_group"]),
+                        exp_group_orig=str(a["exp_group"])) for a in animals]
+        if _tgt != self._ALL_GROUPS:
+            if _tgt not in {a["exp_group_orig"] for a in animals}:
+                self._status(f"Target group '{_tgt}' not found for this 'Predict by' "
+                             "factor - pick it again from the dropdown.",
+                             color=T()["error"])
+                return
+            _rest = f"Rest (not {_tgt})"
+            for a in animals:
+                a["exp_group"] = _tgt if a["exp_group_orig"] == _tgt else _rest
+        else:
+            _tgt = None
+
         # Validate: need ≥2 distinct experimental groups
         exp_groups = sorted({a["exp_group"] for a in animals})
         if len(exp_groups) < 2:
@@ -14935,6 +15018,27 @@ class GroupPredictorPanel(ctk.CTkFrame):
             self._status(f"Feature build error: {exc}", color=T()["error"])
             return
 
+        # Keep raw usage for the group-level stats; optionally CLR the model inputs
+        # (cluster usage is compositional: fractions sum to one).
+        from group_contrasts import clr as _clr
+        _Xd_raw, _Xf_raw = Xd.copy(), Xf.copy()
+        if self._clr_var.get() and src == "clusters":
+            Xf, Xd = _clr(Xf), _clr(Xd)
+        self._extras_ctx = None
+        if Xf.shape[0] == Xd.shape[0] == len(animals):
+            self._extras_ctx = {
+                "animals": animals, "target": _tgt, "src": src,
+                "Xf": Xf, "Xd": Xd, "ff": list(ff), "fd": list(fd),
+                "Xd_raw": _Xd_raw, "Xf_raw": _Xf_raw,
+                "orig": [a["exp_group_orig"] for a in animals],
+                "subjects": [a.get("subject_id") or "" for a in animals],
+                "k": None, "algo": None, "n_perm": None,
+                "pairwise": bool(self._pairwise_var.get()),
+                "groupstats": bool(self._groupstats_var.get()),
+                "clr": bool(self._clr_var.get() and src == "clusters"),
+            }
+        self._extras = None
+
         # Max-contributors cap — passed into the pipeline (SelectKBest inside LOO)
         max_contrib_str = self._max_contrib_var.get()
         _k = int(max_contrib_str) if max_contrib_str != "All" else None
@@ -14987,6 +15091,9 @@ class GroupPredictorPanel(ctk.CTkFrame):
         # ctk.StringVar.get() calls into the Tcl interpreter; doing that from
         # a background thread on Windows is unsafe and can terminate the process.
         _algo = self._algo_var.get()
+        if self._extras_ctx is not None:
+            self._extras_ctx.update(k=_k, algo=_algo, n_perm=n_perm,
+                                    min_class_count=min_class_count)
 
         # Disable Run + nested-test button, enable Cancel, clear any previous cancel signal
         self._cancel_event.clear()
@@ -15997,6 +16104,8 @@ class GroupPredictorPanel(ctk.CTkFrame):
                 except Exception:
                     pass
             self._perm_toggle_frame.pack_forget()
+        if len(results) >= 3:
+            self._start_extras(results)   # sets _extras_running before the first draw
         self._select_model(0)
         n_done = len([r for r in results if not r.get("error")])
         n_total_models = 3
@@ -17711,6 +17820,8 @@ class GroupPredictorPanel(ctk.CTkFrame):
                            labelcolor=T()["text"], ncol=min(4, len(legend_els)))
                 _embed(fig2, pady=(2, 4))
 
+            self._draw_extras(_embed)
+
         except Exception as exc:
             # Append error rather than replacing the whole view — earlier
             # figures that already rendered should remain visible.
@@ -17766,6 +17877,11 @@ class GroupPredictorPanel(ctk.CTkFrame):
                 "n_animals":         n_animals,
                 "n_classes":         n_classes,
                 "chance_level":      round(1.0 / n_classes, 4),
+                "target_group":      (self._extras_ctx or {}).get("target") or "",
+                "min_detectable_bal_acc": (
+                    round(float(np.quantile(res["perm_scores"], 0.95)), 4)
+                    if res.get("perm_scores") is not None
+                    and len(res["perm_scores"]) else None),
             })
         pd.DataFrame(summary_rows).to_csv(out_dir / "model_summary.csv", index=False)
         n += 1
@@ -17864,6 +17980,12 @@ class GroupPredictorPanel(ctk.CTkFrame):
             pd.DataFrame(perm_rows).to_csv(out_dir / "perm_null_scores.csv", index=False)
             n += 1
 
+        # 6. Contrast analyses (figure PNG + CSV pairs)
+        try:
+            n += self.export_extras(out_dir)
+        except Exception as exc:
+            print(f"[Group Predictor] contrast export failed: {exc}")
+
         return n
 
     def _export_csv(self):
@@ -17894,9 +18016,250 @@ class GroupPredictorPanel(ctk.CTkFrame):
         except Exception as exc:
             messagebox.showerror("Export Error", str(exc), parent=self)
 
+    # ── Target-group / pairwise contrasts + group-level stats ─────────────────
+
+    def _start_extras(self, results):
+        """Launch the pairwise-contrast + group-stats thread after the main models."""
+        ctx = self._extras_ctx
+        if not ctx or not (ctx["pairwise"] or ctx["groupstats"] or ctx["target"]):
+            return
+        self._extras_running = True
+        self._extras = None
+        self._extras_out = None
+        if self._nested_btn:
+            self._nested_btn.configure(state="disabled")
+        self._status("Running contrast analyses…")
+        import threading
+        threading.Thread(target=self._extras_worker, args=(ctx, list(results)),
+                         daemon=True).start()
+        self.after(400, self._poll_extras)
+
+    def _poll_extras(self):
+        if getattr(self, "_extras_out", None) is None:
+            self.after(400, self._poll_extras)
+            return
+        self._extras = self._extras_out
+        self._extras_running = False
+        has_nested = any(r.get("_nested_params") is not None
+                         for r in self._results if not r.get("error"))
+        if self._nested_btn:
+            self._nested_btn.configure(state="normal" if has_nested else "disabled")
+        err = self._extras.get("error")
+        self._status(f"Contrast analyses failed: {err}" if err
+                     else "Done (incl. contrast analyses).",
+                     color=T()["error"] if err else None)
+        if self._results:
+            self._select_model(self._selected_model)
+
+    def _extras_worker(self, ctx, results):
+        """Background: classifier contrasts (AUC+CI), omnibus tests, per-cluster
+        effects and sequence features.  Never touches Tk."""
+        import itertools
+        import group_contrasts as gc
+        out = {"error": None, "warnings": [], "target": ctx["target"]}
+        try:
+            orig = np.array(ctx["orig"], dtype=object)
+            subj = ctx["subjects"]
+            tgt = ctx["target"]
+            groups = sorted(set(orig))
+            if tgt:
+                pairs = [(tgt, g) for g in groups if g != tgt]
+            elif len(groups) > 2:
+                pairs = list(itertools.combinations(groups, 2))
+            else:
+                pairs = [(groups[0], groups[1])]
+            out["pairs"] = pairs
+            counts = {g: int((orig == g).sum()) for g in groups}
+            for g, c in counts.items():
+                if c < 6:
+                    out["warnings"].append(
+                        f"Only {c} animal(s) in '{g}' - contrast p-values and "
+                        "effect sizes are low-power; treat as exploratory.")
+            if gc.has_repeats(subj):
+                out["warnings"].append(
+                    "Animal IDs repeat across groups: CV holds out all recordings of the "
+                    "tested animal; per-cluster tests use a random-intercept mixed model.")
+            if tgt:
+                out["warnings"].append(
+                    f"Target mode: '{tgt}' vs the pooled rest assumes the other groups "
+                    "behave alike - check the pairwise contrasts.")
+
+            # ── classifier contrasts ──────────────────────────────────────────
+            rows = []
+            valid = [r for r in results if not r.get("error") and r.get("acc") is not None]
+            for r in valid:
+                classes = list(r["le"].classes_)
+                pb = r.get("pred_proba")
+                if len(classes) != 2 or pb is None or np.asarray(pb).shape[1] != 2:
+                    continue
+                pos = classes.index(tgt) if tgt in classes else 1
+                y01 = (np.asarray(r["y_enc"]) == pos).astype(int)
+                auc, lo, hi = gc.auc_boot_ci(y01, np.asarray(pb)[:, pos])
+                rows.append({
+                    "contrast": f"{r['name']}: {classes[pos]} vs {classes[1 - pos]}",
+                    "kind": "main model", "bal_acc": float(r.get("bal_acc", r["acc"])),
+                    "auc": auc, "auc_lo": lo, "auc_hi": hi,
+                    "pval": float(r["pval"]) if r["pval"] is not None else np.nan,
+                    "qval_bh": np.nan, "n": int(len(y01)),
+                    "min_detectable_bal_acc": gc.min_detectable_acc(r.get("perm_scores"))})
+            if ctx["pairwise"] and (tgt or len(groups) > 2):
+                cand = [r for r in valid if r["name"] in ("Frequency", "Total Duration")]
+                best = max(cand, key=lambda r: r.get("bal_acc", 0)) if cand else None
+                X = ctx["Xf"] if (best and best["name"] == "Frequency") else ctx["Xd"]
+                out["pairwise_metric"] = best["name"] if best else "Total Duration"
+                prow = []
+                try:
+                    for a, b in pairs:
+                        idx = np.where((orig == a) | (orig == b))[0]
+                        y01 = (orig[idx] == a).astype(int)
+                        nmin = int(min(y01.sum(), len(y01) - y01.sum()))
+                        if nmin < 3:
+                            out["warnings"].append(
+                                f"Pairwise '{a} vs {b}' skipped (<3 animals in one group).")
+                            continue
+                        set_predictor_cv_subjects([subj[i] for i in idx])
+                        pipe = self._make_pipeline(
+                            nmin, len(idx), X.shape[1], "freq_dur",
+                            k=ctx["k"], algo=ctx["algo"])
+                        _, p, perm, _, pb, bal = self._run_loo(
+                            pipe, X[idx], y01, ctx["n_perm"] or 199, None)
+                        auc, lo, hi = gc.auc_boot_ci(y01, np.asarray(pb)[:, 1])
+                        prow.append({
+                            "contrast": f"{a} vs {b}", "kind": "pairwise",
+                            "bal_acc": float(bal), "auc": auc, "auc_lo": lo, "auc_hi": hi,
+                            "pval": float(p), "qval_bh": np.nan, "n": int(len(idx)),
+                            "min_detectable_bal_acc": gc.min_detectable_acc(perm)})
+                finally:
+                    set_predictor_cv_subjects(subj)
+                if prow:
+                    q = gc.bh([r["pval"] for r in prow])
+                    for r, qv in zip(prow, q):
+                        r["qval_bh"] = float(qv)
+                rows += prow
+            out["contrasts"] = pd.DataFrame(rows)
+
+            # ── group-level stats ─────────────────────────────────────────────
+            if ctx["groupstats"]:
+                Xraw = ctx["Xd_raw"]
+                if Xraw.shape[1] >= 2 and len(orig) > len(groups):
+                    Z = gc.clr(Xraw)
+                    js = gc.js_permutation_test(Xraw, orig)
+                    pm = gc.permanova(Z, orig)
+                    pcs, ev = gc.pcoa(Z)
+                    out["omnibus"] = {"js": js, "perm": pm, "pcs": pcs, "ev": ev}
+                    out["omnibus_table"] = pd.DataFrame([
+                        {"test": "Jensen-Shannon usage distance", "statistic": js[0],
+                         "pval": js[1], "R2": np.nan},
+                        {"test": "PERMANOVA (Aitchison)", "statistic": pm["F"],
+                         "pval": pm["p"], "R2": pm["R2"]}])
+                    out["omnibus_pcoa"] = pd.DataFrame({
+                        "animal": [a["name"] for a in ctx["animals"]], "group": orig,
+                        "PC1": pcs[:, 0], "PC2": pcs[:, 1]})
+                    out["omnibus_null"] = pd.DataFrame({"js_null": js[2],
+                                                        "permanova_F_null": pm["null"]})
+                out["effects"] = gc.feature_contrasts(
+                    gc.proportions(ctx["Xd_raw"]), ctx["fd"], orig, pairs, subj)
+                seq = gc.sequence_features(ctx["animals"])
+                out["seq"] = seq
+                sv = seq[gc.SEQ_FEATURES].copy()
+                sv = sv.fillna(sv.median())
+                out["seq_effects"] = gc.feature_contrasts(
+                    sv.to_numpy(), gc.SEQ_FEATURES, seq["group"].to_numpy(dtype=object),
+                    pairs, subj)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            out["error"] = str(exc)
+        self._extras_out = out
+
+    def _extras_figures(self) -> list:
+        """[(basename, Figure, [(csv_name, DataFrame), ...]), ...] in the current theme."""
+        ex = self._extras
+        if not ex or ex.get("error"):
+            return []
+        import group_contrasts as gc
+        th = {k: T()[k] for k in ("fig_bg", "ax_bg", "text", "spine", "muted")}
+        figs = []
+
+        def add(base, builder, dfs):
+            try:
+                figs.append((base, builder(), dfs))
+            except Exception as exc:
+                print(f"[Group Predictor] {base} plot failed: {exc}")
+        c = ex.get("contrasts")
+        if c is not None and len(c):
+            add("contrast_summary", lambda: gc.plot_contrast_summary(c, th),
+                [("contrast_summary.csv", c)])
+        om = ex.get("omnibus")
+        if om:
+            add("omnibus_usage_tests",
+                lambda: gc.plot_omnibus(om["js"], om["perm"], om["pcs"], om["ev"],
+                                        ex["omnibus_pcoa"]["group"].to_numpy(dtype=object), th),
+                [("omnibus_tests.csv", ex["omnibus_table"]),
+                 ("omnibus_pcoa.csv", ex["omnibus_pcoa"]),
+                 ("omnibus_null.csv", ex["omnibus_null"])])
+        e = ex.get("effects")
+        if e is not None and len(e):
+            add("usage_effects", lambda: gc.plot_effects(
+                e, th, "Per-cluster usage effect size (share of time)"),
+                [("usage_effects.csv", e)])
+        s = ex.get("seq")
+        if s is not None and len(s):
+            add("sequence_features", lambda: gc.plot_sequence(s, th),
+                [("sequence_features.csv", s)])
+        se = ex.get("seq_effects")
+        if se is not None and len(se):
+            add("sequence_effects", lambda: gc.plot_effects(
+                se, th, "Sequence-structure effect size", top=len(gc.SEQ_FEATURES)),
+                [("sequence_effects.csv", se)])
+        return figs
+
+    def _draw_extras(self, embed):
+        """Append contrast analyses (or a 'running' note) to the detail area."""
+        def hdr(text):
+            ctk.CTkLabel(self._detail_inner, text=text,
+                         font=ctk.CTkFont(size=13, weight="bold"),
+                         text_color=T()["hdr_text"]).pack(anchor="w", padx=10, pady=(14, 2))
+        if self._extras_running:
+            hdr("Contrast analyses")
+            ctk.CTkLabel(self._detail_inner, text="Running pairwise contrasts and group "
+                         "statistics… this view refreshes when done.",
+                         text_color=T()["muted"], font=ctk.CTkFont(size=11)
+                         ).pack(anchor="w", padx=12)
+            return
+        ex = self._extras
+        if not ex:
+            return
+        hdr("Contrast analyses" + (f" - target: {ex['target']}" if ex.get("target") else ""))
+        if ex.get("error"):
+            ctk.CTkLabel(self._detail_inner, text=f"Failed: {ex['error']}",
+                         text_color=T()["error"]).pack(anchor="w", padx=12)
+            return
+        if ex.get("warnings"):
+            ctk.CTkLabel(self._detail_inner, text="\n".join("• " + w for w in ex["warnings"]),
+                         text_color="#cc9944", font=ctk.CTkFont(size=10),
+                         justify="left", wraplength=760).pack(anchor="w", padx=12, pady=(0, 4))
+        for _base, fig, _dfs in self._extras_figures():
+            embed(fig)
+
+    def export_extras(self, out_dir: pathlib.Path) -> int:
+        """Save every contrast figure (PNG, current theme) together with its CSV(s)."""
+        n = 0
+        for base, fig, dfs in self._extras_figures():
+            for name, df in dfs:
+                df.to_csv(out_dir / name, index=False)
+                n += 1
+            fig.savefig(out_dir / f"{base}.png", dpi=200, facecolor=fig.get_facecolor(),
+                        bbox_inches="tight")
+            n += 1
+        return n
+
     # ── Public reset (called when animals are reloaded) ───────────────────────
 
     def reset(self):
+        self._target_cache_key = None
+        self._extras = None
+        self._extras_ctx = None
         import matplotlib.pyplot as _plt
         for fig in self._open_figs:
             self._close_fig(fig)
