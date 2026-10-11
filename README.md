@@ -13,7 +13,7 @@
 
 </div>
 
-**CUBE v5** (Comprehensive Unsupervised Behavioral Explorer) is an open-source, point-and-click pipeline for unsupervised discovery and quantification of animal behaviour from DeepLabCut pose estimation. It turns raw behavioural video into discrete behaviour clusters and group-level statistics without hand-labelling, in 2D or with multi-camera 3D pose. CUBE builds on the approach introduced by B-SOiD (Hsu & Yttri 2021) and extends it with multi-scale features, cluster validation, temporal smoothing, interactive annotation and a statistics suite.
+**CUBE v5** (Comprehensive Unsupervised Behavioral Explorer) is an open-source, point-and-click pipeline for unsupervised discovery and quantification of animal behaviour from DeepLabCut pose estimation. It turns raw behavioural video into discrete behaviour clusters and group-level statistics without hand-labelling, in 2D or with multi-camera 3D pose. CUBE builds on the approach introduced by B-SOiD (Hsu & Yttri 2021) and adds multi-scale features, cluster validation, temporal smoothing, interactive annotation and a statistics suite.
 
 ```mermaid
 flowchart LR
