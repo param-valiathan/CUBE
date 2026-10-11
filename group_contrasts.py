@@ -443,14 +443,48 @@ def plot_effects(eff: pd.DataFrame, th: dict, title: str, top=20):
     for i in range(g.shape[0]):
         for j in range(g.shape[1]):
             v, qq = g.iat[i, j], q.iat[i, j]
-            star = "**" if qq < 0.01 else "*" if qq < 0.05 else ""
+            star = ("**" if qq < 0.01 else "*" if qq < 0.05
+                    else "+" if (np.isfinite(qq) and qq < 0.10) else "")
             ax.text(j, i, f"{v:.1f}{star}", ha="center", va="center", fontsize=7,
                     color="white" if abs(v) > 0.6 * lim else "black")
     cb = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
     cb.set_label("Hedges g (A - B)", color=th["text"], fontsize=8)
     cb.ax.tick_params(colors=th["text"], labelsize=7)
-    ax.set_title(title, fontsize=10, loc="left", color=th["text"])
+    ax.set_title(title, fontsize=9, loc="left", color=th["text"], wrap=True)
     fig.subplots_adjust(left=0.25, right=0.95, bottom=0.2, top=0.9)
+    return fig
+
+
+def plot_forest(eff: pd.DataFrame, th: dict, title: str, top: int = 15):
+    """Forest plot: effect size with 95% CI per feature, one panel per contrast.
+    Needs columns feature, contrast, hedges_g, g_lo, g_hi, qval_bh.  Filled
+    markers = q<0.05, ringed = suggestive (q<0.10), grey = not significant."""
+    contrasts = list(dict.fromkeys(eff["contrast"]))
+    n = len(contrasts)
+    rows = min(top, int(eff.groupby("contrast").size().max()))
+    fig = _fig(max(5.5, 4.2 * n), max(3.0, 0.32 * rows + 1.8), th)
+    for k, c in enumerate(contrasts):
+        d = eff[eff["contrast"] == c].copy()
+        d = d.reindex(d["hedges_g"].abs().sort_values(ascending=False).index).head(top)
+        d = d.iloc[::-1]
+        ax = fig.add_subplot(1, n, k + 1)
+        _style(ax, th)
+        y = np.arange(len(d))
+        ax.axvline(0, color=th["muted"], lw=1)
+        for yi, (_, r) in zip(y, d.iterrows()):
+            q = r.get("qval_bh", np.nan)
+            sig = np.isfinite(q) and q < 0.05
+            sug = np.isfinite(q) and 0.05 <= q < 0.10
+            col = "#E15759" if sig else "#F28E2B" if sug else "#8a8a8a"
+            ax.plot([r["g_lo"], r["g_hi"]], [yi, yi], color=col, lw=1.6)
+            ax.plot(r["hedges_g"], yi, "o", color=(th["ax_bg"] if sug else col),
+                    mec=col, ms=6, mew=1.6)
+        ax.set_yticks(y)
+        ax.set_yticklabels(d["feature"], fontsize=8)
+        ax.set_xlabel("effect size (95% CI)")
+        ax.set_title(c, fontsize=9, loc="left", color=th["text"])
+    fig.suptitle(title, color=th["text"], fontsize=9, x=0.02, ha="left")
+    fig.subplots_adjust(left=0.12, right=0.98, bottom=0.18, top=0.86, wspace=0.45)
     return fig
 
 

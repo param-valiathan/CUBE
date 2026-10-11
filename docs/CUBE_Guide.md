@@ -1220,10 +1220,10 @@ For every cluster (or behaviour group) the Analyser computes per-animal metrics 
 
 | Design | When | Omnibus | Post-hoc |
 |---|---|---|---|
-| **Independent groups** (default) | Different animals per group | Kruskal–Wallis | Dunn's test (Mann–Whitney U if `scikit-posthocs` is absent) |
-| **Repeated measures** | The same animals measured at several levels of "Group by" (e.g. Baseline / Day 3 / Day 7); pairing by Label 3 | Wilcoxon signed-rank (2 levels) or Friedman (≥ 3) | Pairwise Wilcoxon signed-rank |
+| **Independent groups** (default) | Different animals per group | Kruskal–Wallis | Dunn's test (built in), corrected only among clusters whose omnibus p < 0.05 |
+| **Repeated measures** | The same animals measured at several levels of "Group by" (e.g. Baseline / Day 3 / Day 7); pairing by Label 3 | Paired t-test on log usage (n < 10) or Wilcoxon signed-rank (2 levels); repeated-measures ANOVA on log usage (n < 10) or Friedman (≥ 3); a mixed model when some animals miss a level | Pairwise paired tests (same rule) |
 
-Only animals with a non-blank Label 3 present at **every** level are used (at least 3 matched animals); the status bar reports how many were matched and excluded. A third "mixed design" is not available.
+Animals need a non-blank Label 3. By default every animal with data at two or more levels is used (mixed model); with that option off only animals present at **every** level are used. At least 3 animals are needed, and the status bar reports how many were used. A third "mixed design" (independent groups each followed over time) is not available.
 
 **Statistical pipeline** (`run_cluster_statistics`):
 
@@ -1248,7 +1248,9 @@ Only animals with a non-blank Label 3 present at **every** level are used (at le
 | Recombination | Ward reclustering with a blended behavioural distance |
 | Dist Matrix | Pairwise behavioural distance between animals |
 | Transitions | Empirical cluster-to-cluster transition probabilities |
-| Grp Transitions | Per-pair group comparison of transitions (Welch's t, volcano) |
+| Grp Transitions | Per-pair group comparison of transitions (Mann-Whitney U, volcano with q = 0.05 and 0.10 lines) |
+| Effect Sizes | Hedges' g (or paired dz) per cluster and group pair, with `*`/`**`/`+` marks; forest plot with 95 % CI saved with it |
+| Group Omnibus | Jensen-Shannon and PERMANOVA tests on overall cluster usage, plus a PCA of animals (independent designs) |
 | Cluster Stats | Per-cluster mean bout length, frequency, total time |
 | Cluster Validity | Silhouette diagram and UMAP for the primary clustering (from saved embedding) |
 
@@ -1263,6 +1265,39 @@ HDBSCAN often splits one behaviour into several clusters. Recombination groups c
 | **Guided Merge** | Closest pair by usage similarity that is also close in pose space and clearly better than the next option | Automatically | Not having to guess k; a defensible, reproducible starting point |
 
 *Why a pose-distance cap?* The blended distance sees only how a cluster's usage changes across groups and how it transitions. Two clusters can covary for unrelated reasons (shared arousal, session length). Requiring closeness on **two independent criteria** — usage pattern and underlying pose features — is the same safeguard WGCNA uses when merging modules.
+
+#### Statistics for small cohorts: options, tiers and effect sizes
+
+Most neuroscience cohorts have 5 to 12 animals per group. At that size a rank test followed by a strict correction across 20 to 30 clusters can miss large, real effects. A simulation of CUBE's own pipeline (25 clusters, 3 truly different, 6 animals per group, a 2.5 SD effect) found 41 % of true clusters at omnibus q < 0.05, 9 % for the pooled post-hoc pairs, and none at 4 animals per group. The options below keep false-discovery control (Benjamini-Hochberg is still applied) but stop the correction from being stricter than it needs to be. They are shared by **Unbiased Analytics**, **Combined Analysis** and **Paradigm Results**: the checkboxes sit in *Statistical Settings* (Unbiased, Paradigm) or behind the **Stats options** button (Combined). Change a setting, then **re-run** the analysis. Every export includes `stats_policy.json` recording the options in force.
+
+| Option (default on) | What it does | Implication / when to switch it off |
+|---|---|---|
+| **Show suggestive tier (+, q<0.10) and effect sizes** | Adds a second, clearly labelled tier. `*`, `**`, `***` still mean q < 0.05, 0.01, 0.001. `+` means 0.05 ≤ q < 0.10: a lead to follow up, not a confirmed result. The `tier` column in every CSV says `confirmed`, `suggestive` or `ns` | Report only `confirmed` results as findings. Switch off if you want the classic single threshold |
+| **Post-hoc only where omnibus p<0.05** | Pairwise comparisons (Dunn's test, or paired tests) are corrected only among clusters whose omnibus test p < 0.05 (Fisher-protected testing). Other clusters report q = 1 and `gated_out_by_omnibus = True` in `*_posthoc.csv` | Large gain in power with several groups (6 animals per group: 9 % to 89 % detection in simulation, about 2 % false positives per null cluster). Switch off to correct over every pair of every cluster |
+| **Paired t-test on log usage when n<10** | In repeated designs with fewer than 10 matched animals, pairs are tested with a paired t-test on log(1 + value) instead of Wilcoxon, and 3+ levels use a repeated-measures ANOVA on log(1 + value) instead of Friedman. A Wilcoxon test cannot reach p < 0.05 with 5 or fewer pairs (smallest p = 0.0625) and after FDR correction is usually stuck below 10 | Log usage is close to normal for durations and counts. If your data are heavily skewed with many zeros, compare with the option off; at 8-9 animals the two can behave similarly. Values that can be negative (indices) are not log-transformed |
+| **Repeated measures: use all animals (mixed model)** | Animals with data at two or more levels are all used, with a random intercept per animal (likelihood-ratio test on log usage). Previously only animals present at every level were kept | Use when some animals are missing a session. It only replaces the complete-case test when it adds animals; otherwise the paired test above is used. The status bar reports how many animals were used |
+| **Skip features seen in <3 animals (power)** | Clusters or transitions expressed by fewer than 3 animals are not tested (q reported as 1) so they do not enlarge the correction family | Rare features cannot be significant at small n anyway. Switch off to test everything |
+| **Show small-n note** | One short line when the chosen test cannot reach significance at your n | Informational only |
+
+**Effect sizes with confidence intervals.** A non-significant q at small n does not mean no effect. CUBE now always reports an effect size with a 95 % confidence interval: Hedges' g between independent groups, paired dz for repeated measures, Cohen's d against a reference for one-sample tests. As a rough guide, 0.5 is medium and 0.8 is large. A wide interval that excludes zero but with q > 0.10 marks a promising effect to replicate with more animals.
+
+**New views and files.**
+
+| Where | What | Saved files |
+|---|---|---|
+| Unbiased Analytics, **Effect Sizes** view | Heatmap of effect size per cluster and group pair, marked `*`/`**`/`+` | `stats_effects.png` and `stats_effects.csv`, plus `stats_effects_forest.png` (effect with 95 % CI per cluster) |
+| Unbiased Analytics, **Group Omnibus** view | Jensen-Shannon distance and PERMANOVA (Aitchison/CLR) permutation tests on overall cluster usage, with a PCA of animals. A single overall test before looking at individual clusters (independent designs) | `stats_omnibus.png`, `stats_omnibus.csv`, `stats_omnibus_pcoa.csv` |
+| Unbiased Analytics, stats export | Post-hoc table gains `tier`, `test`, `effect`, `effect_ci_low`, `effect_ci_high`, `n_pairs`, `gated_out_by_omnibus` | `stats_posthoc.csv`, `stats.csv` (columns `tier`, `test_used`) |
+| Combined Analysis export | Effect size per behaviour group, metric and group pair; summary and post-hoc tables gain `Tier`, `Test`, effect columns | `combined_effects_*.csv/.png`, `combined_summary_*.csv`, `combined_posthoc_*.csv` |
+| Paradigm Results | Index bar charts show `+` for suggestive results and one-sample markers `(†)`; each `*_stats` table gains the test used, tier and effect size with CI; one-sample results are saved with effect-size CIs | `*_stats.csv`, `*_one_sample.csv` |
+| Grp Transitions volcano (Unbiased) | A dotted line marks q = 0.10; exported pairs include Hedges' g with CI, number of animals expressing the transition and tier | `grp_transitions_stats.csv` |
+
+All figures follow the dark or light theme and are saved together with their CSV by the tab's export and by **Save All Results**.
+
+**Suggested workflow for a small cohort.** (1) Leave the defaults on and run the statistics. (2) Read the **Group Omnibus** result first: if the overall usage pattern differs, per-cluster results are more credible. (3) Look at **Effect Sizes** and the forest plot, not only the stars. (4) Treat `*` as a finding and `+` as a hypothesis to test in the next cohort. (5) Name behaviours and analyse behaviour groups rather than raw clusters when you can: fewer tests means a smaller correction.
+
+> [!NOTE]
+> Pseudo-replication is still your responsibility: if the same animal contributes several sessions to one group, give it a Label 3 / Animal ID so sessions are averaged and the design is recognised as repeated measures.
 
 ### 🔭 Behavioral Explorer
 
@@ -1402,8 +1437,8 @@ Phase is read from **Label 2** (`Acquisition`, `Test`, `Extinction`, `Recall`, `
 
 #### Statistical conventions in Paradigm Results
 
-- **Between-group** comparisons reuse the same Kruskal–Wallis / Dunn / BH-FDR machinery as Unbiased Analytics, adapted to a single scalar index per animal; shown as brackets with `*`/`**`/`***`.
-- **One-sample tests against a fixed reference** (chance for a discrimination index, zero for CPP delta) use a one-sample Wilcoxon signed-rank or paired t-test (`run_one_sample_statistics`), independently BH-corrected, and are shown with **dagger** marks (†/††/†††). Daggers and stars are deliberately different symbols: "differs from chance" and "differs between groups" are different questions.
+- **Between-group** comparisons reuse the same Kruskal–Wallis / Dunn / BH-FDR machinery as Unbiased Analytics, adapted to a single scalar index per animal; shown as brackets with `*`/`**`/`***`, and `+` for suggestive results (see *Statistics for small cohorts*). The `*_stats` table also records the test used, the tier and the effect size with a 95 % confidence interval.
+- **One-sample tests against a fixed reference** (chance for a discrimination index, zero for CPP delta) use a one-sample Wilcoxon signed-rank (a t-test when n < 10 and the small-n option is on) or t-test (`run_one_sample_statistics`), independently BH-corrected, with Cohen's d and its confidence interval saved in `*_one_sample.csv`, and are shown with **dagger** marks (†/††/†††, `(†)` for suggestive). Daggers and stars are deliberately different symbols: "differs from chance" and "differs between groups" are different questions.
 - **Paired designs** (pre/post) use the Experimental Design and Group-by controls with Label 3 pairing; there is no assay-specific "longitudinal" toggle.
 
 **Cross-paradigm limitations.** One paradigm per project (the arena configuration is project-wide); region role tags live in the project configuration, not in per-run outputs, so a mistagged hub or role cannot be fixed after the fact in the Analyser; two-phase three-chamber designs need per-video role overrides re-tagged for phase 2.

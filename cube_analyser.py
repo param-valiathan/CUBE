@@ -1305,6 +1305,65 @@ def resolve_design(choice: str, animals: list) -> tuple:
     return "independent", ""
 
 
+import stats_policy as SP   # shared small-n-friendly statistical policy (tiers, gating, paired tests)
+
+
+def _sig_legend(q_name: str = "FDR q") -> str:
+    """Legend text for significance marks, honouring the suggestive-tier option."""
+    return SP.legend_text(q_name)
+
+
+_STATS_OPTION_HINT = ("Shared by Unbiased Analytics, Combined Analysis and Paradigm "
+                      "Results. Re-run the analysis to apply a change.")
+
+
+def add_stats_option_checkboxes(parent, with_hint: bool = True):
+    """Checkboxes bound to the shared stats policy (stats_policy.POLICY).  Every
+    instance stays in sync, so the same options give the same calls on every tab."""
+    import tkinter as _tk
+    vars_ = {}
+
+    def _sync():
+        for k, v in vars_.items():
+            try:
+                if bool(v.get()) != bool(SP.POLICY[k]):
+                    v.set(bool(SP.POLICY[k]))
+            except Exception:
+                pass
+    for key, label in SP.OPTION_LABELS.items():
+        v = _tk.BooleanVar(master=parent, value=bool(SP.POLICY[key]))
+        vars_[key] = v
+        ctk.CTkCheckBox(
+            parent, text=label, variable=v,
+            command=(lambda k=key, vv=v: SP.set_option(k, vv.get())),
+            text_color=T()["subtext"], font=ctk.CTkFont(size=11),
+        ).pack(anchor="w", padx=12, pady=1)
+    if with_hint:
+        ctk.CTkLabel(parent, text=_STATS_OPTION_HINT, text_color=T()["muted"],
+                     font=ctk.CTkFont(size=9), justify="left", wraplength=240
+                     ).pack(anchor="w", padx=12, pady=(2, 6))
+    SP.on_change(_sync)
+    return vars_
+
+
+def open_stats_options_window(parent):
+    """Small window with the stats-policy checkboxes (used by Combined Analysis)."""
+    win = ctk.CTkToplevel(parent)
+    win.title("Statistics options")
+    win.geometry("330x330")
+    try:
+        win.after(50, win.lift)
+    except Exception:
+        pass
+    fr = ctk.CTkFrame(win, fg_color=T()["card"])
+    fr.pack(fill="both", expand=True, padx=8, pady=8)
+    ctk.CTkLabel(fr, text="Statistics options", font=ctk.CTkFont(size=13, weight="bold"),
+                 text_color=T()["hdr_text"]).pack(anchor="w", padx=12, pady=(8, 4))
+    add_stats_option_checkboxes(fr)
+    ctk.CTkButton(fr, text="Close", command=win.destroy, width=80).pack(pady=8)
+    return win
+
+
 def benjamini_hochberg(pvals) -> "np.ndarray":
     """Benjamini-Hochberg FDR-adjusted q-values for an array of p-values.
 
@@ -1403,6 +1462,37 @@ def _present_only_kw(group_vals: dict, group_present: dict):
         return float("nan"), 1.0, n_used
 
 
+def _dunn_pvalues(group_vals: dict, names: list):
+    """{(a, b): two-sided Dunn p} with tie correction; None if not computable."""
+    try:
+        import itertools as _it
+        arrs = {g: np.asarray(group_vals[g], dtype=float) for g in names}
+        vals = np.concatenate([arrs[g] for g in names])
+        N = len(vals)
+        if N < 3:
+            return None
+        ranks = sp_stats.rankdata(vals)
+        idx, mr = 0, {}
+        for g in names:
+            n = len(arrs[g])
+            mr[g] = float(ranks[idx:idx + n].mean())
+            idx += n
+        _, cnt = np.unique(vals, return_counts=True)
+        tie = float((cnt ** 3 - cnt).sum()) / (12.0 * (N - 1))
+        base = N * (N + 1) / 12.0 - tie
+        out = {}
+        for a, b in _it.combinations(names, 2):
+            var = base * (1.0 / len(arrs[a]) + 1.0 / len(arrs[b]))
+            if var <= 0:
+                out[(a, b)] = 1.0
+                continue
+            z = (mr[a] - mr[b]) / np.sqrt(var)
+            out[(a, b)] = float(2.0 * sp_stats.norm.sf(abs(z)))
+        return out
+    except Exception:
+        return None
+
+
 def _pairwise_posthoc_raw(group_vals: dict, paired: bool = False) -> list:
     """Pairwise post-hoc p-values (no FDR) across groups/levels for one cluster.
 
@@ -1436,48 +1526,40 @@ def _pairwise_posthoc_raw(group_vals: dict, paired: bool = False) -> list:
             va = np.asarray([group_vals[a][s] for s in common], dtype=float)
             vb = np.asarray([group_vals[b][s] for s in common], dtype=float)
             try:
-                if len(common) < 1 or np.allclose(va, vb):
-                    p = 1.0
-                else:
-                    _, p = sp_stats.wilcoxon(va, vb)
+                p, _tname = (SP.paired_pvalue(va, vb) if len(common) >= 2 else (1.0, "none"))
             except Exception:
-                p = 1.0
+                p, _tname = 1.0, "none"
             direction = ">" if np.mean(va) >= np.mean(vb) else "<" if len(va) else ">"
+            _dz, _lo, _hi = SP.paired_dz(va, vb)
             recs.append({"group_a": a, "group_b": b,
-                         "p": float(p), "direction": direction})
+                         "p": float(p), "direction": direction, "test": _tname,
+                         "effect": _dz, "effect_lo": _lo, "effect_hi": _hi,
+                         "effect_type": "paired_dz", "n_pairs": int(len(common))})
         return recs
 
-    # Optional Dunn's test (rank-based, matches the KW omnibus).
-    dunn = None
-    try:
-        import scikit_posthocs as _sph
-        data, labels = [], []
-        for g in names:
-            data.extend(list(group_vals[g]))
-            labels.extend([g] * len(group_vals[g]))
-        dunn = _sph.posthoc_dunn(
-            pd.DataFrame({"v": data, "g": labels}),
-            val_col="v", group_col="g", p_adjust=None)
-    except Exception:
-        dunn = None
+    # Dunn's test (rank-based, matches the KW omnibus; tie-corrected, two-sided,
+    # unadjusted).  Pure numpy: the scikit-posthocs/pandas groupby route
+    # crashed natively on this machine (see Crash Protection in CLAUDE.md).
+    dunn = _dunn_pvalues(group_vals, names)
 
     recs = []
     for a, b in pairs:
         va = np.asarray(group_vals[a], dtype=float)
         vb = np.asarray(group_vals[b], dtype=float)
         if dunn is not None:
-            try:
-                p = float(dunn.loc[a, b])
-            except Exception:
-                p = 1.0
+            p = float(dunn.get((a, b), 1.0))
         else:
             try:
                 _, p = sp_stats.mannwhitneyu(va, vb, alternative="two-sided")
             except Exception:
                 p = 1.0
         direction = ">" if np.mean(va) >= np.mean(vb) else "<"
+        _g, _lo, _hi = SP.hedges_g(va, vb)
         recs.append({"group_a": a, "group_b": b,
-                     "p": float(p), "direction": direction})
+                     "p": float(p), "direction": direction,
+                     "test": "dunn" if dunn is not None else "mannwhitney",
+                     "effect": _g, "effect_lo": _lo, "effect_hi": _hi,
+                     "effect_type": "hedges_g", "n_pairs": int(min(len(va), len(vb)))})
     return recs
 
 
@@ -1504,32 +1586,48 @@ def pairwise_posthoc(group_vals: dict, paired: bool = False) -> list:
     return recs
 
 
-def pairwise_posthoc_pooled(group_vals_list: list, paired: bool = False) -> list:
+def pairwise_posthoc_pooled(group_vals_list: list, paired: bool = False,
+                            omnibus_p: list = None) -> list:
     """Pairwise post-hoc across MANY clusters/panels, FDR-pooled into one family.
 
     group_vals_list: list of per-cluster group_vals dicts (see
-    _pairwise_posthoc_raw for the paired= shape contract — plain
-    {group: [values]} lists when paired=False, {level: {subject_id: value}}
-    dicts when paired=True), one per cluster/panel being reported together.
-    Raw pairwise p-values are computed independently per cluster, then a SINGLE
-    Benjamini-Hochberg pass runs across every pair from every cluster. This
-    keeps post-hoc q-values on the same footing as the omnibus per-cluster q
-    (also corrected across the whole reported family, see run_cluster_statistics)
-    so a q<0.05 star means the same thing whether it's the omnibus bracket or a
-    pairwise one below it, instead of drifting between panels purely from each
-    panel's local, much-smaller correction family.
+    _pairwise_posthoc_raw for the paired= shape contract), one per cluster/panel.
+    Raw pairwise p-values are computed per cluster, then ONE Benjamini-Hochberg
+    pass runs across the pairs, so a q<0.05 mark means the same thing on every
+    panel.
+
+    omnibus_p (optional, same length): each cluster's omnibus raw p-value.  When
+    the stats policy "gate_posthoc" is on (default), only clusters with
+    omnibus p < 0.05 enter the BH family (Fisher-protected post-hoc testing);
+    the others report q = 1.0 and gated_out = True.  This keeps the family small
+    and restores power at low n while the omnibus test still guards against
+    false positives.  With the option off (or omnibus_p None) every pair of
+    every cluster is in the family, as before.
 
     Returns a list (same order/length as group_vals_list) of recs lists, each
-    entry {group_a, group_b, p, q, direction}.
+    entry {group_a, group_b, p, q, direction, test, effect, effect_lo,
+    effect_hi, effect_type, n_pairs, gated_out}.
     """
     per_cluster_raw = [_pairwise_posthoc_raw(gv, paired=paired) for gv in group_vals_list]
-    all_p = [r["p"] for recs in per_cluster_raw for r in recs]
-    if not all_p:
-        return per_cluster_raw
-    all_q = iter(benjamini_hochberg(np.asarray(all_p, dtype=float)))
-    for recs in per_cluster_raw:
+    gate = bool(SP.POLICY["gate_posthoc"]) and omnibus_p is not None
+    in_family = []
+    for i, recs in enumerate(per_cluster_raw):
+        ok = True
+        if gate:
+            try:
+                ok = bool(float(omnibus_p[i]) < 0.05)
+            except Exception:
+                ok = False
         for r in recs:
-            r["q"] = float(next(all_q))
+            r["gated_out"] = not ok
+            if ok:
+                in_family.append(r)
+            else:
+                r["q"] = 1.0
+    if in_family:
+        qs = benjamini_hochberg(np.asarray([r["p"] for r in in_family], dtype=float))
+        for r, qq in zip(in_family, qs):
+            r["q"] = float(qq) if np.isfinite(qq) else 1.0
     return per_cluster_raw
 
 
@@ -1562,7 +1660,7 @@ def draw_sig_brackets(ax, group_names: list, all_pts: list, y_start: float,
         recs = pairwise_posthoc(gv)
     if out_recs is not None:
         out_recs.extend(recs)
-    sig = [r for r in recs if r.get("q", 1.0) < 0.05]
+    sig = [r for r in recs if r.get("q", 1.0) < SP.display_q()]
     if not sig:
         return y_start
     # Order brackets by group separation so short ones stack below long ones.
@@ -1575,9 +1673,10 @@ def draw_sig_brackets(ax, group_names: list, all_pts: list, y_start: float,
         ax.plot([x0, x0, x1, x1], [y, y + y_step * 0.15, y + y_step * 0.15, y],
                 lw=0.6, color=tick_color)
         q = r["q"]
-        star = ("***" if q < 0.001 else "**" if q < 0.01 else "*")
+        star = SP.mark(q)
         ax.text((x0 + x1) / 2, y + y_step * 0.17, star, ha="center",
-                fontsize=10, color=sig_color, fontweight="bold")
+                fontsize=10, color=sig_color, fontweight="bold",
+                alpha=(1.0 if q < 0.05 else 0.7))
         y += y_step
     return y
 
@@ -1618,13 +1717,158 @@ def write_stats_support_csvs(stats_df, animals: list, metric: str, out_dir,
     try:
         recs = stats_df.attrs.get("posthoc_recs") or {}
         prow = [{"cluster_id": cid, "group_a": r["group_a"], "group_b": r["group_b"],
-                 "direction": f"A{r['direction']}B", "p_value": r["p"], "q_value_FDR": r["q"]}
+                 "direction": f"A{r['direction']}B", "p_value": r["p"], "q_value_FDR": r["q"],
+                 "tier": SP.tier(r["q"]), "test": r.get("test", ""),
+                 "effect_type": r.get("effect_type", ""), "effect": r.get("effect", np.nan),
+                 "effect_ci_low": r.get("effect_lo", np.nan),
+                 "effect_ci_high": r.get("effect_hi", np.nan),
+                 "n_pairs": r.get("n_pairs", ""),
+                 "gated_out_by_omnibus": bool(r.get("gated_out", False))}
                 for cid, lst in recs.items() for r in lst]
         if prow:
             p = out_dir / f"{stem}_posthoc.csv"
             pd.DataFrame(prow).to_csv(p, index=False); written.append(p)
     except Exception:
         pass
+    try:
+        written += write_group_effect_outputs(stats_df, animals, metric, out_dir, stem)
+    except Exception as exc:
+        print(f"[Stats] effect/omnibus export failed: {exc}")
+    SP.write_policy(out_dir, {"metric": metric, "design": stats_df.attrs.get("design")})
+    return written
+
+
+def build_effects_view(stats_df, animals: list, metric: str, which: str = "effects"):
+    """Figure for the on-screen 'Effect Sizes' / 'Group Omnibus' views (no files
+    written).  Returns a Figure or None."""
+    import tempfile
+    figs: dict = {}
+    with tempfile.TemporaryDirectory() as td:
+        write_group_effect_outputs(stats_df, animals, metric, td, figs_out=figs,
+                                   with_omnibus=(which == "omnibus"))
+    return figs.get(which)
+
+
+def _plot_theme_dict() -> dict:
+    tt = T()
+    return {"fig_bg": tt["fig_bg"], "ax_bg": tt["ax_bg"], "text": tt.get("text", tt["tick"]),
+            "spine": tt.get("spine", tt["tick"]), "muted": tt["muted"]}
+
+
+def write_group_effect_outputs(stats_df, animals: list, metric: str, out_dir,
+                               stem: str = "stats", figs_out: dict = None,
+                               with_omnibus: bool = True) -> list:
+    """Effect sizes with 95% CI per cluster and group pair (Hedges g, or paired
+    dz for a repeated design) with their q-values, plus omnibus usage tests
+    (Jensen-Shannon and PERMANOVA, independent designs) -- each saved as CSV and
+    as a PNG in the current theme.  {stem}_effects.[csv|png],
+    {stem}_omnibus.[csv|png], {stem}_omnibus_pcoa.csv."""
+    import itertools as _it
+    import group_contrasts as gc
+    out_dir = pathlib.Path(out_dir)
+    written = []
+    if stats_df is None or getattr(stats_df, "empty", True) or not animals:
+        return written
+    design = stats_df.attrs.get("design", "independent")
+    fn = ((lambda a: compute_per_pair_transition_probs(a["df"]))
+          if metric == "transition_prob" else
+          (lambda a: compute_per_cluster_metrics(a["df"], a["fps"], a.get("kinematics_df"))))
+    cids = list(stats_df["cluster_id"])
+    egs = list(dict.fromkeys(a["exp_group"] for a in animals))
+    if len(egs) < 2:
+        return written
+    mat, glab, sids, names = [], [], [], []
+    for a in animals:
+        pcm = fn(a)
+        mat.append([float(pcm.loc[c, metric]) if c in pcm.index else 0.0 for c in cids])
+        glab.append(a["exp_group"])
+        sids.append(normalize_subject_id(a.get("subject_id")))
+        names.append(a.get("name", ""))
+    M = np.asarray(mat, float)
+    glab = np.asarray(glab, dtype=object)
+    ph = stats_df.attrs.get("posthoc_recs") or {}
+    qk = dict(zip(stats_df["cluster_id"], stats_df["qval_kw"])) if "qval_kw" in stats_df else {}
+
+    rows = []
+    for a_, b_ in _it.combinations(egs, 2):
+        for j, c in enumerate(cids):
+            if design == "repeated":
+                da, db = {}, {}
+                for i in range(len(glab)):
+                    if sids[i] and glab[i] == a_:
+                        da.setdefault(sids[i], []).append(M[i, j])
+                    if sids[i] and glab[i] == b_:
+                        db.setdefault(sids[i], []).append(M[i, j])
+                common = sorted(set(da) & set(db))
+                va = np.array([np.mean(da[s]) for s in common])
+                vb = np.array([np.mean(db[s]) for s in common])
+                e, lo, hi = SP.paired_dz(va, vb) if len(common) >= 3 else (np.nan,) * 3
+                et, na, nb = "paired_dz", len(common), len(common)
+            else:
+                va, vb = M[glab == a_, j], M[glab == b_, j]
+                e, lo, hi = SP.hedges_g(va, vb)
+                et, na, nb = "hedges_g", len(va), len(vb)
+            if len(egs) == 2:
+                q = float(qk.get(c, np.nan))
+            else:
+                q = np.nan
+                for r in ph.get(c, []):
+                    if {r["group_a"], r["group_b"]} == {a_, b_}:
+                        q = float(r.get("q", np.nan))
+            rows.append({"cluster_id": c, "contrast": f"{a_} vs {b_}", "effect_type": et,
+                         "effect": e, "ci_low": lo, "ci_high": hi, "n_a": na, "n_b": nb,
+                         "q_value": q, "tier": SP.tier(q)})
+    eff = pd.DataFrame(rows)
+    pth = out_dir / f"{stem}_effects.csv"
+    eff.to_csv(pth, index=False); written.append(pth)
+    try:
+        d = eff.dropna(subset=["effect"]).copy()
+        if len(d):
+            d["feature"] = d["cluster_id"].map(lambda c: f"C{c}" if isinstance(c, (int, np.integer)) else str(c))
+            d = d.rename(columns={"effect": "hedges_g", "q_value": "qval_bh"})
+            fig = gc.plot_effects(d, _plot_theme_dict(),
+                                  f"Effect size per cluster ({metric.replace('_', ' ')}); "
+                                  + SP.legend_text("q"), top=25)
+            if figs_out is not None:
+                figs_out["effects"] = fig
+            else:
+                png = out_dir / f"{stem}_effects.png"
+                fig.savefig(png, dpi=200, facecolor=fig.get_facecolor(), bbox_inches="tight")
+                written.append(png)
+                dd = d.rename(columns={"ci_low": "g_lo", "ci_high": "g_hi"})
+                ffig = gc.plot_forest(dd, _plot_theme_dict(),
+                                      f"Effect sizes with 95% CI ({metric.replace('_', ' ')})")
+                png2 = out_dir / f"{stem}_effects_forest.png"
+                ffig.savefig(png2, dpi=200, facecolor=ffig.get_facecolor(), bbox_inches="tight")
+                written.append(png2)
+    except Exception as exc:
+        print(f"[Stats] effect plot failed: {exc}")
+
+    if with_omnibus and design != "repeated" and M.shape[1] >= 2 and len(M) > len(egs):
+        try:
+            raw = M if metric in ("total_duration", "frequency", "mean_bout") else np.abs(M)
+            Z = gc.clr(raw)
+            js = gc.js_permutation_test(raw, glab)
+            pm = gc.permanova(Z, glab)
+            pcs, ev = gc.pcoa(Z)
+            pd.DataFrame([{"test": "Jensen-Shannon distance (group-mean usage)", "statistic": js[0],
+                           "pval": js[1], "R2": np.nan},
+                          {"test": "PERMANOVA (Aitchison/CLR)", "statistic": pm["F"],
+                           "pval": pm["p"], "R2": pm["R2"]}]).to_csv(
+                out_dir / f"{stem}_omnibus.csv", index=False)
+            written.append(out_dir / f"{stem}_omnibus.csv")
+            pd.DataFrame({"animal": names, "group": glab, "PC1": pcs[:, 0],
+                          "PC2": pcs[:, 1]}).to_csv(out_dir / f"{stem}_omnibus_pcoa.csv", index=False)
+            written.append(out_dir / f"{stem}_omnibus_pcoa.csv")
+            fig = gc.plot_omnibus(js, pm, pcs, ev, glab, _plot_theme_dict())
+            if figs_out is not None:
+                figs_out["omnibus"] = fig
+            else:
+                png = out_dir / f"{stem}_omnibus.png"
+                fig.savefig(png, dpi=200, facecolor=fig.get_facecolor(), bbox_inches="tight")
+                written.append(png)
+        except Exception as exc:
+            print(f"[Stats] omnibus failed: {exc}")
     return written
 
 
@@ -1761,14 +2005,26 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
         common_subjects = sorted(set.intersection(*subj_sets)) if subj_sets else []
         all_seen = set().union(*subj_sets) if subj_sets else set()
         n_excluded_subjects = len(all_seen) - len(common_subjects)
+    # Mixed-model path: animals with >= 2 levels (not only complete ones).
+    multi_subjects: list = []
+    if design == "repeated":
+        _cnt: dict = {}
+        for _eg in eg_names:
+            for _sid in level_pcm_by_subject[_eg]:
+                _cnt[_sid] = _cnt.get(_sid, 0) + 1
+        multi_subjects = sorted(s for s, c in _cnt.items() if c >= 2)
+        if SP.POLICY["mixed_repeated"] and len(multi_subjects) > len(common_subjects):
+            n_excluded_subjects = len(_cnt) - len(multi_subjects)
 
     rows = []
     _posthoc_gv_by_cid = {}
     for cid in all_clusters:
         if design == "repeated":
-            if len(eg_names) < 2 or len(common_subjects) < 3:
+            _use_mixed = bool(SP.POLICY["mixed_repeated"]) and len(multi_subjects) > len(common_subjects)
+            if len(eg_names) < 2 or (len(common_subjects) < 3 and not (
+                    SP.POLICY["mixed_repeated"] and len(multi_subjects) >= 3)):
                 continue
-            level_vals = {}   # eg -> {subject_id: value}
+            level_vals = {}   # eg -> {subject_id: value}  (complete animals)
             for eg in eg_names:
                 by_sid = level_pcm_by_subject[eg]
                 level_vals[eg] = {
@@ -1779,23 +2035,36 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
             aligned = [np.array([level_vals[eg][sid] for sid in common_subjects])
                        for eg in eg_names]
             n_subj, n_lvl = len(common_subjects), len(eg_names)
-
+            all_lv = level_vals      # values used for means / post-hoc / n
+            test_used = "none"
+            stat_kw, pval_kw = np.nan, 1.0
             try:
-                if n_lvl == 2:
-                    if np.allclose(aligned[0], aligned[1]):
-                        stat_kw, pval_kw = 0.0, 1.0
+                if _use_mixed:
+                    all_lv = {eg: {sid: (float(level_pcm_by_subject[eg][sid].loc[cid, metric])
+                                         if cid in level_pcm_by_subject[eg][sid].index else 0.0)
+                                   for sid in multi_subjects if sid in level_pcm_by_subject[eg]}
+                              for eg in eg_names}
+                    _m = SP.mixed_level_pvalue(all_lv)
+                    if _m is not None:
+                        stat_kw, pval_kw, _ = _m
+                        test_used = "mixed_lrt_log1p"
+                if test_used == "none" and n_subj >= 3:
+                    if n_lvl == 2:
+                        pval_kw, test_used = SP.paired_pvalue(aligned[0], aligned[1])
+                        stat_kw = float(sp_stats.norm.isf(max(pval_kw, 1e-300) / 2.0))
                     else:
-                        stat_kw, pval_kw = sp_stats.wilcoxon(aligned[0], aligned[1])
-                else:
-                    stat_kw, pval_kw = sp_stats.friedmanchisquare(*aligned)
+                        stat_kw, pval_kw, test_used = SP.rm_omnibus_pvalue(aligned)
+                elif test_used == "none":
+                    continue
             except Exception:
-                stat_kw, pval_kw = np.nan, 1.0
+                stat_kw, pval_kw, test_used = np.nan, 1.0, "failed"
+            if test_used == "mixed_lrt_log1p":
+                n_subj = len(multi_subjects)
 
-            # Effect size appropriate to the omnibus test used (not literally
-            # epsilon-squared): Kendall's W for Friedman, matched-pairs
-            # rank-biserial correlation for the 2-level Wilcoxon case.
+            # Effect size appropriate to the omnibus test used: Kendall's W for
+            # Friedman-type, matched-pairs rank-biserial for 2 levels.
             try:
-                if n_lvl == 2:
+                if n_lvl == 2 and len(aligned[0]) >= 1:
                     diffs = aligned[0] - aligned[1]
                     nz = diffs[diffs != 0]
                     if len(nz):
@@ -1803,9 +2072,13 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
                         eff = abs(float(r_pos) - float(r_neg)) / len(nz)
                     else:
                         eff = 0.0
+                elif n_lvl > 2 and np.isfinite(stat_kw) and len(aligned[0]) > 0 \
+                        and test_used in ("friedman",):
+                    eff = float(stat_kw) / (len(aligned[0]) * (n_lvl - 1))
+                elif np.isfinite(stat_kw) and n_subj > 0:
+                    eff = float(stat_kw) / (n_subj * (n_lvl - 1)) if n_lvl > 2 else 0.0
                 else:
-                    eff = (float(stat_kw) / (n_subj * (n_lvl - 1))
-                           if np.isfinite(stat_kw) and n_subj > 0 else 0.0)
+                    eff = 0.0
                 eff = float(min(max(eff, 0.0), 1.0))
             except Exception:
                 eff = 0.0
@@ -1813,6 +2086,7 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
             row = {
                 "cluster_id":           cid,
                 "design":               "repeated",
+                "test_used":            test_used,
                 "stat_kw":              stat_kw,
                 "pval_kw":              pval_kw,
                 "stat_anova":           np.nan,
@@ -1824,15 +2098,16 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
                 "pval_prevalence":      np.nan,
                 "stat_kw_present":      np.nan,
                 "pval_kw_present":      np.nan,
-                "n_present_total":      int(n_subj * n_lvl),
+                "n_present_total":      int(sum(len(v) for v in all_lv.values())),
             }
             for eg in eg_names:
-                row[f"mean_{eg}"]         = float(np.mean(list(level_vals[eg].values())))
+                row[f"mean_{eg}"]         = (float(np.mean(list(all_lv[eg].values())))
+                                             if all_lv[eg] else float("nan"))
                 row[f"prevalence_{eg}"]   = float("nan")
-                row[f"n_{eg}"]            = n_subj
-                row[f"n_present_{eg}"]    = n_subj
+                row[f"n_{eg}"]            = len(all_lv[eg])
+                row[f"n_present_{eg}"]    = len(all_lv[eg])
             if with_posthoc and len(eg_names) > 2:
-                _posthoc_gv_by_cid[cid] = dict(level_vals)
+                _posthoc_gv_by_cid[cid] = dict(all_lv)
             rows.append(row)
             continue
 
@@ -1905,6 +2180,7 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
         row = {
             "cluster_id":         cid,
             "design":             "independent",
+            "test_used":          "kruskal",
             "stat_kw":            stat_kw,
             "pval_kw":            pval_kw,
             "stat_anova":         stat_an,
@@ -1942,8 +2218,10 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
     df_res = pd.DataFrame(rows)
     if with_posthoc and _posthoc_gv_by_cid:
         _ph_cids = list(_posthoc_gv_by_cid.keys())
+        _omn_by_cid = dict(zip(df_res["cluster_id"], df_res["pval_kw"]))
         _ph_pooled = pairwise_posthoc_pooled(
-            [_posthoc_gv_by_cid[c] for c in _ph_cids], paired=(design == "repeated"))
+            [_posthoc_gv_by_cid[c] for c in _ph_cids], paired=(design == "repeated"),
+            omnibus_p=[_omn_by_cid.get(c, 1.0) for c in _ph_cids])
         _ph_cols = {}
         for c, _ph in zip(_ph_cids, _ph_pooled):
             _sig = [r for r in _ph if r["q"] < 0.05]
@@ -1973,8 +2251,15 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
         def _bh_testable(p_col, stat_col):
             p = df_res[p_col].to_numpy(dtype=float).copy()
             p[~np.isfinite(df_res[stat_col].to_numpy(dtype=float))] = np.nan
+            if (SP.POLICY["prefilter_sparse"] and design != "repeated"
+                    and "n_present_total" in df_res.columns):
+                # Independent filtering: features seen in too few animals are not
+                # tested (q reported as 1.0) so they do not inflate the BH family.
+                p[df_res["n_present_total"].to_numpy(dtype=float)
+                  < SP.MIN_PRESENT_ANIMALS] = np.nan
             return pd.Series(benjamini_hochberg(p), index=df_res.index).fillna(1.0).to_numpy()
         df_res["qval_kw"] = _bh_testable("pval_kw", "stat_kw")
+        df_res["tier"] = df_res["qval_kw"].map(SP.tier)
         df_res["neg_log10_q"] = -np.log10(
             np.clip(df_res["qval_kw"].to_numpy(), 1e-300, None))
         # FDR for the two-part tests (same cluster family).  Not computed for
@@ -2021,7 +2306,10 @@ def run_cluster_statistics(animal_data: list, metric: str = "total_duration",
     df_res.attrs["posthoc_recs"] = (
         dict(zip(_ph_cids, _ph_pooled)) if (with_posthoc and _posthoc_gv_by_cid) else {})
     if design == "repeated":
-        df_res.attrs["n_matched_subjects"] = len(common_subjects)
+        df_res.attrs["n_matched_subjects"] = (
+            len(multi_subjects) if (SP.POLICY["mixed_repeated"]
+                                    and len(multi_subjects) > len(common_subjects))
+            else len(common_subjects))
         df_res.attrs["n_excluded_subjects"] = n_excluded_subjects
     return df_res
 
@@ -4260,8 +4548,10 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
                               for pcm in eg_map[eg]]
             panel_group_vals.append(gv)
         try:
+            _raw_p = stats_df.set_index("cluster_id")["pval_kw"].to_dict()
             posthoc_by_panel = pairwise_posthoc_pooled(
-                panel_group_vals, paired=(design == "repeated"))
+                panel_group_vals, paired=(design == "repeated"),
+                omnibus_p=[_raw_p.get(c, 1.0) for c in top_ids])
         except Exception:
             posthoc_by_panel = [[] for _ in top_ids]
 
@@ -4305,8 +4595,7 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
                            s=22, linewidths=0.7, alpha=0.88, zorder=4)
 
             # significance bracket + stars — always shown (inc. ns)
-            stars = ("***" if pv < 0.001 else "**" if pv < 0.01
-                     else "*" if pv < 0.05 else "ns")
+            stars = SP.mark(pv)
             data_top = max((m + s for m, s in zip(means, sems)), default=0)
             max_pt   = max((max(pts) for pts in all_pts if pts), default=0)
             data_ceil = max(data_top, max_pt)
@@ -4362,7 +4651,7 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
         fig.suptitle(
             f"Top {len(top_ids)} Significant {_unit_pl}  ({_sw} < {p_thresh})  -  "
             f"Each panel has its own y-scale  -  "
-            f"* {_sw}<0.05  ** {_sw}<0.01  *** {_sw}<0.001",
+            + SP.legend_text(_sw),
             color=t["tick"], fontweight="bold", fontsize=10, y=0.99)
         fig.tight_layout(rect=[0, 0, 1, 0.97])
 
@@ -4446,7 +4735,7 @@ def build_top_n_barplot(stats_df: pd.DataFrame, animal_data: list,
                         framealpha=0.3, facecolor=t["ax_bg"], labelcolor=t["tick"])
             fig2.suptitle(
                 f"User-Defined Behaviour Groups  —  {metric.replace('_',' ').title()}"
-                f"  —  * FDR q<0.05  ** q<0.01  *** q<0.001",
+                f"  —  {_sig_legend()}",
                 color=t["tick"], fontweight="bold", fontsize=10, y=0.99)
             fig2.tight_layout(rect=[0, 0, 1, 0.97])
         return fig, fig2
@@ -5156,10 +5445,15 @@ def build_group_transition_comparison_figure(
                         _mean_b = float(np.mean(_vb))
                         _delta_v = _mean_a - _mean_b
                         try:
+                            if (SP.POLICY["prefilter_sparse"]
+                                    and int(np.count_nonzero(X_pca[:, col_i]))
+                                    < SP.MIN_PRESENT_ANIMALS):
+                                raise ValueError("seen in too few animals")
                             _, _pv = _ttest(_va, _vb, equal_var=False)
                             _pv = float(_pv)
                         except Exception:
                             _pv = float("nan")
+                        _g, _glo, _ghi = SP.hedges_g(_va, _vb)
                         # zero variance in both groups -> NaN: untestable, left
                         # out of the FDR family (previously max(nan, 1e-300)
                         # silently kept the NaN and the pair vanished).
@@ -5173,6 +5467,8 @@ def build_group_transition_comparison_figure(
                                 f"mean_{eg_a}": _mean_a,
                                 f"mean_{eg_b}": _mean_b,
                                 "pval_mwu": _pv,
+                                "hedges_g": _g, "g_ci_low": _glo, "g_ci_high": _ghi,
+                                "n_animals_nonzero": int(np.count_nonzero(X_pca[:, col_i])),
                             })
 
                     # Hundreds of pairs are tested at once: judge significance on
@@ -5185,6 +5481,8 @@ def build_group_transition_comparison_figure(
                         if stats_out is not None:
                             stats_out[_n0 + _k]["qval_fdr"] = _qk
                         _pair_stats[_k][2] = _qk
+                        if stats_out is not None:
+                            stats_out[_n0 + _k]["tier"] = SP.tier(_qk)
 
                     _all_deltas = [abs(s[1]) for s in _pair_stats]
                     _top_thresh = (sorted(_all_deltas, reverse=True)[top_n - 1]
@@ -5192,11 +5490,14 @@ def build_group_transition_comparison_figure(
 
                     ax_c.axhline(-np.log10(0.05), ls="--", color=t["muted"],
                                  lw=0.8, alpha=0.7)
+                    if SP.POLICY["suggestive_tier"]:
+                        ax_c.axhline(-np.log10(SP.SUGGESTIVE_Q), ls=":", color=t["muted"],
+                                     lw=0.8, alpha=0.6)
                     ax_c.axvline(0, ls="--", color=t["muted"], lw=0.8, alpha=0.7)
 
                     for pname, dv, pv in _pair_stats:
                         _y_v  = -np.log10(max(pv, 1e-300))   # pv is the FDR q here
-                        _sig  = pv < 0.05
+                        _sig  = pv < SP.display_q()
                         _top  = abs(dv) >= _top_thresh and _sig
                         # Determine source cluster pair from "Ci→Cj" string
                         _parts = pname.split("→")
@@ -5636,10 +5937,23 @@ def _combined_is_repeated(combined: dict) -> bool:
 
 
 def _combined_paired_p(combined: dict, bg: str, metric_key: str, eg_names: list):
-    """Omnibus p for a repeated design: Wilcoxon (2 levels) / Friedman (>=3)
-    on animals present in every level.  None when untestable."""
+    """Omnibus p for a repeated design.  Uses every animal with >= 2 levels
+    (mixed model, LRT) when the stats policy allows and some animals are
+    incomplete; otherwise the animals present in every level with a paired
+    t-test on log1p (small n) / Wilcoxon (2 levels) or RM-ANOVA / Friedman
+    (>= 3 levels).  None when untestable."""
     lv = {eg: combined_subject_values(combined, bg, metric_key, eg) for eg in eg_names}
     common = sorted(set.intersection(*[set(d) for d in lv.values()])) if lv else []
+    if SP.POLICY["mixed_repeated"] and lv:
+        _cnt: dict = {}
+        for d in lv.values():
+            for s in d:
+                _cnt[s] = _cnt.get(s, 0) + 1
+        multi = [s for s, c in _cnt.items() if c >= 2]
+        if len(multi) > len(common) and len(multi) >= 3:
+            m = SP.mixed_level_pvalue(lv)
+            if m is not None:
+                return float(m[1])
     if len(common) < 3:
         return None
     arrs = [np.array([lv[eg][s] for s in common], dtype=float) for eg in eg_names]
@@ -5647,9 +5961,9 @@ def _combined_paired_p(combined: dict, bg: str, metric_key: str, eg_names: list)
         if len(arrs) == 2:
             if np.allclose(arrs[0], arrs[1]):
                 return None
-            _, p = sp_stats.wilcoxon(arrs[0], arrs[1])
+            p, _ = SP.paired_pvalue(arrs[0], arrs[1])
         else:
-            _, p = sp_stats.friedmanchisquare(*arrs)
+            _, p, _ = SP.rm_omnibus_pvalue(arrs)
         return float(p) if np.isfinite(p) else None
     except Exception:
         return None
@@ -5712,7 +6026,10 @@ def compute_combined_posthoc(combined: dict, groups: dict) -> dict:
     _vals = combined_subject_values if paired else combined_group_values
     gvs = [{eg: _vals(combined, bg, m, eg) for eg in eg_names}
            for m, bg in keys]
-    pooled = pairwise_posthoc_pooled(gvs, paired=paired)
+    _om = compute_combined_pvals(combined, groups)
+    omn = [((_om.get(k) or {}).get("pval")) for k in keys]
+    omn = [1.0 if v is None else v for v in omn]
+    pooled = pairwise_posthoc_pooled(gvs, paired=paired, omnibus_p=omn)
     return dict(zip(keys, pooled))
 
 
@@ -5744,7 +6061,8 @@ def annotate_grouped_bar_significance(ax, x_base, bar_w: float, eg_names: list,
         pvals.append(p)
     qs = benjamini_hochberg(np.asarray(pvals, dtype=float))
     posthoc = (pairwise_posthoc_pooled(
-        [{eg: list(item[eg]) for eg in eg_names} for item in raw_per_item])
+        [{eg: list(item[eg]) for eg in eg_names} for item in raw_per_item],
+        omnibus_p=[(1.0 if not np.isfinite(v) else v) for v in pvals])
         if n_eg > 2 else [[] for _ in raw_per_item])
     offs = {eg: (i - (n_eg - 1) / 2) * bar_w for i, eg in enumerate(eg_names)}
     ymax = ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 2.0
@@ -5753,7 +6071,7 @@ def annotate_grouped_bar_significance(ax, x_base, bar_w: float, eg_names: list,
     for xi, (q, recs) in enumerate(zip(qs, posthoc)):
         y = ymax * 0.97
         if n_eg > 2:
-            for r in sorted([r for r in recs if r.get("q", 1.0) < 0.05],
+            for r in sorted([r for r in recs if r.get("q", 1.0) < SP.display_q()],
                             key=lambda r: abs(eg_names.index(r["group_a"])
                                               - eg_names.index(r["group_b"]))):
                 xa = x_base[xi] + offs[r["group_a"]]
@@ -5762,13 +6080,12 @@ def annotate_grouped_bar_significance(ax, x_base, bar_w: float, eg_names: list,
                 ax.plot([x0, x0, x1, x1], [y, y + step * 0.25, y + step * 0.25, y],
                         lw=0.7, color=tick)
                 qq = r["q"]
-                ax.text((x0 + x1) / 2, y + step * 0.27,
-                        "***" if qq < 0.001 else "**" if qq < 0.01 else "*",
+                ax.text((x0 + x1) / 2, y + step * 0.27, SP.mark(qq),
                         ha="center", fontsize=9, color=star_color, fontweight="bold")
                 y += step
             top = max(top, y + step)
-        elif np.isfinite(q) and q < 0.05:
-            ax.text(x_base[xi], y, "***" if q < 0.001 else "**" if q < 0.01 else "*",
+        elif np.isfinite(q) and q < SP.display_q():
+            ax.text(x_base[xi], y, SP.mark(q),
                     ha="center", fontsize=11, color=star_color, fontweight="bold")
     if top > ymax:
         ax.set_ylim(top=top)
@@ -5786,14 +6103,19 @@ def write_combined_csvs(combined: dict, groups: dict, out_dir, ts: str) -> list:
     out_dir = pathlib.Path(out_dir)
     repeated = _combined_is_repeated(combined)
     n_eg = len(combined["exp_groups"])
-    test_name = ("Wilcoxon signed-rank" if (repeated and n_eg == 2) else
-                 "Friedman" if repeated else "Kruskal-Wallis")
+    if repeated:
+        _small = "paired t-test on log1p (n<10) / " if SP.POLICY["small_n_paired"] else ""
+        _mix = "; mixed-model LRT when animals are incomplete" if SP.POLICY["mixed_repeated"] else ""
+        test_name = (_small + ("Wilcoxon signed-rank" if n_eg == 2 else "Friedman (RM-ANOVA on log1p, n<10)")
+                     + _mix)
+    else:
+        test_name = "Kruskal-Wallis"
     pvals = compute_combined_pvals(combined, groups)
 
     def _stars(qv):
         if qv is None:
             return "N/A"
-        return "***" if qv < 0.001 else "**" if qv < 0.01 else "*" if qv < 0.05 else "ns"
+        return SP.mark(qv)
 
     rows, arows = [], []
     for eg, beh_dict in combined["grand"].items():
@@ -5809,7 +6131,8 @@ def write_combined_csvs(combined: dict, groups: dict, out_dir, ts: str) -> list:
                     "Omnibus_test": test_name,
                     "p_value": round(pv, 6) if pv is not None else "N/A",
                     "q_value_FDR": round(qv, 6) if qv is not None else "N/A",
-                    "Significance_FDR": _stars(qv)})
+                    "Significance_FDR": _stars(qv),
+                    "Tier": SP.tier(qv) if qv is not None else "N/A"})
     for eg, uids in combined["exp_groups"].items():
         for uid in uids:
             rec = combined["records"][combined["uid_to_idx"][uid]]
@@ -5830,11 +6153,78 @@ def write_combined_csvs(combined: dict, groups: dict, out_dir, ts: str) -> list:
     prow = [{"Beh_Group": bg, "Metric": m, "Group_A": r["group_a"],
              "Group_B": r["group_b"], "Direction": f"A{r['direction']}B",
              "p_value": round(r["p"], 6), "q_value_FDR": round(r["q"], 6),
-             "Significance_FDR": _stars(r["q"])}
+             "Significance_FDR": _stars(r["q"]), "Tier": SP.tier(r["q"]),
+             "Test": r.get("test", ""), "Effect_type": r.get("effect_type", ""),
+             "Effect": r.get("effect", np.nan), "Effect_CI_low": r.get("effect_lo", np.nan),
+             "Effect_CI_high": r.get("effect_hi", np.nan),
+             "Gated_out_by_omnibus": bool(r.get("gated_out", False))}
             for (m, bg), recs in ph.items() for r in recs]
     if prow:
         p = out_dir / f"combined_posthoc_{ts}.csv"
         pd.DataFrame(prow).to_csv(p, index=False); written.append(p)
+    try:
+        written += write_effect_size_outputs(combined, groups, out_dir, ts)
+    except Exception as exc:
+        print(f"[Combined] effect-size export failed: {exc}")
+    if SP.write_policy(out_dir, {"design": "repeated" if repeated else "independent"}):
+        written.append(out_dir / "stats_policy.json")
+    return written
+
+
+def write_effect_size_outputs(combined: dict, groups: dict, out_dir, ts: str) -> list:
+    """Effect sizes with 95% CI for every behaviour group x metric x group pair
+    (Hedges g, or paired dz for a repeated design), saved as
+    combined_effects_{ts}.csv plus a heatmap PNG (current theme)."""
+    import itertools as _it
+    out_dir = pathlib.Path(out_dir)
+    eg_names = list(combined["exp_groups"].keys())
+    if len(eg_names) < 2:
+        return []
+    paired = _combined_is_repeated(combined)
+    rows = []
+    for bg in groups:
+        for m in COMBINED_METRIC_KEYS:
+            for a, b in _it.combinations(eg_names, 2):
+                if paired:
+                    da = combined_subject_values(combined, bg, m, a)
+                    db = combined_subject_values(combined, bg, m, b)
+                    common = sorted(set(da) & set(db))
+                    va = np.array([da[s] for s in common], float)
+                    vb = np.array([db[s] for s in common], float)
+                    e, lo, hi = SP.paired_dz(va, vb) if len(common) >= 3 else (np.nan,) * 3
+                    et, n_a, n_b = "paired_dz", len(common), len(common)
+                else:
+                    va = np.array(combined_group_values(combined, bg, m, a), float)
+                    vb = np.array(combined_group_values(combined, bg, m, b), float)
+                    e, lo, hi = SP.hedges_g(va, vb)
+                    et, n_a, n_b = "hedges_g", len(va), len(vb)
+                rows.append({"Beh_Group": bg, "Metric": m, "Contrast": f"{a} vs {b}",
+                             "Effect_type": et, "Effect": e, "CI_low": lo, "CI_high": hi,
+                             "N_A": n_a, "N_B": n_b})
+    if not rows:
+        return []
+    df = pd.DataFrame(rows)
+    written = []
+    pth = out_dir / f"combined_effects_{ts}.csv"
+    df.to_csv(pth, index=False); written.append(pth)
+    try:
+        import group_contrasts as _gc
+        tt = T()
+        th = {k: tt[k] for k in ("fig_bg", "ax_bg", "text", "spine", "muted")} if "text" in tt else {
+            "fig_bg": tt["fig_bg"], "ax_bg": tt["ax_bg"], "text": tt["tick"],
+            "spine": tt.get("spine", tt["tick"]), "muted": tt["muted"]}
+        eff = df.dropna(subset=["Effect"]).copy()
+        if len(eff):
+            eff["feature"] = eff["Beh_Group"].astype(str) + " | " + eff["Metric"].astype(str)
+            eff = eff.rename(columns={"Effect": "hedges_g", "Contrast": "contrast"})
+            eff["qval_bh"] = np.nan
+            fig = _gc.plot_effects(eff, th, "Effect sizes by behaviour group and metric "
+                                   "(Hedges g / paired dz)", top=30)
+            png = out_dir / f"combined_effects_{ts}.png"
+            fig.savefig(png, dpi=200, facecolor=fig.get_facecolor(), bbox_inches="tight")
+            written.append(png)
+    except Exception as exc:
+        print(f"[Combined] effect-size plot failed: {exc}")
     return written
 
 
@@ -5858,7 +6248,7 @@ def annotate_group_significance(ax, eg_names: list, pts_list: list, q,
         ceil = 1.0
 
     def _stars(v):
-        return "***" if v < 0.001 else "**" if v < 0.01 else "*" if v < 0.05 else "ns"
+        return SP.mark(v)
 
     if n_eg == 2:
         if q is None:
@@ -7418,7 +7808,7 @@ def build_combined_figure(groups, combined, eg_colors_override=None, t=None) -> 
                    title="Exp Group", title_fontsize=8)
         fig.suptitle(
             "Combined Multi-Animal Analysis  (Mean   SEM, individual animals shown)\n"
-            "Columns = behaviour groups (own y-scale)  -  * FDR q<0.05  ** q<0.01  *** q<0.001"
+            "Columns = behaviour groups (own y-scale)  -  " + _sig_legend() +
             "  (BH across all metrics x behaviour groups; >2 groups: KW label + pairwise brackets)",
             color=t["tick"], fontsize=11, fontweight="bold", y=0.98)
     return fig
@@ -7475,7 +7865,7 @@ def build_combined_group_figure(bg_name: str, groups: dict, combined: dict,
         fig.subplots_adjust(hspace=0.52, wspace=0.42,
                             left=0.10, right=0.85, top=0.87, bottom=0.13)
         fig.suptitle(f"Behaviour Group: {bg_name}  —  Mean ± SEM by Exp Group"
-                     f"\n* FDR q<0.05  ** q<0.01  *** q<0.001  (BH across all metrics x behaviour groups"
+                     f"\n{_sig_legend()}  (BH across all metrics x behaviour groups"
                      f"{'; KW label + pairwise brackets' if n_eg > 2 else ''})",
                      color=bg_color, fontsize=11, fontweight="bold", y=0.99)
 
@@ -7659,10 +8049,13 @@ def build_combined_transition_figure(
             for eg in eg_names
         ]
         try:
+            if (SP.POLICY["prefilter_sparse"]
+                    and sum(int(np.count_nonzero(g)) for g in group_vals) < SP.MIN_PRESENT_ANIMALS):
+                raise ValueError("transition seen in too few animals")
             _, pv = sp_stats.kruskal(*group_vals)
             pv = float(pv) if np.isfinite(pv) else None
         except Exception:
-            pv = None   # all-identical values: untestable, left out of the BH family
+            pv = None   # untestable / too sparse: left out of the BH family
         raw_pvals[pair] = pv
 
     valid_pairs = [p for p in all_pairs_list if raw_pvals[p] is not None]
@@ -7680,15 +8073,10 @@ def build_combined_transition_figure(
     n_cols = min(n_top, 5)
     n_rows = (n_top + n_cols - 1) // n_cols
 
-    STAR_THRESH = [(0.001, "***"), (0.01, "**"), (0.05, "*")]
-
     def _stars(qv):
         if qv is None:
             return "N/A"
-        for thresh, sym in STAR_THRESH:
-            if qv < thresh:
-                return sym
-        return "ns"
+        return SP.mark(qv)
 
     rng    = np.random.default_rng(42)
     x_base = np.arange(n_eg)
@@ -7706,7 +8094,7 @@ def build_combined_transition_figure(
             bottom=0.14)
         fig.suptitle(
             f"Behaviour Group: {bg_name}  —  Top Transitions by Group Difference"
-            f"\n* FDR q<0.05  ** q<0.01  *** q<0.001  (BH correction, KW test)",
+            f"\n{_sig_legend()}  (BH correction, KW test)",
             color=bg_color, fontsize=11, fontweight="bold", y=0.99)
 
         posthoc_top = {}
@@ -7715,7 +8103,8 @@ def build_combined_transition_figure(
                 _gvs = [{eg: [animal_trans.get(uid, {}).get(p, 0.0)
                               for uid in exp_groups[eg]] for eg in eg_names}
                         for p in top10]
-                posthoc_top = dict(zip(top10, pairwise_posthoc_pooled(_gvs)))
+                posthoc_top = dict(zip(top10, pairwise_posthoc_pooled(
+                    _gvs, omnibus_p=[raw_pvals[p] for p in top10])))
             except Exception:
                 posthoc_top = {}
 
@@ -7795,6 +8184,7 @@ def build_combined_transition_figure(
                 "p_value_KW":   round(pval, 6) if pval is not None else "N/A",
                 "q_value_FDR":  round(qval, 6),
                 "significance": stars,
+                "tier":         SP.tier(qval),
             })
 
     return fig, pd.DataFrame(stats_rows)
@@ -8938,6 +9328,9 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         self._pthresh_var = ctk.StringVar(master=self, value="0.05")
         ctk.CTkEntry(sf, textvariable=self._pthresh_var, width=100
                      ).pack(anchor="w", padx=12, pady=(2, 8))
+        ctk.CTkLabel(sf, text="Statistics options:", text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(4, 0))
+        add_stats_option_checkboxes(sf)
 
         #   Top-N  
         nf = section(ctrl, "Top-N Clusters")
@@ -9185,7 +9578,8 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                     "Elbow/Silhouette", "Cluster Hierarchy", "Guided Merge",
                     "Recombination",
                     "Dist Matrix", "Transitions", "Grp Transitions",
-                    "Cluster Stats", "Cluster Validity"],
+                    "Cluster Stats", "Cluster Validity",
+                    "Effect Sizes", "Group Omnibus"],
             variable=self._plot_mode,
             command=self._switch_plot,
         ).pack(side="left", padx=4, pady=6)
@@ -9622,9 +10016,19 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
             _design_note += (f"\n{n_matched} matched animal(s) across all levels"
                              + (f", {n_excluded} excluded (incomplete Animal ID)."
                                 if n_excluded else "."))
+        _n_sugg = 0
+        if SP.POLICY["suggestive_tier"]:
+            _n_sugg = int(((self._stats_df[_sig_col] >= p_thresh)
+                           & (self._stats_df[_sig_col] < SP.SUGGESTIVE_Q)).sum())
+        _gsz = {g: int(sum(1 for a in animals if a["exp_group"] == g)) for g in egs}
+        _note = SP.min_p_note(_gsz, paired=(design == "repeated"))
+        if _note:
+            _design_note += "\n" + _note
         self._status(
             f"Done. {len(self._stats_df)} {_unit} tested.\n"
             f"{n_sig} significant at {_sw} < {p_thresh} (FDR-corrected)."
+            + (f"\n+{_n_sugg} suggestive ({_sw} < {SP.SUGGESTIVE_Q}); see Effect Sizes."
+               if _n_sugg else "")
             + (f"\n+{_n_ph} more with a significant pairwise post-hoc pair "
                f"(omnibus not significant)." if _n_ph else "")
             + f"{_design_note}", "#88cc88")
@@ -9830,7 +10234,8 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
         p_thresh, top_n, metric = self._get_params()
 
         # Modes that require stats results
-        stats_needed = mode in ("Top-N Bar", "Volcano", "Heatmap")
+        stats_needed = mode in ("Top-N Bar", "Volcano", "Heatmap",
+                                "Effect Sizes", "Group Omnibus")
         # Modes that need full reclustering (no raw preview available)
         full_recluster_needed = mode in ("Elbow/Silhouette", "Guided Merge", "Recombination")
         # Modes that can run on raw animal data OR reclustered data
@@ -10043,6 +10448,19 @@ class UnbiasedAnalyticsPanel(ctk.CTkFrame):
                         "then reload this run folder.")
                     return
                 self._show_figure(build_cluster_validity_figure(_emb, _lbl))
+            elif mode in ("Effect Sizes", "Group Omnibus"):
+                _which = "effects" if mode == "Effect Sizes" else "omnibus"
+                _fig = build_effects_view(
+                    self._stats_df, getattr(self, "_last_animals", None) or animals,
+                    metric if metric == getattr(self, "_last_metric", metric)
+                    else getattr(self, "_last_metric", metric), _which)
+                if _fig is None:
+                    self._show_placeholder(
+                        "Needs at least 2 groups"
+                        + (" (independent design) and 2+ clusters." if _which == "omnibus"
+                           else " with data."))
+                    return
+                self._show_figure(_fig)
             else:
                 return
             # Show advisory status when displaying pre-recluster raw preview
@@ -19763,10 +20181,11 @@ def one_sample_test(values, ref: float = 0.0, use_wilcoxon: bool = False):
     if len(vals) < 2 or not SCIPY_OK:
         return float("nan"), 1.0
     try:
-        if use_wilcoxon:
+        if use_wilcoxon and np.allclose(vals - ref, 0):
+            return 0.0, 1.0
+        if use_wilcoxon and not (SP.POLICY["small_n_paired"]
+                                 and len(vals) <= SP.SMALL_N_PAIRED_MAX):
             diffs = vals - ref
-            if np.allclose(diffs, 0):
-                return 0.0, 1.0
             stat, p = sp_stats.wilcoxon(diffs)
         else:
             stat, p = sp_stats.ttest_1samp(vals, ref)
@@ -19789,7 +20208,7 @@ def run_one_sample_statistics(group_values: dict, ref: float = 0.0,
     columns, not a crash.
     """
     cols = ["exp_group", "n", "mean", "ref", "stat", "pval",
-            "effect_size_cohens_d", "test_type"]
+            "effect_size_cohens_d", "d_ci_low", "d_ci_high", "test_type"]
     rows = []
     for eg, vals in (group_values or {}).items():
         arr = np.asarray([v for v in vals if v is not None], dtype=float)
@@ -19799,14 +20218,17 @@ def run_one_sample_statistics(group_values: dict, ref: float = 0.0,
         mean = float(np.mean(arr)) if n else float("nan")
         sd = float(np.std(arr, ddof=1)) if n > 1 else float("nan")
         eff = float((mean - ref) / sd) if (n > 1 and sd and sd > 0) else float("nan")
+        _d, _dlo, _dhi = SP.one_sample_d_ci(arr, ref)
         rows.append({
             "exp_group": eg, "n": n, "mean": mean, "ref": float(ref),
             "stat": stat, "pval": p, "effect_size_cohens_d": eff,
+            "d_ci_low": _dlo, "d_ci_high": _dhi,
             "test_type": "wilcoxon_1samp" if use_wilcoxon else "ttest_1samp",
         })
     df = pd.DataFrame(rows, columns=cols)
     if not df.empty:
         df["qval"] = benjamini_hochberg(df["pval"].to_numpy())
+        df["tier"] = df["qval"].map(SP.tier)
     else:
         df["qval"] = pd.Series(dtype=float)
     return df.sort_values("qval", na_position="last").reset_index(drop=True)
@@ -19827,8 +20249,9 @@ def draw_one_sample_markers(ax, group_names: list, one_sample_df: pd.DataFrame,
         if row.empty:
             continue
         q = float(row.iloc[0].get("qval", row.iloc[0].get("pval", 1.0)))
-        if q < 0.05:
-            mark = "†††" if q < 0.001 else "††" if q < 0.01 else "†"
+        if q < SP.display_q():
+            mark = ("†††" if q < 0.001 else "††" if q < 0.01 else "†" if q < 0.05
+                    else "(†)")
             y = y_positions[i] if i < len(y_positions) else 0
             ax.text(i, y, mark, ha="center", va="bottom",
                      fontsize=11, color=marker_color, fontweight="bold")
@@ -20346,8 +20769,7 @@ def build_region_crosstab_figure(agg: dict, region_names: list,
                 _reg_q = dict(zip(_reg_p, benjamini_hochberg(
                     np.array(list(_reg_p.values()), dtype=float))))
                 for ri, qv in _reg_q.items():
-                    stars = ("***" if qv < 0.001 else "**" if qv < 0.01
-                             else "*" if qv < 0.05 else "ns")
+                    stars = SP.mark(qv)
                     x0 = bar_x_by_label[labels[0]][ri]
                     x1 = bar_x_by_label[labels[-1]][ri]
                     star_color = "#FF4081" if stars != "ns" else t["muted"]
@@ -20871,6 +21293,9 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                           values=["Label 1", "Label 2", "Label 3 / Animal ID",
                                   "All Labels"],
                           width=250).pack(padx=12, pady=(2, 8))
+        ctk.CTkLabel(sf, text="Statistics options:", text_color=T()["subtext"],
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(0, 0))
+        add_stats_option_checkboxes(sf)
 
         ac = section("")
         ctk.CTkButton(ac, text="Refresh from Loaded Sessions",
@@ -21794,6 +22219,16 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                 if len(_common) >= 3:
                     _subj_vals = {eg: {s: d[s] for s in sorted(_common)}
                                   for eg, d in _lv.items()}
+        _mixed = None
+        if _paired and SP.POLICY["mixed_repeated"] and len(_lv) == len(group_values) >= 2:
+            _cnt = {}
+            for _d in _lv.values():
+                for _s in _d:
+                    _cnt[_s] = _cnt.get(_s, 0) + 1
+            _multi = [s for s, c in _cnt.items() if c >= 2]
+            _ncommon = len(_subj_vals[next(iter(_subj_vals))]) if _subj_vals else 0
+            if len(_multi) >= 3 and len(_multi) > _ncommon:
+                _mixed = SP.mixed_level_pvalue(_lv)
         if hasattr(self, "_export_tables"):
             self._export_tables.append((self._slugify(title), pd.DataFrame(export_rows)))
         egs = [eg for eg in eg_colors if eg in group_values]
@@ -21837,6 +22272,7 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         bracket_top = data_ceil
         stat_omnibus_pv = None
         stat_omnibus_stat = None
+        stat_omnibus_test = ""
         stat_posthoc_recs: list = []
         if len(egs) > 1:
             # Omnibus Kruskal-Wallis stars/"ns" -- always shown (the same
@@ -21846,18 +22282,26 @@ class ParadigmResultsPanel(ctk.CTkFrame):
             # does when no pair reaches q < 0.05.
             omnibus_pv = None
             _ph_pre = None     # paired post-hoc recs (None -> independent post-hoc)
-            if SCIPY_OK and _subj_vals is not None:
-                _arrs = [np.array(list(_subj_vals[eg].values()), dtype=float) for eg in egs]
+            stat_omnibus_test = "kruskal"
+            if SCIPY_OK and (_subj_vals is not None or _mixed is not None):
                 try:
-                    if len(_arrs) == 2:
-                        if not np.allclose(_arrs[0], _arrs[1]):
-                            stat_omnibus_stat, omnibus_pv = sp_stats.wilcoxon(_arrs[0], _arrs[1])
+                    if _mixed is not None:
+                        stat_omnibus_stat, omnibus_pv = _mixed[0], _mixed[1]
+                        stat_omnibus_test = "mixed_lrt_log1p"
                     else:
-                        stat_omnibus_stat, omnibus_pv = sp_stats.friedmanchisquare(*_arrs)
+                        _arrs = [np.array(list(_subj_vals[eg].values()), dtype=float) for eg in egs]
+                        if len(_arrs) == 2:
+                            if not np.allclose(_arrs[0], _arrs[1]):
+                                omnibus_pv, stat_omnibus_test = SP.paired_pvalue(_arrs[0], _arrs[1])
+                                stat_omnibus_stat = float("nan")
+                        else:
+                            stat_omnibus_stat, omnibus_pv, stat_omnibus_test = SP.rm_omnibus_pvalue(_arrs)
                 except Exception:
                     omnibus_pv = None
                 if len(egs) > 2:
-                    _ph_pre = pairwise_posthoc({eg: _subj_vals[eg] for eg in egs}, paired=True)
+                    _ph_src = _lv if _mixed is not None else _subj_vals
+                    _ph_pre = pairwise_posthoc({eg: _ph_src[eg] for eg in egs if eg in _ph_src},
+                                               paired=True)
             elif SCIPY_OK:
                 kw_groups = [np.asarray(group_values[eg], dtype=float) for eg in egs]
                 if all(len(g) >= 1 for g in kw_groups) and any(len(g) >= 2 for g in kw_groups):
@@ -21869,8 +22313,7 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                 omnibus_pv = None
             stat_omnibus_pv = omnibus_pv
             if omnibus_pv is not None:
-                stars = ("***" if omnibus_pv < 0.001 else "**" if omnibus_pv < 0.01
-                         else "*" if omnibus_pv < 0.05 else "ns")
+                stars = SP.mark(omnibus_pv)
                 y = data_ceil + span * 0.08
                 x0, x1 = 0, len(egs) - 1
                 star_color = "#FF4081" if stars != "ns" else t["muted"]
@@ -21884,7 +22327,7 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                 else:
                     # >2 groups: the omnibus test belongs to no single pair, so
                     # a corner label — not a first-vs-last bracket.
-                    _lbl = "Friedman" if _subj_vals is not None else "KW"
+                    _lbl = ("RM" if (_subj_vals is not None or _mixed is not None) else "KW")
                     ax.text(0.02, 0.98, f"{_lbl} {stars}", transform=ax.transAxes,
                             ha="left", va="top", fontsize=8, color=star_color,
                             fontweight="bold" if stars != "ns" else "normal")
@@ -21909,18 +22352,35 @@ class ParadigmResultsPanel(ctk.CTkFrame):
         if hasattr(self, "_export_tables") and (stat_omnibus_pv is not None
                                                   or stat_posthoc_recs):
             stat_rows = []
+            _eff2 = {}
+            if len(egs) == 2:
+                try:
+                    if _subj_vals is not None:
+                        _sv = [np.array(list(_subj_vals[eg].values()), float) for eg in egs]
+                        _e, _lo, _hi = SP.paired_dz(_sv[0], _sv[1])
+                        _eff2 = {"effect_type": "paired_dz"}
+                    else:
+                        _e, _lo, _hi = SP.hedges_g(group_values[egs[0]], group_values[egs[1]])
+                        _eff2 = {"effect_type": "hedges_g"}
+                    _eff2.update(effect=_e, effect_ci_low=_lo, effect_ci_high=_hi)
+                except Exception:
+                    _eff2 = {}
             if stat_omnibus_pv is not None:
                 stat_rows.append({
                     "metric": ylabel, "group_a": "", "group_b": "",
                     "kw_stat": stat_omnibus_stat, "kw_p": stat_omnibus_pv,
-                    "posthoc_q": None,
+                    "posthoc_q": None, "omnibus_test": stat_omnibus_test,
+                    "tier": SP.tier(stat_omnibus_pv), **_eff2,
                 })
             for r in stat_posthoc_recs:
                 stat_rows.append({
                     "metric": ylabel,
                     "group_a": r.get("group_a"), "group_b": r.get("group_b"),
                     "kw_stat": stat_omnibus_stat, "kw_p": stat_omnibus_pv,
-                    "posthoc_q": r.get("q"),
+                    "posthoc_q": r.get("q"), "omnibus_test": stat_omnibus_test,
+                    "tier": SP.tier(r.get("q")), "posthoc_test": r.get("test", ""),
+                    "effect_type": r.get("effect_type", ""), "effect": r.get("effect"),
+                    "effect_ci_low": r.get("effect_lo"), "effect_ci_high": r.get("effect_hi"),
                 })
             if stat_rows:
                 self._export_tables.append(
@@ -21930,6 +22390,8 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                                                use_wilcoxon=use_wilcoxon)
             draw_one_sample_markers(ax, egs, os_df,
                                     [m + se + span * 0.03 for m, se in zip(means, sems)])
+            if hasattr(self, "_export_tables") and not os_df.empty:
+                self._export_tables.append((self._slugify(title) + "_one_sample", os_df))
         head_top = max(data_ceil + span * 0.35, bracket_top + span * 0.15)
         ax.set_ylim(bottom=data_floor - span * 0.08, top=head_top)
         ax.set_ylabel(ylabel, color=t["tick"], fontsize=tick_fontsize)
@@ -22757,10 +23219,9 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                     # is n_subjects * n_levels (data points), not subject count
                     # -- divide back out so the note reports the actual number
                     # of matched animals, not an inflated total.
-                    n_levels = len({a["exp_group"] for a in paired_animals}) or 1
-                    n_subj = int(r.get("n_present_total", 0)) // n_levels
-                    txt = (f"Paired pre/post test (n={n_subj} matched "
-                          f"subjects): stat={r['stat_kw']:.3g}, p={r['pval_kw']:.3g}")
+                    n_subj = int(paired_df.attrs.get("n_matched_subjects", 0))
+                    txt = (f"Paired pre/post test (n={n_subj} matched subjects, "
+                           f"{r.get('test_used', '')}): p={r['pval_kw']:.3g}")
                     if hasattr(self, "_export_tables"):
                         self._export_tables.append(
                             ("cpp_paired_pre_post_repeated_measures", paired_df))
@@ -22970,10 +23431,9 @@ class ParadigmResultsPanel(ctk.CTkFrame):
                         _compute_fn=_scalar_metric_compute_fn("freeze_pct"))
                     if not paired_df.empty:
                         r = paired_df.iloc[0]
-                        n_levels = len({a["exp_group"] for a in animal_rows}) or 1
-                        n_subj = int(r.get("n_present_total", 0)) // n_levels
+                        n_subj = int(paired_df.attrs.get("n_matched_subjects", 0))
                         txt = (f"Repeated-measures test across phases (n={n_subj} matched "
-                               f"subjects): stat={r['stat_kw']:.3g}, p={r['pval_kw']:.3g}")
+                               f"subjects, {r.get('test_used', '')}): p={r['pval_kw']:.3g}")
                         if hasattr(self, "_export_tables"):
                             self._export_tables.append(
                                 ("fc_cross_phase_repeated_measures", paired_df))
@@ -23197,6 +23657,8 @@ class ParadigmResultsPanel(ctk.CTkFrame):
             return 0
         out_dir.mkdir(parents=True, exist_ok=True)
         n = 0
+        if SP.write_policy(out_dir):
+            n += 1
         rows = []
         for s in with_env:
             row = {"session": s["name"], "exp_group": s["exp_group"],
@@ -23622,6 +24084,9 @@ class BSOiDApp(ctk.CTk):
         ctk.CTkOptionMenu(btns, variable=self._combined_design_var,
                           values=[DESIGN_AUTO, "Independent Groups", "Repeated Measures"],
                           width=170).pack(side="left", padx=2, pady=6)
+        ctk.CTkButton(btns, text="Stats options", width=100,
+                      command=lambda: open_stats_options_window(self),
+                      ).pack(side="left", padx=2, pady=6)
 
         # Scrollable plot area: tk.Canvas + vertical scrollbar
         self._scroll_canvas = tk.Canvas(
