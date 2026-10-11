@@ -2,7 +2,7 @@
 
 <img src="../CUBE_logo.png" alt="CUBE" width="260">
 
-# CUBE User Guide: Clustering of Unsupervised Behavioural Events
+# CUBE : Comprehensive Unsupervised Behavioral Explorer
 
 **From multi-camera video to 3D pose to unsupervised behaviour clusters to group statistics.**
 
