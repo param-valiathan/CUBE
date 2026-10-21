@@ -268,6 +268,44 @@ def select_representative(session_dicts: list[dict], cam_label: str) -> "Path | 
     return candidates[0][1]
 
 
+def _cam_fill_rate(sess: dict, cam_label: str) -> float:
+    """Fill rate of one session's corrected video for a camera (same source and fallback as select_representative)."""
+    report = sess.get("report")
+    if report and "cameras" in report:
+        for c in report["cameras"]:
+            if c["cam"] == cam_label and c.get("n_output_frames", 0) > 0:
+                return c.get("fills_inserted", 0) / c["n_output_frames"]
+    return 1.0
+
+
+def _pool_for_camera(session_dicts: list[dict], cam_label: str, pool_max: int, n_frames_fn=None) -> tuple:
+    """
+    Videos for the pooled adaptation of ONE camera (Smart Adapt v4): that camera's corrected videos ordered by fill rate (the same
+    key select_representative uses, so the representative is first), at most `pool_max`, existing files only. Also returns
+    {video: allowed-frame mask} with the duplicated 'fill' frames of each video marked not allowed.
+    Returns ([], {}) when the camera has no usable video.
+    """
+    import os
+    import cube_adapt_pseudo as _cap
+    cands = []
+    for sess in session_dicts:
+        mp4 = sess["cameras"].get(cam_label)
+        if mp4 is None or not os.path.isfile(str(mp4)):
+            continue
+        cands.append((_cam_fill_rate(sess, cam_label), str(mp4), sess))
+    cands.sort(key=lambda x: x[0])
+    cands = cands[:max(1, int(pool_max))]
+    if n_frames_fn is None:
+        n_frames_fn = lambda v: _cap._video_info(v)[1]
+    videos, masks = [], {}
+    for _fr, mp4, sess in cands:
+        videos.append(Path(mp4))
+        csv = sess.get("timestamps", {}).get(cam_label)
+        if csv is not None:
+            masks[Path(mp4)] = _cap.load_fill_mask(csv, n_frames_fn(mp4))
+    return videos, masks
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Fill-frame masking
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2633,9 +2671,11 @@ def _adapt_zoo_for_camera(rep_video: Path, cam_label: str,
                            sa_name: str, model_name: str, detector_name: str,
                            pcutoff: float, bbox_thr_adapt: float,
                            max_ind: int, inf_batch: int, det_batch: int,
-                           pseudo_thr: float, transfer: bool, _adv: dict):
+                           pseudo_thr: float, transfer: bool, _adv: dict, pool: "dict | None" = None):
     """
     Run DLC Zoo video adaptation on *rep_video*.
+    With `pool` ({'videos': [...], 'masks': {...}}) the pooled, filtered Smart Adapt v4 adaptation is tried first (this camera's
+    videos only); any failure falls through to the single-video adaptation below, unchanged.
     Returns (adapted_pose_ckpt, adapted_detector_ckpt, snapshot_base, adapt_project_dir)
     where the first available pair should be used for batch inference.
     """
@@ -2651,6 +2691,25 @@ def _adapt_zoo_for_camera(rep_video: Path, cam_label: str,
     adapted_pose_ckpt  = None
     adapted_det_ckpt   = None
     snapshot_base      = None
+
+    if pool and pool.get("videos"):
+        try:
+            import cube_adapt_pseudo as _cap
+            _pooled_dir = _cap.run_pooled_adaptation(
+                dlc, pool["videos"], cam_adapt_dir / "pooled_v4",
+                sa_name=sa_name, model_name=model_name, detector_name=detector_name,
+                bbox_thr=float(_adv.get("dlc_bbox_threshold", 0.6)), bbox_thr_adapt=bbox_thr_adapt,
+                max_ind=max_ind, inf_batch=inf_batch, det_batch=det_batch, det_epochs=detector_epochs,
+                pose_epochs=pose_epochs, pseudo_thr=pseudo_thr, transfer=transfer, logger=logger,
+                frame_masks=pool.get("masks"), pcutoff_base=0.1)
+            if _pooled_dir is not None:
+                _pp, _pd = _find_adapted_pt_checkpoints(_pooled_dir, model_name, detector_name, logger)
+                if _pp:
+                    logger.success(f"  [{cam_label}] Pooled (Smart Adapt v4) adaptation used.")
+                    return _pp, _pd, None, _pooled_dir
+                logger.warn(f"  [{cam_label}] Pooled adaptation produced no checkpoint; using single-video adaptation.")
+        except Exception:
+            logger.warn(f"  [{cam_label}] Pooled adaptation failed; using single-video adaptation:\n{traceback.format_exc()}")
 
     try:
         if hasattr(dlc, "create_video_adaptation_project"):
@@ -3266,7 +3325,7 @@ def _run_camera_adaptation_with_retry(
         inf_batch: int, det_batch: int, pseudo_thr: float, transfer: bool,
         _adv: dict, *, autodetect: bool, has_manual_override: bool,
         baseline_counts: dict, outlier_ratio: float, threshold_step: float,
-        max_retries: int, report_entry: dict):
+        max_retries: int, report_entry: dict, pool: "dict | None" = None):
     """
     Stage 2: wraps _adapt_zoo_for_camera in a post-hoc pseudo-label-count
     floor check + retry loop, mirroring the OOM-retry loop's shape but keyed
@@ -3284,7 +3343,7 @@ def _run_camera_adaptation_with_retry(
     result = _adapt_zoo_for_camera(
         rep_video, cam_label, adapt_work, logger, detector_epochs, pose_epochs,
         sa_name, model_name, detector_name, pcutoff, cur_thr, max_ind, inf_batch,
-        det_batch, pseudo_thr, transfer, _adv)
+        det_batch, pseudo_thr, transfer, _adv, pool=pool)
     pose_ckpt, det_ckpt, snap_base, adapt_dir = result
     count = _count_pseudo_label_images(adapt_dir)
     steps.append({"threshold": cur_thr, "count": count})
@@ -3307,7 +3366,7 @@ def _run_camera_adaptation_with_retry(
         result = _adapt_zoo_for_camera(
             rep_video, cam_label, adapt_work, logger, detector_epochs, pose_epochs,
             sa_name, model_name, detector_name, pcutoff, new_thr, max_ind, inf_batch,
-            det_batch, pseudo_thr, transfer, _adv)
+            det_batch, pseudo_thr, transfer, _adv, pool=pool)
         pose_ckpt, det_ckpt, snap_base, adapt_dir = result
         new_count = _count_pseudo_label_images(adapt_dir)
         steps.append({"threshold": new_thr, "count": new_count})
@@ -6446,6 +6505,14 @@ def _run_3d_dlc_step(session: dict, settings, logger, pb, after_fn: Callable):
                             "stage1_yield": None, "stage1_flagged": False,
                             "final_threshold_used": cam_bbox_thr_adapt})
 
+            _pool = None
+            if bool(session.get("dlc_3d_adapt_pooled", True)):
+                try:
+                    _pv, _pm = _pool_for_camera(sessions, cam_label, int(session.get("dlc_3d_adapt_pool_max", 4)))
+                    if _pv:
+                        _pool = dict(videos=_pv, masks=_pm)
+                except Exception as _pe:
+                    logger.warn(f"  [{cam_label}] Could not build the adaptation pool ({_pe}); single-video adaptation")
             pose_ckpt, det_ckpt, snap_base, adapt_dir = _run_camera_adaptation_with_retry(
                 rep_video, cam_label, adapt_work, logger,
                 detector_epochs, pose_epochs, sa_name, model_name, detector_name,
@@ -6456,7 +6523,7 @@ def _run_3d_dlc_step(session: dict, settings, logger, pb, after_fn: Callable):
                 outlier_ratio=baseline_outlier_ratio,
                 threshold_step=baseline_threshold_step,
                 max_retries=baseline_max_retries,
-                report_entry=report_entry)
+                report_entry=report_entry, pool=_pool)
 
             final_thr = report_entry.get("final_threshold_used", cam_bbox_thr_adapt)
             final_count = report_entry.get("final_pseudo_label_count")
@@ -6474,6 +6541,7 @@ def _run_3d_dlc_step(session: dict, settings, logger, pb, after_fn: Callable):
                 "det_ckpt":  det_ckpt,
                 "snap_base": snap_base,
                 "adapt_dir": str(adapt_dir) if adapt_dir else None,
+                "method": "pooled_v4" if (adapt_dir and Path(adapt_dir).name == "pooled_v4") else "single_video",
             }
             session["dlc_3d_models"] = models
             session["dlc_3d_bbox_threshold_report"] = bbox_report

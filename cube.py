@@ -673,6 +673,9 @@ class SessionState:
         dlc_3d_baseline_threshold_min   = 0.3,
         dlc_3d_baseline_max_retries     = 2,
         dlc_3d_bbox_threshold_report    = {},  # cached last Stage 1/2 report (see cube_3d_dlc.py)
+        # Smart Adapt v4 for the per-camera adaptation (2026-10-21): pool each camera's own videos, filter the pseudo-labels
+        dlc_3d_adapt_pooled             = True,
+        dlc_3d_adapt_pool_max           = 4,
         dlc_3d_calib_refine                       = True,
         dlc_3d_calib_refine_orthogonal            = True,
         dlc_3d_calib_refine_expected_angle_deg    = 90.0,
@@ -2555,12 +2558,10 @@ def _run_pooled_smart_adaptation(dlc, cv2, valid_entries, rep_entry, adapt_work:
     Smart Adapt v4 (default): adapt on pooled, filtered pseudo-labels from SAME-CAMERA videos (see cube_adapt_pseudo.py).
 
     "Same camera" = identical frame size as the representative video, nearest in brightness (up to `pool_max` videos).
-    Steps: base-model inference on the pool -> plausibility filter + pose-balanced frame selection + per-body-part
-    thresholds -> a COCO pseudo-label set that DeepLabCut's video-adapt training uses in place of its own.
+    The pooled adaptation itself is cube_adapt_pseudo.run_pooled_adaptation(), shared with the 3D per-camera adaptation.
     Returns the folder holding the adapted checkpoints, or None when the recipe does not apply (non-Quadruped schema, too few
     usable frames) or fails -- the caller then runs standard single-video adaptation exactly as before.
     """
-    import traceback as _tb
     try:
         import cube_adapt_pseudo as cap_mod
         rep_path, _rs, rep_b = rep_entry
@@ -2573,53 +2574,14 @@ def _run_pooled_smart_adaptation(dlc, cv2, valid_entries, rep_entry, adapt_work:
         same = [e for e in valid_entries if e[0] != rep_path and _size(e[0]) == rep_size]
         same.sort(key=lambda e: abs(e[2] - rep_b))
         pool = [rep_entry] + same[:max(0, pool_max - 1)]
-        logger.info(f"  Pooled adaptation: {len(pool)} same-camera video(s) "
-                    f"({rep_size[0]}x{rep_size[1]}) -> {[Path(e[0]).name for e in pool]}")
-
-        root = adapt_work / "pooled_v4"
-        root.mkdir(parents=True, exist_ok=True)
-        base_dir = root / "base"
-        base_dir.mkdir(exist_ok=True)
-        preds = []
-        for e in pool:
-            vp = e[0]
-            js, h5 = cap_mod.find_prediction_files(str(base_dir), vp)
-            if not (js and h5):
-                logger.info(f"  Base-model inference on {Path(vp).name} (labels to be filtered) ...")
-                dlc.video_inference_superanimal(
-                    [vp], superanimal_name=sa_name, model_name=model_name, detector_name=detector_name,
-                    video_adapt=False, pcutoff=pcutoff_base, bbox_threshold=bbox_thr, max_individuals=max_ind,
-                    batch_size=inf_batch, detector_batch_size=det_batch, dest_folder=str(base_dir),
-                    create_labeled_video=False, plot_bboxes=False, device="auto")
-                js, h5 = cap_mod.find_prediction_files(str(base_dir), vp)
-            preds.append((vp, h5, js))
-        info = cap_mod.build_pooled_pseudo_dataset(preds, str(root), bbox_thr=bbox_thr_adapt,
-                                                   log=lambda m: logger.info(m))
-        if info is None:
-            return None
-        seed = root / "seed.mp4"
-        _sa_kw = dict(
-            superanimal_name=sa_name, model_name=model_name, detector_name=detector_name, video_adapt=True,
-            pcutoff=pcutoff_base, pseudo_threshold=pseudo_thr, bbox_threshold=bbox_thr_adapt, max_individuals=max_ind,
-            batch_size=inf_batch, detector_batch_size=det_batch, detector_epochs=det_epochs, pose_epochs=pose_epochs,
-            dest_folder=str(root / "adapt_out"), create_labeled_video=False, plot_bboxes=False, device="auto")
-        try:
-            import inspect as _insp
-            _sig = _insp.signature(dlc.video_inference_superanimal).parameters
-            if "superanimal_transfer_learning" in _sig:
-                _sa_kw["superanimal_transfer_learning"] = transfer
-            if "video_adapt_batch_size" in _sig:
-                _sa_kw["video_adapt_batch_size"] = inf_batch
-        except Exception:
-            pass
-        logger.info(f"  Adapting on {info['selected']} pooled, filtered pseudo-label frames "
-                    f"({pose_epochs} pose / {det_epochs} detector epochs) ...")
-        dlc.video_inference_superanimal([str(seed)], **_sa_kw)
-        logger.success("  Pooled adaptation complete.")
-        return root
+        return cap_mod.run_pooled_adaptation(
+            dlc, [e[0] for e in pool], adapt_work / "pooled_v4",
+            sa_name=sa_name, model_name=model_name, detector_name=detector_name, bbox_thr=bbox_thr,
+            bbox_thr_adapt=bbox_thr_adapt, max_ind=max_ind, inf_batch=inf_batch, det_batch=det_batch,
+            det_epochs=det_epochs, pose_epochs=pose_epochs, pseudo_thr=pseudo_thr, transfer=transfer,
+            logger=logger, pcutoff_base=pcutoff_base)
     except Exception as exc:
         logger.warn(f"  Pooled adaptation unavailable ({exc}); falling back to standard single-video adaptation.")
-        logger.info(_tb.format_exc())
         return None
 
 
@@ -8032,6 +7994,26 @@ class ThreeDSettingsWindow(tk.Toplevel):
             lbl.pack(anchor="w")
             self._crop_lbls[cam] = lbl
 
+        # ── Smart Adapt v4: pooled adaptation labels ─────────────────────────────
+        _hdr("Pooled Adaptation Labels (Smart Adapt v4)", default_open=False)
+        self._adapt_pooled = tk.BooleanVar(
+            value=bool(session.get("dlc_3d_adapt_pooled", True)))
+        row = _row("Adapt each camera on pooled, filtered labels:")
+        tk.Checkbutton(row, variable=self._adapt_pooled, bg=C["bg"],
+                       fg=C["text"], selectcolor=C["card"],
+                       activebackground=C["bg"]).pack(side="left")
+        self._adapt_pool_max = tk.StringVar(
+            value=str(session.get("dlc_3d_adapt_pool_max", 4)))
+        row = _row("Videos pooled per camera (default 4):")
+        tk.Entry(row, textvariable=self._adapt_pool_max, width=6,
+                 bg=C["card2"], fg=C["text"], insertbackground=C["text"],
+                 relief="flat", font=("Segoe UI", 9)).pack(side="left")
+        tk.Label(_cur_sec["body"],
+                 text="  Uses only that camera's own videos (never mixes cameras); off = adapt on one representative video. "
+                      "A camera already adapted in a previous run is reused: delete 3d_adapt_workspace/adapt_<cam> to redo it.",
+                 font=("Segoe UI", 8), bg=C["bg"], fg=C["subtext"],
+                 wraplength=520, justify="left").pack(anchor="w", padx=10, pady=(0, 4))
+
         # ── Auto-detect starved cameras ──────────────────────────────────────────
         _hdr("Auto-Detect Starved Cameras", default_open=False)
         self._baseline_autodetect = tk.BooleanVar(
@@ -8428,6 +8410,11 @@ class ThreeDSettingsWindow(tk.Toplevel):
             s["dlc_3d_baseline_threshold_step"] = float(self._baseline_threshold_step.get())
         except ValueError:
             s["dlc_3d_baseline_threshold_step"] = 0.1
+        s["dlc_3d_adapt_pooled"] = bool(self._adapt_pooled.get())
+        try:
+            s["dlc_3d_adapt_pool_max"] = max(1, int(float(self._adapt_pool_max.get())))
+        except ValueError:
+            s["dlc_3d_adapt_pool_max"] = 4
         self.destroy()
 
 

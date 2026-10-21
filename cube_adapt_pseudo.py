@@ -185,12 +185,16 @@ def per_bp_thresholds(preds, lo=0.25, hi=0.6, default=0.4):
     return thr
 
 
-def select_frames(preds, budget=360, k_clusters=20, stride=3, min_conf_bps=18, bbox_thr=0.75, seed=0):
+def select_frames(preds, budget=360, k_clusters=20, stride=3, min_conf_bps=18, bbox_thr=0.75, seed=0, frame_masks=None):
+    """frame_masks: optional {video key: bool array} of ALLOWED frames (e.g. False on the duplicated 'fill' frames of a corrected video)."""
     from sklearn.cluster import KMeans
     rows, feats = [], []
     for p in preds:
         P = p["P"]; bi = P["bi"]; T = P["X"].shape[0]
+        allowed = (frame_masks or {}).get(p["key"])
         for t in range(0, min(T, len(p["json"])), stride):
+            if allowed is not None and (t >= len(allowed) or not allowed[t]):
+                continue
             if p["json"][t]["bbox_scores"][0] < bbox_thr:
                 continue
             conf = P["L"][t] >= LL_GATE
@@ -271,12 +275,28 @@ def make_seed_clip(path, src, n=30):
     vw.release(); cap.release()
 
 
-def build_pooled_pseudo_dataset(base_predictions, root, bbox_thr=0.75, budget=360, log=print):
+def load_fill_mask(csv_path, n_frames):
+    """Allowed-frame mask for a corrected video: False where the timestamps CSV marks a duplicated 'fill' frame (4th column).
+    A missing/unreadable CSV allows every frame; the length is reconciled to n_frames (pad allowed / truncate)."""
+    allowed = np.ones(int(n_frames), bool)
+    try:
+        data = np.genfromtxt(str(csv_path), delimiter=",", skip_header=1)
+        fill = np.atleast_2d(data)[:, 3].astype(bool)
+    except Exception:
+        return allowed
+    n = min(len(fill), len(allowed))
+    allowed[:n] = ~fill[:n]
+    return allowed
+
+
+def build_pooled_pseudo_dataset(base_predictions, root, bbox_thr=0.75, budget=360, log=print, frame_masks=None):
     """
     base_predictions: list of (video_path, h5_path, json_path) from base-model inference on same-camera videos.
+    frame_masks: optional {video_path: bool array of allowed frames}.
     Writes <root>/seed.mp4 and <root>/pseudo_seed/{annotations,images} (DeepLabCut then skips building its own).
     Returns a stats dict, or None when the recipe does not apply (unsupported schema / too few usable frames).
     """
+    keyed_masks = {os.path.splitext(os.path.basename(v))[0]: m for v, m in (frame_masks or {}).items()}
     os.makedirs(root, exist_ok=True)
     preds = [load_prediction(v, h, j) for v, h, j in base_predictions if h and j]
     if not preds or not schema_supported(preds[0]["P"]["bps"]):
@@ -286,7 +306,7 @@ def build_pooled_pseudo_dataset(base_predictions, root, bbox_thr=0.75, budget=36
     log(f"  A1: scoring {len(preds)} video(s) for implausible base-model labels (spike / Hampel / optical flow / paw swap)")
     flags = {p["key"]: a1_flags(p, cache_dir) for p in preds}
     thr = per_bp_thresholds(preds)
-    sel, info = select_frames(preds, budget=budget, bbox_thr=bbox_thr)
+    sel, info = select_frames(preds, budget=budget, bbox_thr=bbox_thr, frame_masks=keyed_masks)
     if len(sel) < 20:
         log(f"  pooled pseudo-labels: only {len(sel)} usable frames - using standard adaptation")
         return None
@@ -299,3 +319,82 @@ def build_pooled_pseudo_dataset(base_predictions, root, bbox_thr=0.75, budget=36
     log(f"  A2/A3: {info['selected']} frames from {len(preds)} video(s); {st['kp_kept']}/{st['kp_total']} keypoints kept "
         f"({st['kp_flagged']} removed by the plausibility filter, {st['kp_below_thr']} below their per-body-part threshold)")
     return info
+
+
+# ----------------------------------------------------------------------------- orchestration (shared by 2D Smart Adapt and the 3D per-camera adaptation)
+def _video_info(path):
+    import cv2
+    c = cv2.VideoCapture(str(path))
+    size = (int(c.get(cv2.CAP_PROP_FRAME_WIDTH)), int(c.get(cv2.CAP_PROP_FRAME_HEIGHT))); n = int(c.get(cv2.CAP_PROP_FRAME_COUNT)); c.release()
+    return size, n
+
+
+def prediction_cache_valid(video_path, h5_path, json_path):
+    """A cached base-model prediction is reused only if its frame count matches the video (a stale or truncated file is recomputed)."""
+    try:
+        if not (h5_path and json_path and os.path.isfile(h5_path) and os.path.isfile(json_path)):
+            return False
+        _, n = _video_info(video_path)
+        return abs(len(pd.read_hdf(str(h5_path))) - n) <= 1
+    except Exception:
+        return False
+
+
+def run_pooled_adaptation(dlc, videos, root, *, sa_name, model_name, detector_name, bbox_thr, bbox_thr_adapt, max_ind, inf_batch, det_batch,
+                          det_epochs, pose_epochs, pseudo_thr, transfer, logger, frame_masks=None, pcutoff_base=0.1):
+    """
+    Pooled, filtered adaptation for ONE camera. `videos` are same-camera videos with the preferred one first; a video whose frame size
+    differs from the first is dropped. Base-model predictions are cached under <root>/base and reused (any bbox_thr_adapt change only
+    redoes the frame selection, never the inference). Returns the folder holding the adapted checkpoints (<root>), or None when the recipe
+    does not apply or fails -- the caller then runs its standard single-video adaptation. Never raises.
+    """
+    import traceback
+    try:
+        root = os.fspath(root); os.makedirs(root, exist_ok=True)
+        videos = [os.fspath(v) for v in videos if os.path.isfile(os.fspath(v))]
+        if not videos:
+            return None
+        size0, _ = _video_info(videos[0]); pool = [videos[0]]
+        for v in videos[1:]:
+            if _video_info(v)[0] == size0:
+                pool.append(v)
+            else:
+                logger.warn(f"  Pooled adaptation: skipping {os.path.basename(v)} (frame size differs from {os.path.basename(videos[0])})")
+        logger.info(f"  Pooled adaptation: {len(pool)} same-camera video(s) ({size0[0]}x{size0[1]}) -> {[os.path.basename(v) for v in pool]}")
+        base_dir = os.path.join(root, "base"); os.makedirs(base_dir, exist_ok=True)
+        preds = []
+        for vp in pool:
+            js, h5 = find_prediction_files(base_dir, vp)
+            if not prediction_cache_valid(vp, h5, js):
+                logger.info(f"  Base-model inference on {os.path.basename(vp)} (labels to be filtered) ...")
+                dlc.video_inference_superanimal(
+                    [vp], superanimal_name=sa_name, model_name=model_name, detector_name=detector_name, video_adapt=False,
+                    pcutoff=pcutoff_base, bbox_threshold=bbox_thr, max_individuals=max_ind, batch_size=inf_batch, detector_batch_size=det_batch,
+                    dest_folder=base_dir, create_labeled_video=False, plot_bboxes=False, device="auto")
+                js, h5 = find_prediction_files(base_dir, vp)
+            preds.append((vp, h5, js))
+        info = build_pooled_pseudo_dataset(preds, root, bbox_thr=bbox_thr_adapt, log=logger.info, frame_masks=frame_masks)
+        if info is None:
+            return None
+        sa_kw = dict(superanimal_name=sa_name, model_name=model_name, detector_name=detector_name, video_adapt=True, pcutoff=pcutoff_base,
+                     pseudo_threshold=pseudo_thr, bbox_threshold=bbox_thr_adapt, max_individuals=max_ind, batch_size=inf_batch,
+                     detector_batch_size=det_batch, detector_epochs=det_epochs, pose_epochs=pose_epochs, dest_folder=os.path.join(root, "adapt_out"),
+                     create_labeled_video=False, plot_bboxes=False, device="auto")
+        try:
+            import inspect
+            sig = inspect.signature(dlc.video_inference_superanimal).parameters
+            if "superanimal_transfer_learning" in sig:
+                sa_kw["superanimal_transfer_learning"] = transfer
+            if "video_adapt_batch_size" in sig:
+                sa_kw["video_adapt_batch_size"] = inf_batch
+        except Exception:
+            pass
+        logger.info(f"  Adapting on {info['selected']} pooled, filtered pseudo-label frames ({pose_epochs} pose / {det_epochs} detector epochs) ...")
+        dlc.video_inference_superanimal([os.path.join(root, "seed.mp4")], **sa_kw)
+        logger.success("  Pooled adaptation complete.")
+        from pathlib import Path
+        return Path(root)
+    except Exception as exc:
+        logger.warn(f"  Pooled adaptation unavailable ({exc}); falling back to standard single-video adaptation.")
+        logger.info(traceback.format_exc())
+        return None
