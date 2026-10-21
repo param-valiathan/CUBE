@@ -19269,6 +19269,121 @@ def _interpolate_short_gaps(x: "np.ndarray", y: "np.ndarray", ll: "np.ndarray",
     return xf, yf, llf, filled
 
 
+def _body_scale_px(all_x, all_y, all_ll, bps, gate) -> float:
+    """Per-video body scale in pixels: median neck_base-back_end length when those exist, else 0.45 x the median diagonal of the
+    confident points' bounding box (the two agree to within a few percent on SuperAnimal-Quadruped mice)."""
+    try:
+        if "neck_base" in bps and "back_end" in bps:
+            a, b = bps.index("neck_base"), bps.index("back_end")
+            ok = (all_ll[:, a] >= gate) & (all_ll[:, b] >= gate)
+            if ok.sum() > 50:
+                return float(np.nanmedian(np.hypot(all_x[ok, a] - all_x[ok, b], all_y[ok, a] - all_y[ok, b])))
+        conf = all_ll >= gate
+        xs = np.where(conf, all_x, np.nan); ys = np.where(conf, all_y, np.nan)
+        with np.errstate(all="ignore"):
+            diag = np.hypot(np.nanmax(xs, 1) - np.nanmin(xs, 1), np.nanmax(ys, 1) - np.nanmin(ys, 1))
+        return 0.45 * float(np.nanmedian(diag))
+    except Exception:
+        return float("nan")
+
+
+# Head points: if two or more are flagged together in one frame, the remaining head points that also sit far from their own
+# recent position are flagged too (a whole head detected on the wrong object, e.g. a person's face behind the cage).
+_HEAD_GATE_NAMES = ("nose", "upper_jaw", "lower_jaw", "left_eye", "right_eye")
+
+
+def _temporal_gate_flags(all_x, all_y, all_ll, bps, torso_px, gate=0.4, half_window=8, iters=3,
+                         pct=98.0, mult=1.3, floor_frac=0.15):
+    """
+    Per-body-part temporal plausibility gate (2026-10-21, Smart Adapt v4 validation; see DLC_ADAPTATION_IMPROVEMENT_PLAN.md).
+    A confident point is flagged when it lies further than its OWN learned limit from that body part's median position over the
+    surrounding +-half_window frames (confident points only; the reference is recomputed `iters` times without the flagged points so a
+    bad stretch cannot drag its own reference). limit = max(floor_frac x body scale, mult x the pct-th percentile of that body part's
+    deviations in this video). Catches the detector flipping a point between the animal and something else. Returns (n, nbp) bool.
+    """
+    import pandas as _pd
+    n, nbp = all_x.shape
+    flag = np.zeros((n, nbp), bool)
+    lim = np.full(nbp, np.nan)
+    dev_all = np.full((n, nbp), np.nan)
+    w = 2 * half_window + 1
+
+    def _ref(v, ok):
+        return _pd.Series(np.where(ok, v, np.nan)).rolling(w, center=True, min_periods=5).median().values
+
+    for k in range(nbp):
+        conf = all_ll[:, k] >= gate
+        if conf.sum() < 200:
+            continue
+        ok = conf.copy()
+        d = None
+        for _ in range(iters):
+            d = np.hypot(all_x[:, k] - _ref(all_x[:, k], ok), all_y[:, k] - _ref(all_y[:, k], ok)) / torso_px
+            c = conf & np.isfinite(d)
+            if c.sum() < 100 or (c & ok).sum() <= 50:
+                break
+            lim[k] = max(floor_frac, mult * float(np.percentile(d[c & ok], pct)))
+            ok = conf & ~(c & (d > lim[k]))
+        if d is None or not np.isfinite(lim[k]):
+            continue
+        dev_all[:, k] = d
+        flag[:, k] = conf & np.isfinite(d) & (d > lim[k])
+    hk = [bps.index(h) for h in _HEAD_GATE_NAMES if h in bps]
+    if len(hk) >= 2:
+        two = flag[:, hk].sum(1) >= 2
+        for k in hk:
+            if np.isfinite(lim[k]):
+                flag[:, k] |= two & (all_ll[:, k] >= gate) & np.isfinite(dev_all[:, k]) & (dev_all[:, k] > 0.5 * lim[k])
+    return flag
+
+
+def _find_bbox_json(h5_path):
+    """DLC's per-frame detector boxes saved beside the pose H5 (video_inference_superanimal writes <stem>_before_adapt.json)."""
+    try:
+        h5_path = Path(h5_path)
+        cand = h5_path.with_name(h5_path.stem + "_before_adapt.json")
+        if cand.is_file():
+            return cand
+        for p in sorted(h5_path.parent.glob(h5_path.stem + "*.json")):
+            return p
+    except Exception:
+        pass
+    return None
+
+
+def _bbox_gate_flags(h5_path, all_x, all_y, all_ll, torso_px, gate=0.4, pct=99.0, mult=1.3, floor_frac=0.03):
+    """
+    Detector-box gate: a confident point lying outside DLC's own bounding box of the animal (by more than that body part's learned
+    margin: mult x the pct-th percentile of its outside-distance, floor floor_frac x body scale) is flagged. Independent of every other
+    keypoint, so it still works when a whole group of points (e.g. the head) has gone to the wrong object together. Needs the
+    detector json beside the H5; without it nothing is flagged.
+    """
+    import json as _json
+    n, nbp = all_x.shape
+    flag = np.zeros((n, nbp), bool)
+    js = _find_bbox_json(h5_path)
+    if js is None:
+        return flag
+    try:
+        J = _json.load(open(js))
+    except Exception:
+        return flag
+    B = np.full((n, 4), np.nan)
+    for i in range(min(n, len(J))):
+        bb, sc = J[i].get("bboxes", []), J[i].get("bbox_scores", [])
+        if len(bb):
+            B[i] = bb[int(np.argmax(sc)) if len(sc) else 0][:4]
+    l, t, r, b_ = B[:, 0], B[:, 1], B[:, 0] + B[:, 2], B[:, 1] + B[:, 3]
+    for k in range(nbp):
+        e = np.maximum.reduce([l - all_x[:, k], all_x[:, k] - r, t - all_y[:, k], all_y[:, k] - b_, np.zeros(n)])
+        c = (all_ll[:, k] >= gate) & np.isfinite(e)
+        if c.sum() < 200:
+            continue
+        lim = max(floor_frac * torso_px, mult * float(np.percentile(e[c], pct)))
+        flag[:, k] = c & (e > lim)
+    return flag
+
+
 def dlc_filter_extra_kwargs(adv_cfg: dict) -> dict:
     """
     Resolves the three additive filter_dlc_h5 data-quality passes (slow-
@@ -19287,6 +19402,9 @@ def dlc_filter_extra_kwargs(adv_cfg: dict) -> dict:
         offbody_margin_frac=float(adv_cfg.get("dlc_offbody_margin_frac", 0.8)),
         gap_interp_enabled=bool(adv_cfg.get("dlc_gap_interp", True)),
         gap_interp_max_frames=int(adv_cfg.get("dlc_gap_interp_max_frames", 5)),
+        temporal_gate_enabled=bool(adv_cfg.get("dlc_temporal_gate", True)),
+        bbox_gate_enabled=bool(adv_cfg.get("dlc_bbox_gate", True)),
+        fill_conf_cap_enabled=bool(adv_cfg.get("dlc_fill_conf_cap", True)),
     )
 
 
@@ -19299,7 +19417,10 @@ def filter_dlc_h5(h5_path: Path, filter_types: list, log_fn=print,
                   offbody_gate_enabled: bool = True,
                   offbody_margin_frac: float = 0.6,
                   gap_interp_enabled: bool = True,
-                  gap_interp_max_frames: int = 5) -> "Path | None":
+                  gap_interp_max_frames: int = 5,
+                  temporal_gate_enabled: bool = True,
+                  bbox_gate_enabled: bool = True,
+                  fill_conf_cap_enabled: bool = True) -> "Path | None":
     """
     Apply a jitter-removal filter pipeline to a DLC H5 pose file; save as
     <stem>_filtered.h5. Supports: median, gaussian, butterworth, savgol,
@@ -19380,7 +19501,8 @@ def filter_dlc_h5(h5_path: Path, filter_types: list, log_fn=print,
         all_x, all_y, all_ll = None, None, None
         need_offbody_arrays = offbody_gate_enabled and len(bps) >= 4
         need_speed_arrays = slow_bp_extra_smoothing and len(bps) >= 2
-        if need_offbody_arrays or need_speed_arrays:
+        need_gate_arrays = (temporal_gate_enabled or bbox_gate_enabled) and len(bps) >= 4
+        if need_offbody_arrays or need_speed_arrays or need_gate_arrays:
             try:
                 n = len(result)
                 all_x = np.full((n, len(bps)), np.nan)
@@ -19397,6 +19519,23 @@ def filter_dlc_h5(h5_path: Path, filter_types: list, log_fn=print,
             except Exception as e:
                 log_fn(f"  [WARN] off-body/speed-score array setup failed, skipping both: {e}")
                 all_x = None
+        # Per-body-part temporal gate + detector-box gate (2026-10-21): flag confident-but-implausible points BEFORE
+        # run-building and gap filling, so a wrong detection is never a median-run member, a gap-fill anchor, or an off-body-box anchor.
+        gate_flags = None
+        if need_gate_arrays and all_x is not None:
+            try:
+                _gate_ll = max(float(likelihood_thresh), 0.4)
+                _torso_px = _body_scale_px(all_x, all_y, all_ll, bps, _gate_ll)
+                if np.isfinite(_torso_px) and _torso_px > 5:
+                    gate_flags = np.zeros(all_x.shape, bool)
+                    if temporal_gate_enabled:
+                        gate_flags |= _temporal_gate_flags(all_x, all_y, all_ll, bps, _torso_px, gate=_gate_ll)
+                    if bbox_gate_enabled:
+                        gate_flags |= _bbox_gate_flags(h5_path, all_x, all_y, all_ll, _torso_px, gate=_gate_ll)
+                    all_ll = np.where(gate_flags, 0.0, all_ll)
+            except Exception as e:
+                log_fn(f"  [WARN] temporal/bbox gate failed, skipping it: {e}")
+                gate_flags = None
         # Use likelihood_thresh itself (not a raised floor) -- real per-frame
         # simultaneous confidence on this rig is often too sparse to clear a
         # stricter bar; min_anchor_pts (inside _offbody_flags) is what keeps
@@ -19415,6 +19554,7 @@ def filter_dlc_h5(h5_path: Path, filter_types: list, log_fn=print,
                 log_fn(f"  [WARN] speed-score computation failed, using neutral 0.5: {e}")
 
         _total_offbody = 0
+        _total_gated = 0
         _total_filled = 0
         _worst_bp = None
         _worst_bp_total = -1
@@ -19429,6 +19569,11 @@ def filter_dlc_h5(h5_path: Path, filter_types: list, log_fn=print,
             except Exception:
                 lik = np.ones(len(result))
             good = np.nan_to_num(lik, nan=-1.0) >= likelihood_thresh
+            if gate_flags is not None:
+                _gf = gate_flags[:, bi]
+                _total_gated += int((_gf & good).sum())
+                good = good & ~_gf
+                lik = np.where(_gf, 0.0, lik)
 
             offbody_count = 0
             offbody_flags_bp = None
@@ -19464,6 +19609,10 @@ def filter_dlc_h5(h5_path: Path, filter_types: list, log_fn=print,
                     x_filled, y_filled, lik_filled, filled_mask = _interpolate_short_gaps(
                         x_raw, y_raw, lik, good, max_gap=gap_interp_max_frames)
                     filled_count = int(filled_mask.sum())
+                    if fill_conf_cap_enabled and filled_count:
+                        # A bridged position is never reported as a confident detection at the universal display/analysis
+                        # cut-off (DISPLAY_LL_THRESHOLD): it stays in the data but is not drawn or trained on as "confident".
+                        lik_filled = np.where(filled_mask, np.minimum(lik_filled, DISPLAY_LL_THRESHOLD - 0.01), lik_filled)
                 except Exception as e:
                     log_fn(f"  [WARN] gap interpolation failed for {bp}, skipping it: {e}")
                     x_filled, y_filled, lik_filled = x_raw, y_raw, lik
@@ -19513,9 +19662,9 @@ def filter_dlc_h5(h5_path: Path, filter_types: list, log_fn=print,
                 if _bp_total > _worst_bp_total:
                     _worst_bp_total, _worst_bp = _bp_total, bp
 
-        if _total_offbody or _total_filled:
+        if _total_offbody or _total_filled or _total_gated:
             _worst = f", worst: {_worst_bp}" if _worst_bp else ""
-            log_fn(f"  Data-quality pass: off-body-flagged={_total_offbody}  "
+            log_fn(f"  Data-quality pass: temporal/box-gated={_total_gated}  off-body-flagged={_total_offbody}  "
                    f"gap-interpolated={_total_filled}  (across {len(bps)} bodyparts{_worst})")
 
         result.to_hdf(str(out_path), key="df_with_missing", mode="w", format="fixed")

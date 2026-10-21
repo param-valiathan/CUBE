@@ -218,24 +218,45 @@ CUBE uses DeepLabCut's **SuperAnimal-Quadruped** foundation model (default pose 
 A pretrained model has never seen your arena, lighting, or camera angle. **Video adaptation** fine-tunes the detector and pose network on *pseudo-labels*, which are the model's own confident predictions on your video. Only predictions above `pseudo_threshold` are used, so the network specialises to your domain without hand labelling. After adaptation, the whole batch is run with the adapted weights.
 
 > [!NOTE]
-> **Smart Adapt (default on)** adapts **once** on a single representative video, not on every video. CUBE decodes and validates every video, quarantines unreadable files to an `errors/` folder, computes each video's median pixel brightness, and picks the video closest to the median brightness. The adapted weights are then reused for all videos. This costs one adaptation instead of N, and assumes the videos share arena and lighting. If your sessions differ strongly (different cages, camera moved), turn Smart Adapt off.
+> **Smart Adapt (default on, v4)** adapts **once** and reuses the adapted weights for every video. CUBE decodes and validates every video, quarantines unreadable files to an `errors/` folder, computes each video's median pixel brightness, and picks the video closest to the median as the representative. With **Pooled labels** on (`dlc_smart_adapt_pooled`, the default) it then builds the adaptation set from up to six same-camera videos and cleans the pseudo-labels first, as described in the next section. With it off, the adaptation uses every confident label of the representative video only (the v3 behaviour). Either way this costs one adaptation instead of N, and assumes the videos share arena and lighting. If your sessions differ strongly (different cages, camera moved), turn Smart Adapt off.
 
 ```mermaid
 flowchart TD
     V[Videos in selected folders] --> R[Resize: long edge 1280 default]
     R --> S{Smart Adapt?}
     S -- yes --> SA[Pick representative video<br/>median brightness]
-    SA --> AD[Zoo video adaptation<br/>detector 10 ep, pose 30 ep]
+    SA --> PO{Pooled labels?}
+    PO -- yes --> PL[Pool same-camera videos, base-model labels,<br/>plausibility filter, pose-balanced frames,<br/>per-bodypart thresholds]
+    PO -- no --> AD
+    PL --> AD[Zoo video adaptation<br/>detector 10 ep, pose 30 ep]
     S -- no --> PV[Adapt per video if Video adapt on]
     AD --> INF[Batch inference on all videos]
     PV --> INF
-    INF --> RAW[raw DLC H5]
-    RAW --> F1[Off-body gate]
-    F1 --> F2[Short-gap interpolation]
+    INF --> RAW[raw DLC H5 + detector json]
+    RAW --> F0[Temporal gate, head-group check,<br/>detector-box gate]
+    F0 --> F1[Off-body gate]
+    F1 --> F2[Short-gap interpolation,<br/>fill likelihood capped]
     F2 --> F3[Adaptive median/gaussian smoothing]
     F3 --> FH[_filtered.h5]
     FH --> OV[Labeled video overlay + legend PNG]
 ```
+
+<a id="smart-adapt-v4-pooled-filtered-pseudo-labels"></a>
+
+### 🧬 Smart Adapt v4: pooled, filtered pseudo-labels
+
+Standard adaptation trains on *every* confident prediction of one video. About one confident prediction in eight is wrong in our checks, and a wrong pseudo-label teaches the network its own mistake. With `dlc_smart_adapt_pooled` on (default) CUBE builds a cleaner set in `cube_adapt_pseudo.py` before the usual DeepLabCut `video_adapt` training (CUBE writes the COCO annotations and images; DeepLabCut then skips building its own).
+
+1. **Pool same-camera videos.** The representative video plus up to `dlc_smart_adapt_pool_max - 1` (default 5) others with the identical frame size, nearest in brightness. Different cameras or sizes are never mixed.
+2. **Base-model labels.** The unadapted model tracks each pooled video (`pcutoff 0.1`, `bbox_threshold 0.6`).
+3. **Plausibility filter (A1).** A keypoint is removed when its track is implausible, with a ±1-frame margin: an out-and-back **spike** (neighbours agree, the point does not; ratio 3), a **Hampel** outlier (robust z above 8 against a 7-frame median), an **optical-flow** disagreement (the pixels under the label, tracked by Lucas-Kanade between neighbouring frames, move differently from the label by more than 0.07 × the median torso length in both directions), or a **left/right paw swap**. Spike, Hampel and swap checks cover the 24 mouse bodyparts, optical flow the 12 informative ones (nose, jaws, eyes, neck base, back end, tail base, four paws).
+4. **Pose-balanced frames (A2).** Frames with at least 18 confident bodyparts and a detector box score of at least 0.75 (every third frame) are clustered by body pose (k-means, 20 clusters); 360 frames are drawn evenly across clusters, so a rare posture counts as much as the common one.
+5. **Per-bodypart thresholds (A3).** Each of the 24 mouse bodyparts is kept above `clip(p40 of its own confidence, 0.25, 0.6)`; the 15 SuperAnimal keypoints with no mouse anatomy keep 0.4. A filtered or sub-threshold keypoint is written as unlabelled, not as a wrong label.
+6. **Adapt.** DeepLabCut fine-tunes on those frames (`dlc_det_epochs` 10, `dlc_pose_epochs` 30). Checkpoints are found in `smart_adapt_workspace/<model>/pooled_v4/`; `pooled_pseudo_report.json` there records frame counts, kept and removed keypoints and every threshold.
+
+**Fallback.** If the model is not SuperAnimal-Quadruped (the recipe needs its bodypart names), fewer than 20 usable frames are found, or any step raises, CUBE logs it and runs the v3 single-video adaptation instead.
+
+**What it was tested against.** Two held-out videos of one camera (3,620 frames each), against standard single-video adaptation trained identically, both passed through CUBE's earlier filter: median frame-to-frame jitter 5 to 10% lower, 95th percentile 7 to 9% lower, one-frame jumps above a quarter torso length 1.17% to 0.92% and 0.97% to 0.84% of labels, and about 0.3 fewer confident main bodyparts per frame (of 12). In a manual side-by-side review of 55 frames where the models disagreed most, the pooled model (Z1) was picked as most accurate in 21 and the standard model in 25 (ties count for each; pooled-only 14, standard-only 27, both 13), which is not a significant difference. The recipe is steadier, not demonstrably more accurate. A refresh round (re-labelling with the adapted model and retraining) was also tried; it cost coverage (about 1.2 fewer confident bodyparts per frame) without a better review result and is not part of the default. The testbed and results are in `DLC_ADAPTATION_IMPROVEMENT_PLAN.md` (not published). Differences from the testbed: CUBE also applies its BatchNorm-unfreeze patch during adaptation, and the optical-flow limit is scaled to the torso length.
 
 ### 🔧 Main DLC settings (DLC and Prep panel)
 
@@ -244,6 +265,7 @@ flowchart TD
 | `dlc_resolution` | `Long-edge 1280 (720p equivalent)` | more pixels per paw/ear, slower, more VRAM | faster, less detail | `Original` for tiny animals in a large field; `854`/`640` for fast screening | 🟢 |
 | `dlc_adapt` | `True` | n/a | `False` = raw Zoo weights, no fine-tuning | keep on unless the Zoo model already tracks your setup | 🟡 |
 | `dlc_smart_adapt` | `True` | n/a | `False` = adapt each video | off for heterogeneous sessions | 🟡 |
+| `dlc_smart_adapt_pooled` | `True` | n/a | `False` = adapt on every confident label of the one representative video (v3) | on; off if tracking looks worse or the videos do not share one camera setup | 🟡 |
 | `dlc_epochs` | `30` | slower, can over-fit pseudo-labels | faster, under-adapted | 30 default, 4 to 10 for a smoke test | 🟡 |
 | `dlc_pseudo_thr` | `0.40` | stricter pseudo-labels, fewer but cleaner | more labels, more noise reinforced | 0.4 default; 0.5 to 0.6 on clean footage | 🟡 |
 | `dlc_filter` | `Median (spike removal)` | see the filter table below | | | 🟢 |
@@ -265,6 +287,7 @@ flowchart TD
 | `dlc_max_individuals` | `1` | multi-animal; slower and identity swaps possible | n/a | 1 for single-animal assays | 🟡 |
 | `dlc_inf_batch` / `dlc_det_batch` | `0` / `0` (auto from GPU memory) | faster until VRAM is exhausted | slower, safer | 8, 16, or 32; on CUDA out-of-memory CUBE halves the batch and retries down to 1 | 🟡 |
 | `dlc_det_epochs` / `dlc_pose_epochs` | `10` / `30` | more adaptation | less | detector saturates earlier than pose | 🟡 |
+| `dlc_smart_adapt_pool_max` | `6` | more videos pooled, more base-model inference time | fewer | 4 to 8 | 🟡 |
 | `dlc_overlay_dot_radius` | `3` px | bigger dots | smaller dots | 2 to 5 | 🟢 |
 | `dlc_export_legend` | `True` | n/a | no legend PNG | on | 🟢 |
 | `dlc_scale_mode` / `_min` / `_max` / `_step` | `Auto` / `100` / `600` / `50` | detector input crop-size list | | leave on Auto | 🟡 |
@@ -275,16 +298,25 @@ flowchart TD
 
 ### 🧹 Post-processing the raw pose track
 
-Raw network output contains three kinds of defects: **spikes** (single-frame jumps), **confidently wrong points** (a keypoint snapped to cage furniture), and **short dropouts** (a paw briefly occluded). `filter_dlc_h5()` handles them in a fixed order. It writes `<stem>_filtered.h5` and never overwrites the raw H5.
+Raw network output contains four kinds of defects: **spikes** (single-frame jumps), **confidently wrong points** (a keypoint snapped to cage furniture), **a whole group of points on the wrong object** (for example the head found on a person's face behind a clear cage wall), and **short dropouts** (a paw briefly occluded). `filter_dlc_h5()` handles them in a fixed order. It writes `<stem>_filtered.h5` and never overwrites the raw H5. The two gates in steps 1 and 2 run together first and set a flagged point's likelihood to 0 *before* anything else runs, so a wrong detection is never smoothed into its neighbours, never a gap anchor and never an anchor for the off-body box.
 
-1. **Off-body gate** (`dlc_offbody_gate`). Per frame, CUBE builds a box from all *other* confidently tracked bodyparts (≥ `likelihood_thresh`, at least 4 of them) and flags a point that lies farther outside that box than `margin_frac × box size + 20 px`, *regardless of its own likelihood*. Frames with too few anchors are left unjudged, never flagged.
-2. **Short-gap interpolation** (`dlc_gap_interp`). A run of not-confident frames of at most `gap_interp_max_frames` is linearly interpolated between the confident frames on each side. The filled **likelihood is itself interpolated** between the two anchors' likelihoods, so a fill between two confident frames reports high confidence and a fill next to a marginal frame reports low. Longer gaps are left untouched.
-3. **Smoothing, per confident run.** Each maximal run of confident frames is filtered *in isolation* (runs shorter than 7 frames are skipped). A low-confidence stretch can therefore never bleed smoothed values into neighbouring confident frames.
+1. **Temporal gate** (`dlc_temporal_gate`). For each bodypart, a confident point is flagged when it lies farther than that bodypart's own limit from its median position over the surrounding 17 frames (confident points only; the reference is recomputed three times without the flagged points so a bad stretch cannot drag its own reference). The limit is `max(0.15 × body scale, 1.3 × the 98th percentile of that bodypart's deviations in this video)`, so a paw may move farther than a nose. If two or more head points (nose, jaws, eyes) are flagged in one frame, the other head points that sit more than half their limit away are flagged too. Body scale is the median neck-base to back-end length, or 0.45 × the median bounding-box diagonal of the confident points when those two are absent.
+2. **Detector-box gate** (`dlc_bbox_gate`). A confident point outside DeepLabCut's own bounding box of the animal, by more than `max(0.03 × body scale, 1.3 × the 99th percentile of that bodypart's outside-distance)`, is flagged. It uses no other keypoint, so it still works when a whole group has moved together. It reads the detector's `<h5 stem>_before_adapt.json` next to the H5; without it this gate does nothing. Because the margin is learned from the 99th percentile it assumes wrong detections are under 1% of frames.
+3. **Off-body gate** (`dlc_offbody_gate`). Per frame, CUBE builds a box from all *other* confidently tracked bodyparts (≥ `likelihood_thresh`, at least 4 of them) and flags a point that lies farther outside that box than `margin_frac × box size + 20 px`, *regardless of its own likelihood*. Frames with too few anchors are left unjudged, never flagged.
+4. **Short-gap interpolation** (`dlc_gap_interp`). A run of not-confident frames of at most `gap_interp_max_frames` is linearly interpolated between the confident frames on each side. The filled **likelihood is itself interpolated** between the two anchors' likelihoods, then **capped at 0.39** (`dlc_fill_conf_cap`, just under `DISPLAY_LL_THRESHOLD`), so a bridged position stays in the data but is never reported, drawn or counted as a confident detection. Longer gaps are left untouched.
+5. **Smoothing, per confident run.** Each maximal run of confident frames is filtered *in isolation* (runs shorter than 7 frames are skipped). A low-confidence stretch can therefore never bleed smoothed values into neighbouring confident frames.
+
+**Measured effect** (two held-out videos, standard and pooled tracking, against the filter without the temporal gate, box gate and fill cap): median jitter 5 to 15% lower, one-frame jumps above a quarter torso length about two thirds fewer, confident gap fills 3.8 to 5.1% of confident points down to none, and about 0.6 fewer confident main bodyparts per frame (of 12). The gates flag about 2.2 to 2.6% of confident points. On the frames that triggered the work (a person's face detected as the mouse's head for several frames), confident head points on the face fell from 10 to 2 and from 19 to 1 for the two models. Injected-error tests: the temporal gate caught 99% of points moved by half a torso length or more; the box gate caught about 60% at 0.5 to 0.8 and 80% at 0.8 to 1.3 torso lengths, flagging 0.05 to 0.12% of untouched points. Pixel-space anchors (body centre, trunk centroid, parent bone, a dark-silhouette mask) were tried and did not separate the face from the head on this close camera.
+
+**Known limit.** A persistent wrong detection that stays *inside* the animal's bounding box passes every gate. Check the labeled video where something other than the animal is in view.
 
 | Key | Default | Raising it | Lowering it | Recommended | Risk |
 |---|---|---|---|---|---|
 | `dlc_offbody_gate` | `True` | n/a | off: furniture-snapped points pass | on | 🟢 |
 | `dlc_offbody_margin_frac` | `0.8` | tolerates more extreme postures (stretching, rearing), flags fewer | stricter, more false flags | 0.6 to 1.2 | 🟡 |
+| `dlc_temporal_gate` | `True` | n/a | off: a point that flips to another object can pass, be smoothed and anchor a gap fill | on | 🟢 |
+| `dlc_bbox_gate` | `True` | n/a | off: points outside the detector box pass | on (needs the detector `.json` beside the H5) | 🟢 |
+| `dlc_fill_conf_cap` | `True` | n/a | off: a bridged gap can report confident (≥ 0.4) and is drawn and counted | on | 🟢 |
 | `dlc_gap_interp` | `True` | n/a | leave brief dropouts as gaps | on | 🟢 |
 | `dlc_gap_interp_max_frames` | `5` (~0.17 s at 30 fps) | bridges longer dropouts but a straight line lags fast head/paw motion | only very short gaps bridged | 3 to 8 at 30 fps; scale with fps | 🟡 |
 | `dlc_slow_bp_smoothing` | `True` | n/a | `False` = every bodypart uses the lightest smoothing (window 3, sigma 1.0) | on | 🟢 |

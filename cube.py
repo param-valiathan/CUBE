@@ -14,7 +14,14 @@ named DLC inference project (base-folder name), injects init_weights via
 ruamel.yaml, and then runs high-throughput batch inference via
 dlc.analyze_videos on all remaining videos with adaptive OOM recovery.
 
-Enable via the "Smart Adapt (v3)" checkbox in DLC & Prep Settings.
+Smart Adapt v4 (2026-10-21): by default the adaptation no longer trains on every
+confident label of the one representative video. It pools same-camera videos,
+drops base-model labels that fail plausibility checks (spike, Hampel outlier,
+optical-flow disagreement, left/right paw swap), samples frames evenly across
+pose clusters, and applies a per-body-part confidence threshold -- see
+cube_adapt_pseudo.py. Untick "Pooled labels" for the previous behaviour.
+
+Enable via the "Smart Adapt (v4)" checkbox in DLC & Prep Settings.
 
 Single-file launcher.  Place in the same folder as:
     cube_core.py           (required — V5 analysis engine)
@@ -497,6 +504,9 @@ class SessionState:
         dlc_cooldown    = "15 s",
         dlc_run_prep    = True,
         dlc_smart_adapt = True,
+        # Smart Adapt v4 (2026-10-21): adapt on pooled, plausibility-filtered pseudo-labels
+        # from same-camera videos instead of every confident label of one video.
+        dlc_smart_adapt_pooled = True,
         # BSOID prep
         bsoid_min_conf  = 0.30,
         bsoid_conf_metric    = "median",
@@ -1041,8 +1051,11 @@ class SettingsPanel(tk.Frame):
          "Resize before inference"),
         ("dlc_adapt",        "Video adapt",         "bool", None, True,
          "Fine-tune per video (better tracking)"),
-        ("dlc_smart_adapt",  "Smart Adapt (v3)",    "bool", None, True,
-         "Select 1 representative video → adapt once → reuse for all (Scenario A)"),
+        ("dlc_smart_adapt",  "Smart Adapt (v4)",    "bool", None, True,
+         "Adapt once → reuse the adapted weights for every video (Scenario A)"),
+        ("dlc_smart_adapt_pooled", "  Pooled labels",   "bool", None, True,
+         "Adapt on filtered pseudo-labels pooled from same-camera videos "
+         "(off = every confident label of one representative video)"),
         ("dlc_epochs",       "Adapt epochs",        "int",  (4,200,2),  30,
          "30=recommended (pose epochs; detector defaults to 10 automatically "
          "and saturates faster)  4=fast  — used only when the Advanced "
@@ -2050,7 +2063,7 @@ def _run_dlc_step(session: SessionState, settings: SettingsPanel,
     Run DeepLabCut SuperAnimal inference on all video folders.
     Mirrors the logic of BatchDLC_2_PreBSOID_Combined_Analyser.py.
 
-    When 'Smart Adapt (v3)' is enabled in settings, dispatches to
+    When 'Smart Adapt (v4)' is enabled in settings, dispatches to
     _run_dlc_smart_adapt_step (Scenario A: one representative video
     adapted, adapted weights reused for all videos via analyze_videos).
     """
@@ -2533,6 +2546,83 @@ def _find_adapted_pt_checkpoints(
             str(best_det)  if best_det  else None)
 
 
+def _run_pooled_smart_adaptation(dlc, cv2, valid_entries, rep_entry, adapt_work: Path,
+                                 *, sa_name, model_name, detector_name, pcutoff_base,
+                                 bbox_thr, bbox_thr_adapt, max_ind, inf_batch, det_batch,
+                                 det_epochs, pose_epochs, pseudo_thr, transfer, pool_max,
+                                 logger) -> "Path | None":
+    """
+    Smart Adapt v4 (default): adapt on pooled, filtered pseudo-labels from SAME-CAMERA videos (see cube_adapt_pseudo.py).
+
+    "Same camera" = identical frame size as the representative video, nearest in brightness (up to `pool_max` videos).
+    Steps: base-model inference on the pool -> plausibility filter + pose-balanced frame selection + per-body-part
+    thresholds -> a COCO pseudo-label set that DeepLabCut's video-adapt training uses in place of its own.
+    Returns the folder holding the adapted checkpoints, or None when the recipe does not apply (non-Quadruped schema, too few
+    usable frames) or fails -- the caller then runs standard single-video adaptation exactly as before.
+    """
+    import traceback as _tb
+    try:
+        import cube_adapt_pseudo as cap_mod
+        rep_path, _rs, rep_b = rep_entry
+
+        def _size(p):
+            c = cv2.VideoCapture(p)
+            s = (int(c.get(cv2.CAP_PROP_FRAME_WIDTH)), int(c.get(cv2.CAP_PROP_FRAME_HEIGHT))); c.release()
+            return s
+        rep_size = _size(rep_path)
+        same = [e for e in valid_entries if e[0] != rep_path and _size(e[0]) == rep_size]
+        same.sort(key=lambda e: abs(e[2] - rep_b))
+        pool = [rep_entry] + same[:max(0, pool_max - 1)]
+        logger.info(f"  Pooled adaptation: {len(pool)} same-camera video(s) "
+                    f"({rep_size[0]}x{rep_size[1]}) -> {[Path(e[0]).name for e in pool]}")
+
+        root = adapt_work / "pooled_v4"
+        root.mkdir(parents=True, exist_ok=True)
+        base_dir = root / "base"
+        base_dir.mkdir(exist_ok=True)
+        preds = []
+        for e in pool:
+            vp = e[0]
+            js, h5 = cap_mod.find_prediction_files(str(base_dir), vp)
+            if not (js and h5):
+                logger.info(f"  Base-model inference on {Path(vp).name} (labels to be filtered) ...")
+                dlc.video_inference_superanimal(
+                    [vp], superanimal_name=sa_name, model_name=model_name, detector_name=detector_name,
+                    video_adapt=False, pcutoff=pcutoff_base, bbox_threshold=bbox_thr, max_individuals=max_ind,
+                    batch_size=inf_batch, detector_batch_size=det_batch, dest_folder=str(base_dir),
+                    create_labeled_video=False, plot_bboxes=False, device="auto")
+                js, h5 = cap_mod.find_prediction_files(str(base_dir), vp)
+            preds.append((vp, h5, js))
+        info = cap_mod.build_pooled_pseudo_dataset(preds, str(root), bbox_thr=bbox_thr_adapt,
+                                                   log=lambda m: logger.info(m))
+        if info is None:
+            return None
+        seed = root / "seed.mp4"
+        _sa_kw = dict(
+            superanimal_name=sa_name, model_name=model_name, detector_name=detector_name, video_adapt=True,
+            pcutoff=pcutoff_base, pseudo_threshold=pseudo_thr, bbox_threshold=bbox_thr_adapt, max_individuals=max_ind,
+            batch_size=inf_batch, detector_batch_size=det_batch, detector_epochs=det_epochs, pose_epochs=pose_epochs,
+            dest_folder=str(root / "adapt_out"), create_labeled_video=False, plot_bboxes=False, device="auto")
+        try:
+            import inspect as _insp
+            _sig = _insp.signature(dlc.video_inference_superanimal).parameters
+            if "superanimal_transfer_learning" in _sig:
+                _sa_kw["superanimal_transfer_learning"] = transfer
+            if "video_adapt_batch_size" in _sig:
+                _sa_kw["video_adapt_batch_size"] = inf_batch
+        except Exception:
+            pass
+        logger.info(f"  Adapting on {info['selected']} pooled, filtered pseudo-label frames "
+                    f"({pose_epochs} pose / {det_epochs} detector epochs) ...")
+        dlc.video_inference_superanimal([str(seed)], **_sa_kw)
+        logger.success("  Pooled adaptation complete.")
+        return root
+    except Exception as exc:
+        logger.warn(f"  Pooled adaptation unavailable ({exc}); falling back to standard single-video adaptation.")
+        logger.info(_tb.format_exc())
+        return None
+
+
 def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
                                logger: PipelineLogger, pb: DualProgressBar,
                                after_fn):
@@ -2851,8 +2941,23 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
     adapt_config_path  = None
     adapt_project_dir  = None
 
+    # Smart Adapt v4 (default): pooled, filtered pseudo-labels from same-camera videos.
+    # Falls back to the standard single-video adaptation below if it cannot run.
+    _pooled_dir = None
+    if bool(settings.get("dlc_smart_adapt_pooled", True)):
+        _pooled_dir = _run_pooled_smart_adaptation(
+            dlc, cv2, valid_entries, rep_entry, adapt_work,
+            sa_name=_sa_name, model_name=_model_name, detector_name=_detector_name,
+            pcutoff_base=0.1, bbox_thr=_bbox_thr, bbox_thr_adapt=_bbox_thr_adapt,
+            max_ind=_max_ind, inf_batch=inf_batch, det_batch=det_batch,
+            det_epochs=_det_epochs, pose_epochs=_pose_epochs, pseudo_thr=pseudo_thr,
+            transfer=_transfer, pool_max=int(_adv.get("dlc_smart_adapt_pool_max", 6)),
+            logger=logger)
+        if _pooled_dir is not None:
+            adapt_project_dir = _pooled_dir
+
     try:
-        if hasattr(dlc, "create_video_adaptation_project"):
+        if _pooled_dir is None and hasattr(dlc, "create_video_adaptation_project"):
             # Primary path: dedicated adaptation API (DLC ≥ 2.3).
             # superanimal_name must be the family name only ("superanimal_quadruped"),
             # NOT the combined "superanimal_quadruped_hrnet_w32" string.
@@ -2885,7 +2990,7 @@ def _run_dlc_smart_adapt_step(session: SessionState, settings: SettingsPanel,
                 logger.warn("  create_video_adaptation_project returned no path; "
                             "switching to fallback.")
         # ── Fallback: video_inference_superanimal with video_adapt=True ────────
-        if adapt_config_path is None:
+        if adapt_config_path is None and _pooled_dir is None:
             logger.warn(
                 "  Fallback: video_inference_superanimal "
                 "(video_adapt=True) on representative video")

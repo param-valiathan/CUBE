@@ -66,12 +66,23 @@ python cube.py
 
 </details>
 
+## 🧬 Smart Adapt: adapting the tracking model
+
+Step 1a fine-tunes the DeepLabCut SuperAnimal model to your footage once and tracks every video with the result. Without hand labels it trains on the model's own confident predictions, so **Smart Adapt v4** cleans them first:
+
+- frames are pooled from up to six videos of the same camera (same frame size, closest brightness);
+- a base-model label is dropped when its track is implausible (a spike, a Hampel outlier, a disagreement with optical flow, or a left/right paw swap);
+- frames are sampled evenly across 20 posture clusters, and each mouse bodypart keeps its own confidence threshold.
+
+Every tracked video is then filtered with a per-bodypart temporal gate, a head-group check and a detector-box gate, and a gap-filled point is never reported as confident. On two held-out test videos this cut median jitter by 5 to 15% and one-frame jumps by about two thirds. A manual review of 55 frames showed **no significant accuracy gain** from pooling over standard single-video adaptation, so treat it as a robustness improvement. The **Pooled labels** checkbox restores single-video adaptation, and CUBE falls back to it automatically when the recipe cannot run. Details, settings and limits: [docs/CUBE_Guide.md](docs/CUBE_Guide.md#smart-adapt-v4-pooled-filtered-pseudo-labels) and the [website](https://param-valiathan.github.io/CUBE-site/guide/smart-adapt/).
+
 ## 🗂️ Repository layout
 
 | Path | Contents |
 |------|----------|
 | `cube.py` | Main window and the six-step pipeline |
-| `cube_core.py` | Engine: features, clustering, classifier, HMM, triangulation |
+| `cube_core.py` | Engine: features, clustering, classifier, HMM, triangulation, DLC track filtering |
+| `cube_adapt_pseudo.py` | Step 1a: Smart Adapt v4 pooled, filtered pseudo-labels |
 | `cube_3d_dlc.py`, `calibrate_cameras.py`, `calibration_refine_poses.py`, `cube_homography_calibrator.py` | Step 1b: 3D pose and calibration |
 | `bonsai_video_corrector.py` | Step 0: Bonsai / Doric video correction |
 | `cube_video_explorer.py`, `guided/` | Step 4: cluster review and guided labelling |
