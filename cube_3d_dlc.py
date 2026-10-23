@@ -2857,12 +2857,25 @@ def _autodetect_cached_adaptation(adapt_work: Path, cam_label: str,
         snap_base = _find_highest_snapshot_path(cam_adapt_dir, logger)
     if pose_ckpt is None and snap_base is None:
         return None
-    return {
+    out = {
         "pose_ckpt": pose_ckpt,
         "det_ckpt":  det_ckpt,
         "snap_base": snap_base,
         "adapt_dir": str(cam_adapt_dir),
     }
+    # A pooled (Smart Adapt v4) adaptation is recognisable from where its checkpoint lives; a legacy one has no recorded method
+    # (it predates the option) and is deliberately left unlabelled so that upgrading never silently redoes it.
+    if pose_ckpt and "pooled_v4" in Path(pose_ckpt).parts:
+        out["method"] = "pooled_v4"
+    return out
+
+
+def _adaptation_method_mismatch(cached: dict | None, want_pooled: bool) -> bool:
+    """True when a cached adaptation was explicitly recorded as the other method than the one the settings now ask for."""
+    method = (cached or {}).get("method")
+    if method not in ("pooled_v4", "single_video"):
+        return False
+    return method != ("pooled_v4" if want_pooled else "single_video")
 
 
 def _infer_camera_videos(dlc, videos: list[Path], cam_label: str,
@@ -6432,6 +6445,15 @@ def _run_3d_dlc_step(session: dict, settings, logger, pb, after_fn: Callable):
             models[_cam] = _cached
             logger.info(f"  [{_cam}] Auto-detected cached adaptation from disk "
                         f"({Path(_cached['adapt_dir']).name})")
+    # The "pooled labels" option must take effect: a camera whose cached adaptation was made with the other method is adapted again
+    # (pooled_v4 and single-video adaptations live in different folders, so nothing is overwritten).
+    _want_pooled = bool(session.get("dlc_3d_adapt_pooled", True))
+    for _cam in list(models):
+        if _adaptation_method_mismatch(models[_cam], _want_pooled):
+            logger.info(f"  [{_cam}] Cached adaptation was made with "
+                        f"{models[_cam].get('method')}; the setting now asks for "
+                        f"{'pooled_v4' if _want_pooled else 'single_video'} - adapting again")
+            models.pop(_cam)
     if models != session.get("dlc_3d_models", {}):
         session["dlc_3d_models"] = models
         try:

@@ -17,7 +17,7 @@ training uses it instead of building its own. Pure numpy/pandas/cv2/scipy/sklear
 Validated in the standalone testbed D:\\CUBE\\ADAPT_LABEL_TESTS (see DLC_ADAPTATION_IMPROVEMENT_PLAN.md).
 """
 from __future__ import annotations
-import os, json, glob
+import os, json, glob, shutil, hashlib, warnings
 import numpy as np
 import pandas as pd
 
@@ -29,6 +29,7 @@ EXCLUDED = {
 INFO_BPS = ["nose", "upper_jaw", "lower_jaw", "left_eye", "right_eye", "neck_base", "back_end", "tail_base",
             "front_left_paw", "front_right_paw", "back_left_paw", "back_right_paw"]
 LL_GATE = 0.4
+RECIPE_VERSION = "v4.1"   # bump when the pseudo-label recipe changes: it is part of the cache signature of a pooled adaptation folder
 FLOW_PX_FRAC = 0.07       # optical-flow residual limit as a fraction of the median torso length (30 px on a 430 px torso)
 
 
@@ -39,12 +40,20 @@ def schema_supported(bodyparts) -> bool:
 
 
 # ----------------------------------------------------------------------------- loading
-def find_prediction_files(dest_dir, video_path):
-    """(json, h5) written by video_inference_superanimal for `video_path` inside dest_dir (None if missing)."""
+def find_prediction_files(dest_dir, video_path, other_stems=()):
+    """(json, h5) written by video_inference_superanimal for `video_path` inside dest_dir (None if missing).
+    `other_stems`: stems of the other videos sharing dest_dir. A file belongs to the video whose stem is its LONGEST matching prefix,
+    so 'clip1' never picks up the output of 'clip10'."""
     stem = os.path.splitext(os.path.basename(video_path))[0]
-    js = [p for p in glob.glob(os.path.join(dest_dir, stem + "*.json"))]
+    longer = [o for o in other_stems if o != stem and o.startswith(stem)]
+
+    def mine(p):
+        b = os.path.basename(p)
+        return not any(b.startswith(o) for o in longer)
+    pat = os.path.join(dest_dir, glob.escape(stem) + "*")
+    js = sorted(p for p in glob.glob(pat + ".json") if mine(p))
     js_b = [p for p in js if p.endswith("_before_adapt.json")]
-    h5 = [p for p in glob.glob(os.path.join(dest_dir, stem + "*.h5")) if "_labeled" not in p and not p.endswith("_filtered.h5")]
+    h5 = sorted(p for p in glob.glob(pat + ".h5") if "_labeled" not in p and not p.endswith("_filtered.h5") and mine(p))
     return (js_b or js or [None])[0], (h5 or [None])[0]
 
 
@@ -62,8 +71,26 @@ def load_prediction(video_path, h5_path, json_path):
              L=np.stack([get(b, "likelihood") for b in bps], 1), bi={b: i for i, b in enumerate(bps)}, ll_gate=LL_GATE)
     P["torso"] = torso_len(P)
     P["torso_med"] = float(np.nanmedian(P["torso"]))
+    P["gate"] = np.full(len(bps), LL_GATE)      # per-body-part check level; lowered to the pseudo-label threshold by set_gates()
+    P["fps"] = _video_fps(video_path)
     return dict(video=video_path, key=os.path.splitext(os.path.basename(video_path))[0], P=P, names39=names39,
                 json=json.load(open(json_path)))
+
+
+def _video_fps(path):
+    try:
+        import cv2
+        c = cv2.VideoCapture(str(path)); f = float(c.get(cv2.CAP_PROP_FPS)); c.release()
+        return f if np.isfinite(f) and f > 1 else 30.0
+    except Exception:
+        return 30.0
+
+
+def set_gates(pred, thr39):
+    """Check level of every mouse body part = min(0.4, its pseudo-label threshold). A pseudo-label is accepted from its own threshold
+    (down to 0.25 for the weak parts), so the plausibility flags must look at every point that can become a label, not only those >= 0.4."""
+    P = pred["P"]; names39 = pred["names39"]
+    P["gate"] = np.array([min(LL_GATE, float(thr39[names39.index(b)])) for b in P["bps"]])
 
 
 def torso_len(P):
@@ -74,8 +101,13 @@ def torso_len(P):
 
 
 # ----------------------------------------------------------------------------- A1 flags
+def _gate(P, k):
+    g = P.get("gate")
+    return LL_GATE if g is None else float(g[k])
+
+
 def _series(P, k):
-    ok = (P["L"][:, k] >= LL_GATE) & ~np.isnan(P["X"][:, k])
+    ok = (P["L"][:, k] >= _gate(P, k)) & ~np.isnan(P["X"][:, k])
     return P["X"][:, k], P["Y"][:, k], ok
 
 
@@ -109,7 +141,7 @@ def hampel_flags(P, win=7, z=8.0):
 
 def swap_flags(P, A, B, ratio=0.6, floor_frac=0.12):
     a, b = P["bi"][A], P["bi"][B]; T = P["X"].shape[0]
-    ok = (P["L"][:, a] >= LL_GATE) & (P["L"][:, b] >= LL_GATE); ok = ok[1:] & ok[:-1]
+    ok = (P["L"][:, a] >= _gate(P, a)) & (P["L"][:, b] >= _gate(P, b)); ok = ok[1:] & ok[:-1]
     d = lambda i, j, s, e: np.hypot(P["X"][s, i] - P["X"][e, j], P["Y"][s, i] - P["Y"][e, j])
     keep = d(a, a, slice(1, None), slice(None, -1)) + d(b, b, slice(1, None), slice(None, -1))
     swp = d(a, b, slice(1, None), slice(None, -1)) + d(b, a, slice(1, None), slice(None, -1))
@@ -126,7 +158,7 @@ def flow_odd_flags(P, video_path, cache=None):
         d = np.load(cache); fwd, back = d["fwd"], d["back"]
     else:
         fwd = np.full((T, K), np.nan); back = np.full((T, K), np.nan)
-        conf = (P["L"] >= LL_GATE) & ~np.isnan(P["X"])
+        conf = (P["L"] >= np.asarray(P.get("gate", LL_GATE))) & ~np.isnan(P["X"])
         cap = cv2.VideoCapture(video_path); ok, fr = cap.read()
         if not ok:
             return np.zeros((T, K), bool)
@@ -160,13 +192,33 @@ def flow_odd_flags(P, video_path, cache=None):
     return odd & mask
 
 
-def a1_flags(pred, cache_dir=None, margin=1):
+def gate_flags(pred):
+    """Temporal (own +-8-frame median) and detector-box gates, the same functions that clean every CUBE DLC output (cube_dlc_gates).
+    Without them a head that jumped onto another object (a person's face behind the cage) could become a training label."""
+    from cube_dlc_gates import _temporal_gate_flags, _bbox_gate_flags, boxes_from_json
+    P = pred["P"]; T, K = P["X"].shape
+    out = np.zeros((T, K), bool)
+    torso = P["torso_med"]
+    if not np.isfinite(torso) or torso < 5:
+        return out
+    gate = np.asarray(P.get("gate", np.full(K, LL_GATE)), float)
+    try:
+        out |= _temporal_gate_flags(P["X"], P["Y"], P["L"], P["bps"], torso, gate=LL_GATE, apply_gate=gate, fps=P.get("fps"))
+        out |= _bbox_gate_flags(None, P["X"], P["Y"], P["L"], torso, gate=LL_GATE, apply_gate=gate, boxes=boxes_from_json(pred["json"], T))
+    except Exception as exc:                                  # never let an auxiliary gate disable the whole recipe
+        warnings.warn(f"temporal/box gate skipped for {pred.get('key')}: {exc}")
+    return out
+
+
+def a1_flags(pred, cache_dir=None, margin=1, use_gates=True):
     """(T,K24) bool: True = zero this keypoint in the pseudo-label."""
     from scipy.ndimage import maximum_filter1d
     P = pred["P"]; T, K = P["X"].shape
     cache = os.path.join(cache_dir, f"flow_{pred['key']}.npz") if cache_dir else None
     # spike / Hampel / swap run over all 24 mouse body parts; optical flow over the 12 informative ones (as validated in the testbed)
     U = spike_flags(P) | hampel_flags(P) | flow_odd_flags(P, pred["video"], cache)
+    if use_gates:
+        U |= gate_flags(pred)
     for A, B in [("front_left_paw", "front_right_paw"), ("back_left_paw", "back_right_paw")]:
         f = swap_flags(P, A, B); U[:, P["bi"][A]] |= f; U[:, P["bi"][B]] |= f
     if margin > 0:
@@ -226,6 +278,9 @@ def write_coco(out_dir, selected, preds_by_key, thr_vec, flags, bbox_thr=0.75):
     import cv2
     img_dir = os.path.join(out_dir, "images"); ann_dir = os.path.join(out_dir, "annotations")
     os.makedirs(img_dir, exist_ok=True); os.makedirs(ann_dir, exist_ok=True)
+    for f in os.listdir(img_dir):                     # images of an earlier, different selection must not be counted or trained on
+        if f.lower().endswith(".png"):
+            os.remove(os.path.join(img_dir, f))
     images, annotations, caps = [], [], {}
     st = dict(kp_total=0, kp_below_thr=0, kp_flagged=0, kp_kept=0, frames=0)
     names39 = next(iter(preds_by_key.values()))["names39"]
@@ -304,8 +359,10 @@ def build_pooled_pseudo_dataset(base_predictions, root, bbox_thr=0.75, budget=36
         return None
     cache_dir = os.path.join(root, "_cache"); os.makedirs(cache_dir, exist_ok=True)
     log(f"  A1: scoring {len(preds)} video(s) for implausible base-model labels (spike / Hampel / optical flow / paw swap)")
-    flags = {p["key"]: a1_flags(p, cache_dir) for p in preds}
     thr = per_bp_thresholds(preds)
+    for p in preds:
+        set_gates(p, thr)
+    flags = {p["key"]: a1_flags(p, cache_dir) for p in preds}
     sel, info = select_frames(preds, budget=budget, bbox_thr=bbox_thr, frame_masks=keyed_masks)
     if len(sel) < 20:
         log(f"  pooled pseudo-labels: only {len(sel)} usable frames - using standard adaptation")
@@ -335,9 +392,54 @@ def prediction_cache_valid(video_path, h5_path, json_path):
         if not (h5_path and json_path and os.path.isfile(h5_path) and os.path.isfile(json_path)):
             return False
         _, n = _video_info(video_path)
+        if os.path.getmtime(h5_path) + 2 < os.path.getmtime(video_path):      # video re-written after the prediction was made
+            return False
         return abs(len(pd.read_hdf(str(h5_path))) - n) <= 1
     except Exception:
         return False
+
+
+def _write_json(path, obj):
+    with open(path, "w") as fh:
+        json.dump(obj, fh, indent=1, sort_keys=True)
+
+
+def _read_json(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def adaptation_signature(pool, frame_masks, **params):
+    """Hash of everything that decides what a pooled adaptation folder contains: recipe version, model names, epochs, thresholds and
+    the exact videos (path, size, modification time, allowed-frame mask)."""
+    h = hashlib.sha1()
+    h.update(json.dumps(dict(params, recipe=RECIPE_VERSION), sort_keys=True, default=str).encode())
+    masks = {os.fspath(k): v for k, v in (frame_masks or {}).items()}
+    for v in pool:
+        st = os.stat(v)
+        h.update(f"|{os.path.abspath(v)}|{st.st_size}|{int(st.st_mtime)}".encode())
+        m = masks.get(v)
+        if m is not None:
+            h.update(np.asarray(m, bool).tobytes())
+    return h.hexdigest()
+
+
+def reset_adaptation_state(root, logger=None):
+    """Remove everything derived from the pseudo-label set (dataset, trained checkpoints, adaptation inference, optical-flow cache, seed clip)
+    but keep the base-model predictions. DeepLabCut silently reuses checkpoints that already exist for the target epoch, so a changed
+    configuration must never be trained into a folder that still holds the old ones."""
+    for sub in ("pseudo_seed", "adapt_out", "_cache"):
+        shutil.rmtree(os.path.join(root, sub), ignore_errors=True)
+    for f in ("seed.mp4", "pooled_pseudo_report.json"):
+        try:
+            os.remove(os.path.join(root, f))
+        except OSError:
+            pass
+    if logger:
+        logger.info("  Pooled adaptation: settings or videos changed since the last run - rebuilding the dataset and retraining")
 
 
 def run_pooled_adaptation(dlc, videos, root, *, sa_name, model_name, detector_name, bbox_thr, bbox_thr_adapt, max_ind, inf_batch, det_batch,
@@ -361,21 +463,42 @@ def run_pooled_adaptation(dlc, videos, root, *, sa_name, model_name, detector_na
             else:
                 logger.warn(f"  Pooled adaptation: skipping {os.path.basename(v)} (frame size differs from {os.path.basename(videos[0])})")
         logger.info(f"  Pooled adaptation: {len(pool)} same-camera video(s) ({size0[0]}x{size0[1]}) -> {[os.path.basename(v) for v in pool]}")
-        base_dir = os.path.join(root, "base"); os.makedirs(base_dir, exist_ok=True)
+        base_dir = os.path.join(root, "base")
+        base_sig = dict(sa=sa_name, model=model_name, detector=detector_name, bbox_thr=float(bbox_thr), pcutoff=float(pcutoff_base))
+        if os.path.isdir(base_dir) and _read_json(os.path.join(base_dir, "_signature.json")) not in (None, base_sig):
+            logger.info("  Pooled adaptation: base-model settings changed - base predictions will be recomputed")
+            shutil.rmtree(base_dir, ignore_errors=True)
+        os.makedirs(base_dir, exist_ok=True); _write_json(os.path.join(base_dir, "_signature.json"), base_sig)
+        stems = [os.path.splitext(os.path.basename(v))[0] for v in pool]
         preds = []
         for vp in pool:
-            js, h5 = find_prediction_files(base_dir, vp)
+            js, h5 = find_prediction_files(base_dir, vp, stems)
             if not prediction_cache_valid(vp, h5, js):
                 logger.info(f"  Base-model inference on {os.path.basename(vp)} (labels to be filtered) ...")
                 dlc.video_inference_superanimal(
                     [vp], superanimal_name=sa_name, model_name=model_name, detector_name=detector_name, video_adapt=False,
                     pcutoff=pcutoff_base, bbox_threshold=bbox_thr, max_individuals=max_ind, batch_size=inf_batch, detector_batch_size=det_batch,
                     dest_folder=base_dir, create_labeled_video=False, plot_bboxes=False, device="auto")
-                js, h5 = find_prediction_files(base_dir, vp)
+                js, h5 = find_prediction_files(base_dir, vp, stems)
+                try:                                           # the optical-flow cache belongs to the predictions it was made from
+                    os.remove(os.path.join(root, "_cache", f"flow_{os.path.splitext(os.path.basename(vp))[0]}.npz"))
+                except OSError:
+                    pass
             preds.append((vp, h5, js))
+        sig = adaptation_signature(pool, frame_masks, sa=sa_name, model=model_name, detector=detector_name, bbox_thr=float(bbox_thr),
+                                   bbox_thr_adapt=float(bbox_thr_adapt), det_epochs=int(det_epochs), pose_epochs=int(pose_epochs),
+                                   pseudo_thr=float(pseudo_thr), transfer=bool(transfer))
+        sig_path = os.path.join(root, "_signature.json")
+        stored = _read_json(sig_path)
+        have_ckpt = bool(glob.glob(os.path.join(root, "pseudo_seed", "**", "*.pt"), recursive=True))
+        if stored is not None and stored.get("sig") != sig:
+            reset_adaptation_state(root, logger)
+        elif stored is None and not have_ckpt:
+            reset_adaptation_state(root)                       # leftovers of an interrupted first attempt: nothing worth keeping
         info = build_pooled_pseudo_dataset(preds, root, bbox_thr=bbox_thr_adapt, log=logger.info, frame_masks=frame_masks)
         if info is None:
             return None
+        _write_json(sig_path, dict(sig=sig, recipe=RECIPE_VERSION))
         sa_kw = dict(superanimal_name=sa_name, model_name=model_name, detector_name=detector_name, video_adapt=True, pcutoff=pcutoff_base,
                      pseudo_threshold=pseudo_thr, bbox_threshold=bbox_thr_adapt, max_individuals=max_ind, batch_size=inf_batch,
                      detector_batch_size=det_batch, detector_epochs=det_epochs, pose_epochs=pose_epochs, dest_folder=os.path.join(root, "adapt_out"),

@@ -4265,6 +4265,12 @@ class AdvancedDLCWindow(tk.Toplevel):
         # were fills sitting a median 30px from the raw detection); 5 frames
         # (~0.17s) keeps brief dropouts bridged without the visible trail.
         dlc_gap_interp_max_frames = 5,
+        # 2026-10-21 (Smart Adapt v4): plausibility gates on every DLC output; each can be switched off to get the previous output.
+        dlc_temporal_gate    = True,
+        dlc_bbox_gate        = True,
+        dlc_fill_conf_cap    = True,
+        dlc_fill_conf_bridge = True,
+        dlc_smart_adapt_pool_max = 6,
         dlc_inf_batch        = 0,
         dlc_det_batch        = 0,
         dlc_det_epochs       = 10,
@@ -4483,9 +4489,41 @@ class AdvancedDLCWindow(tk.Toplevel):
                      font=("Segoe UI", 7), bg=C["card"], fg=C["dim"]
                      ).pack(side="left", padx=4)
 
+        def _temporal_gate_row(r):
+            _bool_row(r, "dlc_temporal_gate", True)
+            tk.Label(r, text="flags a point that jumps away from its own position over the surrounding +-8 frames "
+                             "(e.g. the whole head snapping onto something else); limits are learned per body part",
+                     font=("Segoe UI", 7), bg=C["card"], fg=C["dim"]
+                     ).pack(side="left", padx=4)
+
+        def _bbox_gate_row(r):
+            _bool_row(r, "dlc_bbox_gate", True)
+            tk.Label(r, text="flags a point lying outside DeepLabCut's own bounding box of the animal "
+                             "(needs the detector json written beside the pose file)",
+                     font=("Segoe UI", 7), bg=C["card"], fg=C["dim"]
+                     ).pack(side="left", padx=4)
+
+        def _fill_cap_row(r):
+            _bool_row(r, "dlc_fill_conf_cap", True)
+            tk.Label(r, text="a bridged (interpolated) position never reports a confidence at or above the display "
+                             "cut-off (0.4)",
+                     font=("Segoe UI", 7), bg=C["card"], fg=C["dim"]
+                     ).pack(side="left", padx=4)
+
+        def _fill_bridge_row(r):
+            _bool_row(r, "dlc_fill_conf_bridge", True)
+            tk.Label(r, text="confidence of a bridged point = probability it is within 0.05 body lengths of the truth, from the gap "
+                              "length, the point's local speed and the anchors' noise (off = interpolate the anchors' likelihoods)",
+                     font=("Segoe UI", 7), bg=C["card"], fg=C["dim"]
+                     ).pack(side="left", padx=4)
+
         _adv_row(sec2b, "Slow-bodypart extra smoothing", _slow_bp_row)
         _adv_row(sec2b, "Off-body spatial-plausibility gate", _offbody_row)
         _adv_row(sec2b, "Short-gap interpolation", _gap_interp_row)
+        _adv_row(sec2b, "Temporal plausibility gate", _temporal_gate_row)
+        _adv_row(sec2b, "Detector-box gate", _bbox_gate_row)
+        _adv_row(sec2b, "Cap confidence of bridged points", _fill_cap_row)
+        _adv_row(sec2b, "Estimate bridged-point confidence", _fill_bridge_row)
 
         # ── Batch sizes ───────────────────────────────────────────────────────
         sec3 = _adv_section(p, "BATCH SIZES  (0 = auto from GPU memory)", C["orange"], default_open=False)
@@ -4513,6 +4551,15 @@ class AdvancedDLCWindow(tk.Toplevel):
                  lambda r: _spin_i(r, "dlc_det_epochs", 1, 200, 1, 10))
         _adv_row(sec4, "Pose epochs",
                  lambda r: _spin_i(r, "dlc_pose_epochs", 1, 200, 1, 30))
+
+        def _pool_max_row(r):
+            _spin_i(r, "dlc_smart_adapt_pool_max", 1, 24, 1, 6)
+            tk.Label(r, text="most videos pooled by 2D Smart Adapt with 'Pooled labels' on "
+                             "(3D has its own field in the 3D settings)",
+                     font=("Segoe UI", 7), bg=C["card"], fg=C["dim"]
+                     ).pack(side="left", padx=4)
+
+        _adv_row(sec4, "Smart Adapt pool size", _pool_max_row)
 
         # ── Keypoint overlay (replaces DLC's native labeled video) ──────────────
         sec4b = _adv_section(p, "KEYPOINT OVERLAY  (rainbow-colored dots, replaces DLC's native labeled video)", C["cyan"], default_open=False)
@@ -8010,7 +8057,8 @@ class ThreeDSettingsWindow(tk.Toplevel):
                  relief="flat", font=("Segoe UI", 9)).pack(side="left")
         tk.Label(_cur_sec["body"],
                  text="  Uses only that camera's own videos (never mixes cameras); off = adapt on one representative video. "
-                      "A camera already adapted in a previous run is reused: delete 3d_adapt_workspace/adapt_<cam> to redo it.",
+                      "A camera already adapted in a previous run is reused, unless it was made with the other method here; "
+                       "to redo it anyway delete 3d_adapt_workspace/adapt_<cam>.",
                  font=("Segoe UI", 8), bg=C["bg"], fg=C["subtext"],
                  wraplength=520, justify="left").pack(anchor="w", padx=10, pady=(0, 4))
 
